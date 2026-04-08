@@ -25,6 +25,31 @@ class MainWindow(QMainWindow):
         self._viewport:      Viewport     | None = None
         self._history_panel: HistoryPanel | None = None
         self._build_menu()
+        self._build_statusbar()
+
+    def _build_statusbar(self):
+        sb = self.statusBar()
+        sb.setStyleSheet("""
+            QStatusBar {
+                background: #161616;
+                color: #555;
+                font-size: 11px;
+                border-top: 1px solid #2a2a2a;
+            }
+            QStatusBar::item { border: none; }
+        """)
+        # Permanent widget on the right — shows selection count
+        from PyQt6.QtWidgets import QLabel
+        self._sel_label = QLabel("")
+        self._sel_label.setStyleSheet("color: #888; padding-right: 8px;")
+        sb.addPermanentWidget(self._sel_label)
+
+    def _update_selection_label(self):
+        if self._viewport is None:
+            self._sel_label.setText("")
+            return
+        text = self._viewport.selection.status_text()
+        self._sel_label.setText(text)
 
     def _build_menu(self):
         menubar = self.menuBar()
@@ -75,12 +100,12 @@ class MainWindow(QMainWindow):
     def _menu_extrude(self):
         if not self._viewport:
             return
-        if self._viewport.picked_face is None:
+        if self._viewport.selection.face_count == 0:
             self.statusBar().showMessage("Select a face first.", 3000)
             return
-        self._show_extrude_dialog(
-            self._viewport.picked_body_id,
-            self._viewport.picked_face)
+        sf = self._viewport.selection.single_face or \
+             self._viewport.selection.faces[0]
+        self._show_extrude_dialog(sf.body_id, sf.face_idx)
 
     def _show_extrude_dialog(self, body_id: str, face_idx: int):
         dist, ok = QInputDialog.getDouble(
@@ -107,10 +132,8 @@ class MainWindow(QMainWindow):
         history   = History()
         workspace.history = history
 
-        # Split compound into individual solids → one Body each
         solids = list(compound.solids())
         if not solids:
-            # Fallback: treat the whole thing as one body
             solids = [compound]
 
         basename = os.path.splitext(os.path.basename(path))[0]
@@ -130,7 +153,6 @@ class MainWindow(QMainWindow):
             )
             print(f"  Body '{name}' — {len(list(solid.faces()))} faces")
 
-        # Build meshes (no GL context yet — upload happens in initializeGL)
         vp = Viewport(workspace, history)
         vp.build_meshes()
         vp.fit_camera_to_scene()
@@ -141,6 +163,9 @@ class MainWindow(QMainWindow):
         panel.seek_requested.connect(vp.seek_history)
         panel.replay_requested.connect(vp.do_replay)
         vp.history_changed.connect(panel.refresh)
+
+        # Wire selection → status bar
+        vp.selection_changed.connect(self._update_selection_label)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(panel)

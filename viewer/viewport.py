@@ -1,11 +1,11 @@
 """
 viewer/viewport.py
 
-Renders all visible bodies in the workspace. Each body has its own Mesh.
-Picking identifies both the body and the face within that body.
+Thin Qt widget: GL lifecycle, input events, mesh management, operations.
+Drawing logic lives in viewer/renderer.py.
+Hover/pick logic lives in viewer/hover.py.
 """
 
-import ctypes
 import numpy as np
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -14,12 +14,16 @@ from OpenGL.GLU import *
 
 from viewer.camera import Camera
 from viewer.mesh import Mesh
+from viewer.renderer import draw_opaque, draw_overlays
+from viewer.hover import HoverState
 from cad.workspace import Workspace
 from cad.history import History
+from cad.selection import SelectionSet
 
 
 class Viewport(QOpenGLWidget):
-    history_changed = pyqtSignal()
+    history_changed   = pyqtSignal()
+    selection_changed = pyqtSignal()
 
     def __init__(self, workspace: Workspace, history: History):
         super().__init__()
@@ -27,39 +31,59 @@ class Viewport(QOpenGLWidget):
         self.history   = history
         self.camera    = Camera()
 
-        # body_id → Mesh, rebuilt whenever that body's shape changes
         self._meshes: dict[str, Mesh] = {}
 
         self._modelview  = None
         self._projection = None
         self._viewport   = None
 
-        # Current pick — (body_id, face_idx) or (None, None)
-        self.picked_body_id:  str | None = None
-        self.picked_face:     int | None = None
-        self.picked_face_obj             = None
+        self.selection = SelectionSet()
+        self.hover     = HoverState()
+
+        self._hovered_vertex: tuple[str | None, int | None] = (None, None)
+        self._hovered_edge:   tuple[str | None, int | None] = (None, None)
 
         self.camera_projection_changed = None
         self.request_extrude_distance  = None
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+
+    # ------------------------------------------------------------------
+    # Backward-compat shims
+    # ------------------------------------------------------------------
+
+    @property
+    def picked_body_id(self) -> str | None:
+        sf = self.selection.single_face
+        return sf.body_id if sf else None
+
+    @property
+    def picked_face(self) -> int | None:
+        sf = self.selection.single_face
+        return sf.face_idx if sf else None
+
+    @property
+    def picked_face_obj(self):
+        sf = self.selection.single_face
+        if sf is None:
+            return None
+        mesh = self._meshes.get(sf.body_id)
+        return mesh.occt_faces[sf.face_idx] if mesh else None
 
     # ------------------------------------------------------------------
     # Mesh management
     # ------------------------------------------------------------------
 
     def build_meshes(self):
-        """Build a Mesh for every visible body. Call after load."""
         self.makeCurrent()
         for body_id, shape in self.workspace.all_current_shapes():
             self._meshes[body_id] = Mesh(shape)
         self.doneCurrent()
 
     def fit_camera_to_scene(self):
-        """Fit camera to the combined bounding box of all loaded meshes."""
         if not self._meshes:
             return
-        import numpy as np
         all_min = np.array([ np.inf,  np.inf,  np.inf])
         all_max = np.array([-np.inf, -np.inf, -np.inf])
         for mesh in self._meshes.values():
@@ -68,49 +92,43 @@ class Viewport(QOpenGLWidget):
         self.camera.fit_scene(all_min, all_max)
 
     def _rebuild_body_mesh(self, body_id: str):
-        """Re-tessellate one body after an operation."""
         self.makeCurrent()
         old = self._meshes.get(body_id)
         if old:
-            for buf in (old.vbo_verts, old.vbo_normals,
-                        old.vbo_edges, old.ebo):
+            for buf in (old.vbo_verts, old.vbo_normals, old.vbo_edges, old.ebo):
                 if buf is not None:
                     glDeleteBuffers(1, [buf])
-
         shape = self.workspace.current_shape(body_id)
         if shape is not None:
             mesh = Mesh(shape)
             mesh.upload()
             self._meshes[body_id] = mesh
-
-        # Clear pick if it was on this body
-        if self.picked_body_id == body_id:
-            self.picked_body_id  = None
-            self.picked_face     = None
-            self.picked_face_obj = None
-
+        self.selection.clear_for_body(body_id)
+        if self._hovered_vertex[0] == body_id:
+            self._hovered_vertex = (None, None)
+        if self._hovered_edge[0] == body_id:
+            self._hovered_edge = (None, None)
         self.doneCurrent()
+        self.selection_changed.emit()
         self.update()
 
     def _rebuild_all_meshes(self):
-        """Re-tessellate all bodies — used after seek/undo/redo."""
         self.makeCurrent()
         for body_id, old in list(self._meshes.items()):
-            for buf in (old.vbo_verts, old.vbo_normals,
-                        old.vbo_edges, old.ebo):
+            for buf in (old.vbo_verts, old.vbo_normals, old.vbo_edges, old.ebo):
                 if buf is not None:
                     glDeleteBuffers(1, [buf])
-
         self._meshes.clear()
         for body_id, shape in self.workspace.all_current_shapes():
             mesh = Mesh(shape)
             mesh.upload()
             self._meshes[body_id] = mesh
-
-        self.picked_body_id  = None
-        self.picked_face     = None
-        self.picked_face_obj = None
+        self.selection.clear()
+        self._hovered_vertex = (None, None)
+        self._hovered_edge   = (None, None)
+        self.hover.clear()
         self.doneCurrent()
+        self.selection_changed.emit()
         self.update()
 
     # ------------------------------------------------------------------
@@ -127,7 +145,6 @@ class Viewport(QOpenGLWidget):
         glLightfv(GL_LIGHT0, GL_AMBIENT,  [0.2, 0.2, 0.2, 1])
         glEnable(GL_COLOR_MATERIAL)
         glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
-        # Upload all meshes now that GL context exists
         for mesh in self._meshes.values():
             mesh.upload()
 
@@ -140,7 +157,8 @@ class Viewport(QOpenGLWidget):
             glOrtho(-s * aspect, s * aspect, -s, s, -50000, 50000)
         else:
             near = max(0.1, self.camera.distance * 0.001)
-            gluPerspective(45, aspect, near, max(50000, self.camera.distance * 100))
+            gluPerspective(45, aspect, near,
+                           max(50000, self.camera.distance * 100))
         glMatrixMode(GL_MODELVIEW)
 
     def resizeGL(self, w, h):
@@ -148,68 +166,33 @@ class Viewport(QOpenGLWidget):
         self._set_projection(w, h)
 
     def paintGL(self):
-        w, h = self.width(), self.height()
-        self._set_projection(w, h)
-
+        self._set_projection(self.width(), self.height())
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
 
-        c   = self.camera
-        eye = c.get_eye()
-        up  = c.get_up()
+        c = self.camera
+        eye, up = c.get_eye(), c.get_up()
         gluLookAt(eye[0], eye[1], eye[2],
                   c.target[0], c.target[1], c.target[2],
                   up[0], up[1], up[2])
 
-        # Draw all bodies
-        for body_id, mesh in self._meshes.items():
-            body = self.workspace.bodies.get(body_id)
-            if body and not body.visible:
-                continue
+        draw_opaque(self._meshes, self.workspace, self.selection)
 
-            # Active body slightly brighter
-            if body_id == self.workspace.active_body_id:
-                glColor3f(0.6, 0.82, 1.0)
-            else:
-                glColor3f(0.45, 0.60, 0.78)
-            mesh.draw()
-
-        glDisable(GL_LIGHTING)
-
-        # Picked face highlight
-        if self.picked_face is not None and self.picked_body_id in self._meshes:
-            mesh = self._meshes[self.picked_body_id]
-            start, count = mesh.get_face_triangle_range(self.picked_face)
-            glColor3f(1.0, 0.4, 0.0)
-            glDisable(GL_DEPTH_TEST)
-            glEnableClientState(GL_VERTEX_ARRAY)
-            glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo_verts)
-            glVertexPointer(3, GL_FLOAT, 0, None)
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo)
-            glDrawElements(GL_TRIANGLES, count * 3, GL_UNSIGNED_INT,
-                           ctypes.c_void_p(start * 3 * 4))
-            glDisableClientState(GL_VERTEX_ARRAY)
-            glBindBuffer(GL_ARRAY_BUFFER, 0)
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0)
-            glEnable(GL_DEPTH_TEST)
-
-        # Edges for all bodies
-        glColor3f(1.0, 1.0, 1.0)
-        glLineWidth(3.0)
-        for body_id, mesh in self._meshes.items():
-            body = self.workspace.bodies.get(body_id)
-            if body and not body.visible:
-                continue
-            mesh.draw_edges()
-
-        glEnable(GL_LIGHTING)
-
+        # Capture matrices and rebuild hover cache while depth buffer
+        # contains only opaque geometry — gives correct occlusion results.
         self._modelview  = glGetDoublev(GL_MODELVIEW_MATRIX)
         self._projection = glGetDoublev(GL_PROJECTION_MATRIX)
         self._viewport   = glGetIntegerv(GL_VIEWPORT)
+        self.hover.rebuild(self._meshes, self.workspace,
+                           self._modelview, self._projection,
+                           self._viewport, self.devicePixelRatio(),
+                           camera_eye=self.camera.get_eye())
+
+        draw_overlays(self._meshes, self.selection,
+                      self._hovered_vertex, self._hovered_edge)
 
     # ------------------------------------------------------------------
-    # Ray casting — picks across all visible bodies
+    # Ray casting
     # ------------------------------------------------------------------
 
     def get_ray(self, x, y):
@@ -222,39 +205,23 @@ class Viewport(QOpenGLWidget):
                         self._modelview, self._projection, self._viewport))
         far  = np.array(gluUnProject(x_px, y_px, 1.0,
                         self._modelview, self._projection, self._viewport))
-        direction = far - near
-        norm = np.linalg.norm(direction)
-        if norm == 0:
-            return None, None
-        return near, direction / norm
+        d    = far - near
+        n    = np.linalg.norm(d)
+        return (near, d / n) if n > 1e-10 else (None, None)
 
-    def _pick_at(self, pos) -> tuple[str | None, int | None]:
-        """
-        Cast a ray against all visible body meshes.
-        Returns (body_id, face_idx) of the closest hit, or (None, None).
-        """
+    def _pick_at(self, pos):
         from cad.picker import pick_face
         origin, direction = self.get_ray(pos.x(), pos.y())
         if origin is None:
             return None, None
-
-        best_body  = None
-        best_face  = None
-        best_t     = float("inf")
-
+        best_t, best_body, best_face = np.inf, None, None
         for body_id, mesh in self._meshes.items():
             body = self.workspace.bodies.get(body_id)
             if body and not body.visible:
                 continue
             result = pick_face(mesh, origin, direction, return_t=True)
-            if result is None:
-                continue
-            face_idx, t = result
-            if t < best_t:
-                best_t    = t
-                best_body = body_id
-                best_face = face_idx
-
+            if result and result[1] < best_t:
+                best_t, best_body, best_face = result[1], body_id, result[0]
         return best_body, best_face
 
     # ------------------------------------------------------------------
@@ -264,36 +231,34 @@ class Viewport(QOpenGLWidget):
     def keyPressEvent(self, e):
         key  = e.key()
         mods = e.modifiers()
-
         if mods & Qt.KeyboardModifier.ControlModifier:
-            if key == Qt.Key.Key_Z:
-                self._do_undo(); return
-            if key == Qt.Key.Key_Y:
-                self._do_redo(); return
-
+            if key == Qt.Key.Key_Z:  self._do_undo(); return
+            if key == Qt.Key.Key_Y:  self._do_redo(); return
         if key == Qt.Key.Key_5:
             self.toggle_projection()
         elif key == Qt.Key.Key_E:
             self._try_extrude()
+        elif key == Qt.Key.Key_Escape:
+            self.selection.clear()
+            self.selection_changed.emit()
+            self.update()
         else:
             super().keyPressEvent(e)
 
     def toggle_projection(self):
         self.camera.toggle_ortho()
-        cb = self.camera_projection_changed
-        if cb:
-            cb(self.camera.ortho)
+        if self.camera_projection_changed:
+            self.camera_projection_changed(self.camera.ortho)
         self.update()
 
     # ------------------------------------------------------------------
-    # Undo / Redo / Seek
+    # Undo / Redo / Seek / Replay
     # ------------------------------------------------------------------
 
     def _do_undo(self):
         entry = self.history.undo()
         if entry is None:
-            print("[Undo] Nothing to undo.")
-            return
+            print("[Undo] Nothing to undo."); return
         print(f"[Undo] Reverting: {entry.label}")
         self._rebuild_all_meshes()
         self.history_changed.emit()
@@ -301,8 +266,7 @@ class Viewport(QOpenGLWidget):
     def _do_redo(self):
         entry = self.history.redo()
         if entry is None:
-            print("[Redo] Nothing to redo.")
-            return
+            print("[Redo] Nothing to redo."); return
         print(f"[Redo] Restoring: {entry.label}")
         self._rebuild_all_meshes()
         self.history_changed.emit()
@@ -311,10 +275,6 @@ class Viewport(QOpenGLWidget):
         if self.history.seek(index):
             self._rebuild_all_meshes()
             self.history_changed.emit()
-
-    # ------------------------------------------------------------------
-    # Parametric replay
-    # ------------------------------------------------------------------
 
     def do_replay(self, from_index: int):
         print(f"[Replay] Replaying from entry {from_index}…")
@@ -333,61 +293,45 @@ class Viewport(QOpenGLWidget):
     # ------------------------------------------------------------------
 
     def _try_extrude(self):
-        if self.picked_face is None or self.picked_body_id is None:
-            print("[Extrude] No face selected — click a face first.")
-            return
+        if self.selection.face_count == 0:
+            print("[Extrude] No face selected."); return
+        sf = self.selection.single_face or self.selection.faces[0]
         cb = self.request_extrude_distance
         if cb:
-            cb(self.picked_body_id, self.picked_face)
+            cb(sf.body_id, sf.face_idx)
         else:
-            self._do_extrude_dialog(self.picked_body_id, self.picked_face)
+            self._do_extrude_dialog(sf.body_id, sf.face_idx)
 
     def _do_extrude_dialog(self, body_id, face_idx):
         from PyQt6.QtWidgets import QInputDialog
         dist, ok = QInputDialog.getDouble(
             self, "Extrude",
             "Distance (positive = add material, negative = cut):",
-            value=5.0, min=-1000.0, max=1000.0, decimals=3,
-        )
-        if not ok:
-            return
-        self.do_extrude(body_id, face_idx, dist)
+            value=5.0, min=-1000.0, max=1000.0, decimals=3)
+        if ok:
+            self.do_extrude(body_id, face_idx, dist)
 
     def do_extrude(self, body_id: str, face_idx: int, distance: float):
         from cad.operations import extrude_face
         from cad.face_ref import FaceRef
-
         mesh = self._meshes.get(body_id)
         if mesh is None:
-            print(f"[Extrude] No mesh for body {body_id}")
-            return
-
+            print(f"[Extrude] No mesh for body {body_id}"); return
         shape_before = self.workspace.current_shape(body_id)
         face_ref     = FaceRef.from_b3d_face(mesh.occt_faces[face_idx])
         if face_ref is None:
-            print(f"[Extrude] Face {face_idx} is not planar.")
-            return
-
+            print(f"[Extrude] Face {face_idx} is not planar."); return
         try:
             shape_after = extrude_face(shape_before, face_idx, distance)
         except Exception as ex:
-            print(f"[Extrude] FAILED: {ex}")
-            return
-
+            print(f"[Extrude] FAILED: {ex}"); return
         op    = "cut" if distance < 0 else "extrude"
         label = (f"Cut  -{abs(distance):.3f}mm" if distance < 0
                  else f"Extrude  +{distance:.3f}mm")
-
         self.history.push(
-            label        = label,
-            operation    = op,
-            params       = {"distance": abs(distance)},
-            body_id      = body_id,
-            face_ref     = face_ref,
-            shape_before = shape_before,
-            shape_after  = shape_after,
-        )
-
+            label=label, operation=op, params={"distance": abs(distance)},
+            body_id=body_id, face_ref=face_ref,
+            shape_before=shape_before, shape_after=shape_after)
         print(f"[Extrude] body={self.workspace.bodies[body_id].name} "
               f"face={face_idx}  distance={distance:+.3f}  OK")
         self._rebuild_body_mesh(body_id)
@@ -398,58 +342,76 @@ class Viewport(QOpenGLWidget):
     # ------------------------------------------------------------------
 
     def mouseDoubleClickEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            body_id, idx = self._pick_at(e.position())
-            if idx is None:
-                return
-            mesh = self._meshes.get(body_id)
-            if mesh is None:
-                return
-            face = mesh.occt_faces[idx]
-            try:
-                from build123d import Plane
-                plane = Plane(face)
-                n  = plane.z_dir
-                wo = plane.origin
-                self.camera.snap_to_normal(
-                    n.X, n.Y, n.Z, origin=(wo.X, wo.Y, wo.Z))
-                self.update()
-            except Exception:
-                pass
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        body_id, idx = self._pick_at(e.position())
+        if idx is None:
+            return
+        mesh = self._meshes.get(body_id)
+        if mesh is None:
+            return
+        try:
+            from build123d import Plane
+            plane = Plane(mesh.occt_faces[idx])
+            n, wo = plane.z_dir, plane.origin
+            self.camera.snap_to_normal(n.X, n.Y, n.Z,
+                                       origin=(wo.X, wo.Y, wo.Z))
+            self.update()
+        except Exception:
+            pass
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            body_id, idx = self._pick_at(e.position())
-            if idx is not None:
-                self.picked_body_id  = body_id
-                self.picked_face     = idx
-                mesh = self._meshes[body_id]
-                self.picked_face_obj = mesh.occt_faces[idx]
-                # Make clicked body active
-                self.workspace.set_active_body(body_id)
-                try:
-                    from build123d import Plane
-                    plane = Plane(self.picked_face_obj)
-                    body_name = self.workspace.bodies[body_id].name
-                    print(f"Picked face {idx} | {body_name} | planar | "
-                          f"normal={plane.z_dir} origin={plane.origin}")
-                except Exception:
-                    body_name = self.workspace.bodies[body_id].name
-                    print(f"Picked face {idx} | {body_name} | non-planar")
+            additive = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            hov_body,  hov_idx  = self._hovered_vertex
+            hov_ebody, hov_eidx = self._hovered_edge
+
+            if hov_body is not None:
+                self.selection.select_vertex(hov_body, hov_idx,
+                                             additive=additive)
+                self.workspace.set_active_body(hov_body)
+                p = self._meshes[hov_body].topo_verts[hov_idx]
+                print(f"Picked vertex {hov_idx} | "
+                      f"{self.workspace.bodies[hov_body].name} | "
+                      f"pos=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})")
+
+            elif hov_ebody is not None:
+                self.selection.select_edge(hov_ebody, hov_eidx,
+                                           additive=additive)
+                self.workspace.set_active_body(hov_ebody)
+                print(f"Picked edge {hov_eidx} | "
+                      f"{self.workspace.bodies[hov_ebody].name}")
+
             else:
-                self.picked_body_id  = None
-                self.picked_face     = None
-                self.picked_face_obj = None
+                body_id, idx = self._pick_at(e.position())
+                if idx is not None:
+                    self.selection.select_face(body_id, idx, additive=additive)
+                    self.workspace.set_active_body(body_id)
+                    mesh = self._meshes[body_id]
+                    try:
+                        from build123d import Plane
+                        plane = Plane(mesh.occt_faces[idx])
+                        print(f"Picked face {idx} | "
+                              f"{self.workspace.bodies[body_id].name} | "
+                              f"planar | normal={plane.z_dir}")
+                    except Exception:
+                        print(f"Picked face {idx} | "
+                              f"{self.workspace.bodies[body_id].name} | "
+                              f"non-planar")
+                elif not additive:
+                    self.selection.clear()
+
+            self.selection_changed.emit()
             self.update()
 
         elif e.button() == Qt.MouseButton.RightButton:
             body_id, idx = self._pick_at(e.position())
             pivot = None
             if idx is not None and body_id in self._meshes:
-                mesh = self._meshes[body_id]
+                mesh  = self._meshes[body_id]
                 start, count = mesh.get_face_triangle_range(idx)
-                face_tris = mesh.tris[start:start + count]
-                pivot = mesh.verts[face_tris].mean(axis=(0, 1)).tolist()
+                pivot = mesh.verts[mesh.tris[start:start+count]].mean(
+                    axis=(0, 1)).tolist()
             self.camera.begin_orbit(e.position(), self.width(), self.height(),
                                     pivot=pivot)
 
@@ -459,10 +421,19 @@ class Viewport(QOpenGLWidget):
     def mouseMoveEvent(self, e):
         buttons = e.buttons()
         if buttons & Qt.MouseButton.RightButton:
-            self.camera.orbit(e.position())
-            self.update()
+            self.camera.orbit(e.position()); self.update(); return
         if buttons & Qt.MouseButton.MiddleButton:
-            self.camera.pan(e.position())
+            self.camera.pan(e.position());   self.update(); return
+
+        # No button — update hover (vertex takes priority over edge)
+        x, y    = e.position().x(), e.position().y()
+        new_v   = self.hover.vertex_at(x, y)
+        new_e   = (None, None) if new_v[0] is not None \
+                  else self.hover.edge_at(x, y)
+
+        if new_v != self._hovered_vertex or new_e != self._hovered_edge:
+            self._hovered_vertex = new_v
+            self._hovered_edge   = new_e
             self.update()
 
     def mouseReleaseEvent(self, e):

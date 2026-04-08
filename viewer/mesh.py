@@ -43,7 +43,15 @@ class Mesh:
         self.bbox_min = self.verts.min(axis=0)
         self.bbox_max = self.verts.max(axis=0)
 
-        # Legacy compatibility — code that still references these gets no-op values
+        # True topological vertices — actual CAD corners where edges meet.
+        # A box has 8, a cylinder has 2, etc.
+        self.topo_verts = _extract_topo_verts(shape)
+
+        # True topological edges — each is a (N,3) polyline in world mm.
+        # Straight edges have 2 points; curves are discretised to ~0.05mm.
+        self.topo_edges = _extract_topo_edges(shape)
+
+        # Legacy compatibility
         self.center = np.array([0.0, 0.0, 0.0])
         self.scale  = 1.0
 
@@ -101,3 +109,102 @@ class Mesh:
         start = int(self.triangles_per_face[:face_idx].sum())
         count = int(self.triangles_per_face[face_idx])
         return start, count
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _extract_topo_verts(shape) -> np.ndarray:
+    """
+    Extract the true topological vertices from a build123d shape via OCCT.
+    These are the actual CAD corners (where edges meet), not tessellation pts.
+    Returns a (N, 3) float32 array in world millimetre coordinates.
+    """
+    from OCP.BRep import BRep_Tool
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_VERTEX
+    from OCP.TopoDS import TopoDS
+
+    seen = set()
+    pts  = []
+
+    explorer = TopExp_Explorer(shape.wrapped, TopAbs_VERTEX)
+    while explorer.More():
+        vert = TopoDS.Vertex_s(explorer.Current())
+        pnt  = BRep_Tool.Pnt_s(vert)
+        key  = (round(pnt.X(), 4), round(pnt.Y(), 4), round(pnt.Z(), 4))
+        if key not in seen:
+            seen.add(key)
+            pts.append([pnt.X(), pnt.Y(), pnt.Z()])
+        explorer.Next()
+
+    if not pts:
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.array(pts, dtype=np.float32)
+
+
+def _extract_topo_edges(shape) -> list[np.ndarray]:
+    """
+    Extract topological edges from a build123d shape via OCCT.
+
+    Each edge is returned as a (N, 3) float32 array of world-space points
+    forming a polyline along the edge.  Straight edges have 2 points; arcs
+    and curves are discretised so hover highlighting looks correct.
+
+    Returns a list of arrays, one per unique edge.
+    """
+    from OCP.BRep import BRep_Tool
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopoDS import TopoDS
+    from OCP.GCPnts import GCPnts_UniformAbscissa
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+
+    edges = []
+    seen  = set()
+
+    explorer = TopExp_Explorer(shape.wrapped, TopAbs_EDGE)
+    while explorer.More():
+        edge = TopoDS.Edge_s(explorer.Current())
+
+        try:
+            adaptor = BRepAdaptor_Curve(edge)
+            first   = adaptor.FirstParameter()
+            last    = adaptor.LastParameter()
+
+            discretiser = GCPnts_UniformAbscissa()
+            discretiser.Initialize(adaptor, 64, first, last, 0.05)
+
+            pts = []
+            if discretiser.IsDone() and discretiser.NbPoints() >= 2:
+                for i in range(1, discretiser.NbPoints() + 1):
+                    p = adaptor.Value(discretiser.Parameter(i))
+                    pts.append([p.X(), p.Y(), p.Z()])
+            else:
+                p0 = adaptor.Value(first)
+                p1 = adaptor.Value(last)
+                pts = [[p0.X(), p0.Y(), p0.Z()],
+                       [p1.X(), p1.Y(), p1.Z()]]
+
+            if len(pts) < 2:
+                explorer.Next()
+                continue
+
+            arr = np.array(pts, dtype=np.float32)
+
+            # Deduplicate by rounded midpoint
+            mid = arr[len(arr) // 2]
+            key = (round(float(mid[0]), 3),
+                   round(float(mid[1]), 3),
+                   round(float(mid[2]), 3))
+            if key not in seen:
+                seen.add(key)
+                edges.append(arr)
+
+        except Exception:
+            pass  # skip degenerate edges
+
+        explorer.Next()
+
+    return edges
