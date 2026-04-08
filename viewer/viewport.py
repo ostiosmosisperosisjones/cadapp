@@ -24,6 +24,7 @@ from cad.selection import SelectionSet
 class Viewport(QOpenGLWidget):
     history_changed   = pyqtSignal()
     selection_changed = pyqtSignal()
+    sketch_mode_changed = pyqtSignal(bool)   # True = entered, False = exited
 
     def __init__(self, workspace: Workspace, history: History):
         super().__init__()
@@ -42,6 +43,9 @@ class Viewport(QOpenGLWidget):
 
         self._hovered_vertex: tuple[str | None, int | None] = (None, None)
         self._hovered_edge:   tuple[str | None, int | None] = (None, None)
+
+        # Sketch modal state — None when not in sketch mode
+        self._sketch = None   # SketchMode | None
 
         self.camera_projection_changed = None
         self.request_extrude_distance  = None
@@ -136,7 +140,9 @@ class Viewport(QOpenGLWidget):
     # ------------------------------------------------------------------
 
     def initializeGL(self):
-        glClearColor(0.15, 0.15, 0.15, 1.0)
+        from cad.prefs import prefs
+        r, g, b = prefs.background_color
+        glClearColor(r, g, b, 1.0)
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_LIGHTING)
         glEnable(GL_LIGHT0)
@@ -189,7 +195,9 @@ class Viewport(QOpenGLWidget):
                            camera_eye=self.camera.get_eye())
 
         draw_overlays(self._meshes, self.selection,
-                      self._hovered_vertex, self._hovered_edge)
+                      self._hovered_vertex, self._hovered_edge,
+                      sketch=self._sketch,
+                      camera_distance=self.camera.distance)
 
     # ------------------------------------------------------------------
     # Ray casting
@@ -231,6 +239,48 @@ class Viewport(QOpenGLWidget):
     def keyPressEvent(self, e):
         key  = e.key()
         mods = e.modifiers()
+
+        if key == Qt.Key.Key_Escape:
+            if self._sketch is not None:
+                from cad.sketch import SketchTool
+                if self._sketch.tool != SketchTool.NONE:
+                    # First ESC: cancel active tool, stay in sketch
+                    self._sketch.set_tool(SketchTool.NONE)
+                    self.sketch_mode_changed.emit(True)  # refresh status bar
+                else:
+                    # Second ESC (or ESC with no tool): exit sketch
+                    self._exit_sketch()
+            else:
+                self.selection.clear()
+                self.selection_changed.emit()
+            self.update()
+            return
+
+        # Keys active inside sketch mode
+        if self._sketch is not None:
+            from cad.sketch import SketchTool
+            if key == Qt.Key.Key_L:
+                self._sketch.set_tool(SketchTool.LINE)
+                self.sketch_mode_changed.emit(True)
+                self.update()
+            elif key == Qt.Key.Key_I:
+                n = self._sketch.include_selection(self.selection, self._meshes)
+                if n:
+                    print(f"[Sketch] Included {n} reference "
+                          f"{'entity' if n == 1 else 'entities'}")
+                    self.selection.clear()
+                    self.selection_changed.emit()
+                    self.update()
+                else:
+                    print("[Sketch] Nothing selected to include — "
+                          "select edges or vertices first.")
+            elif key == Qt.Key.Key_5:
+                self.toggle_projection()
+            else:
+                super().keyPressEvent(e)
+            return
+
+        # Normal 3D mode keys
         if mods & Qt.KeyboardModifier.ControlModifier:
             if key == Qt.Key.Key_Z:  self._do_undo(); return
             if key == Qt.Key.Key_Y:  self._do_redo(); return
@@ -238,10 +288,6 @@ class Viewport(QOpenGLWidget):
             self.toggle_projection()
         elif key == Qt.Key.Key_E:
             self._try_extrude()
-        elif key == Qt.Key.Key_Escape:
-            self.selection.clear()
-            self.selection_changed.emit()
-            self.update()
         else:
             super().keyPressEvent(e)
 
@@ -341,27 +387,69 @@ class Viewport(QOpenGLWidget):
     # Mouse
     # ------------------------------------------------------------------
 
-    def mouseDoubleClickEvent(self, e):
-        if e.button() != Qt.MouseButton.LeftButton:
-            return
-        body_id, idx = self._pick_at(e.position())
-        if idx is None:
-            return
+    # ------------------------------------------------------------------
+    # Sketch modal
+    # ------------------------------------------------------------------
+
+    def _enter_sketch(self, body_id: str, face_idx: int):
+        """Enter sketch mode on a planar face."""
+        from cad.sketch import SketchMode
+        from build123d import Plane
         mesh = self._meshes.get(body_id)
         if mesh is None:
             return
         try:
-            from build123d import Plane
-            plane = Plane(mesh.occt_faces[idx])
-            n, wo = plane.z_dir, plane.origin
-            self.camera.snap_to_normal(n.X, n.Y, n.Z,
-                                       origin=(wo.X, wo.Y, wo.Z))
-            self.update()
+            b3d_plane = Plane(mesh.occt_faces[face_idx])
         except Exception:
-            pass
+            print("[Sketch] Face is not planar — cannot enter sketch mode.")
+            return
+        # Snap camera to face normal so the sketch looks flat
+        n, wo = b3d_plane.z_dir, b3d_plane.origin
+        self.camera.snap_to_normal(n.X, n.Y, n.Z, origin=(wo.X, wo.Y, wo.Z))
+        self._sketch = SketchMode(b3d_plane, body_id, face_idx)
+        # No tool active by default — user picks a tool explicitly
+        self.selection.clear()
+        self.hover.clear()
+        self.selection_changed.emit()
+        self.sketch_mode_changed.emit(True)
+        self.update()
+        print(f"[Sketch] Entered sketch on face {face_idx} of "
+              f"{self.workspace.bodies[body_id].name}")
+
+    def _exit_sketch(self):
+        """Exit sketch mode, discarding the current sketch."""
+        if self._sketch is None:
+            return
+        self._sketch = None
+        self.sketch_mode_changed.emit(False)
+        self.update()
+        print("[Sketch] Exited sketch mode.")
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        # In sketch mode, double-click does nothing special
+        if self._sketch is not None:
+            return
+        body_id, idx = self._pick_at(e.position())
+        if idx is None:
+            return
+        self._enter_sketch(body_id, idx)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
+            if self._sketch is not None:
+                from cad.sketch import SketchTool
+                if self._sketch.tool != SketchTool.NONE:
+                    # A tool is active — consume the click for drawing
+                    origin, direction = self.get_ray(e.position().x(),
+                                                     e.position().y())
+                    if origin is not None:
+                        self._sketch.handle_click(origin, direction)
+                        self.update()
+                    return
+                # No tool active — fall through to normal vertex/edge/face selection
+
             additive = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             hov_body,  hov_idx  = self._hovered_vertex
             hov_ebody, hov_eidx = self._hovered_edge
@@ -425,15 +513,28 @@ class Viewport(QOpenGLWidget):
         if buttons & Qt.MouseButton.MiddleButton:
             self.camera.pan(e.position());   self.update(); return
 
-        # No button — update hover (vertex takes priority over edge)
-        x, y    = e.position().x(), e.position().y()
-        new_v   = self.hover.vertex_at(x, y)
-        new_e   = (None, None) if new_v[0] is not None \
-                  else self.hover.edge_at(x, y)
+        x, y = e.position().x(), e.position().y()
 
-        if new_v != self._hovered_vertex or new_e != self._hovered_edge:
-            self._hovered_vertex = new_v
-            self._hovered_edge   = new_e
+        # Always update vertex/edge hover (visible in both 3D and sketch mode)
+        new_v = self.hover.vertex_at(x, y)
+        new_e = (None, None) if new_v[0] is not None \
+                else self.hover.edge_at(x, y)
+        hover_changed = (new_v != self._hovered_vertex or
+                         new_e != self._hovered_edge)
+        self._hovered_vertex = new_v
+        self._hovered_edge   = new_e
+
+        # If a sketch tool is active, also update the sketch cursor
+        sketch_changed = False
+        if self._sketch is not None:
+            from cad.sketch import SketchTool
+            if self._sketch.tool != SketchTool.NONE:
+                origin, direction = self.get_ray(x, y)
+                if origin is not None:
+                    self._sketch.handle_mouse_move(origin, direction)
+                    sketch_changed = True
+
+        if hover_changed or sketch_changed:
             self.update()
 
     def mouseReleaseEvent(self, e):

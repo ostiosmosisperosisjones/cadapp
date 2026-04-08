@@ -1,10 +1,13 @@
 """
 cad/sketch.py
-Sketch mode data model.
 
-SketchPlane  — a build123d Plane transformed into normalised mesh-space,
-               providing the axes / origin used by the overlay and picker.
-SketchMode   — holds the active plane, sketch entities, and current tool.
+Sketch mode data model.  All coordinates in world millimetres — no
+normalisation, matching the rest of the pipeline since mesh coordinates
+were moved to world space.
+
+SketchPlane  — wraps a build123d Plane, provides world-space axes/origin
+               and ray intersection / coordinate conversion helpers.
+SketchMode   — holds the active plane, entities, and tool state.
 """
 
 from __future__ import annotations
@@ -25,14 +28,30 @@ class SketchTool(Enum):
 
 
 # ---------------------------------------------------------------------------
-# Entity types (minimal, extend as needed)
+# Entity types
 # ---------------------------------------------------------------------------
 
 class LineEntity:
-    """A 2-D line segment in sketch coordinates."""
+    """A 2-D line segment in sketch (u, v) coordinates (world mm)."""
     def __init__(self, p0: tuple[float, float], p1: tuple[float, float]):
         self.p0 = np.array(p0, dtype=np.float64)
         self.p1 = np.array(p1, dtype=np.float64)
+
+
+class ReferenceEntity:
+    """
+    A projected reference polyline — created by the Include tool.
+
+    Stores a list of 2-D (u, v) points forming a polyline projected from
+    a selected 3-D edge or vertex onto the sketch plane.  Rendered in a
+    distinct dim style and used as snap targets; not part of the sketch
+    profile for extrude.
+
+    source_type : 'edge' | 'vertex'
+    """
+    def __init__(self, points: list[np.ndarray], source_type: str = 'edge'):
+        self.points      = [np.array(p, dtype=np.float64) for p in points]
+        self.source_type = source_type
 
 
 # ---------------------------------------------------------------------------
@@ -41,39 +60,24 @@ class LineEntity:
 
 class SketchPlane:
     """
-    Wraps a build123d Plane and exposes the origin / axes already transformed
-    into the normalised mesh-space used by the OpenGL viewport.
-
-    Parameters
-    ----------
-    b3d_plane : build123d.Plane
-    mesh_center : array-like, shape (3,)   — Mesh.center
-    mesh_scale  : float                    — Mesh.scale
+    Wraps a build123d Plane.  Exposes origin and axes in world mm space,
+    matching the coordinate system used by mesh VBOs and the camera.
     """
 
-    def __init__(self, b3d_plane: Plane, mesh_center, mesh_scale: float):
-        self._plane      = b3d_plane
-        self.mesh_center = np.array(mesh_center, dtype=np.float64)
-        self.mesh_scale  = float(mesh_scale)
+    def __init__(self, b3d_plane: Plane):
+        self._plane = b3d_plane
 
-        wo = b3d_plane.origin  # build123d Vector
-        # Transform origin into normalised GL space
-        self.origin = np.array([
-            (wo.X - mesh_center[0]) / mesh_scale,
-            (wo.Y - mesh_center[1]) / mesh_scale,
-            (wo.Z - mesh_center[2]) / mesh_scale,
-        ], dtype=np.float64)
+        wo = b3d_plane.origin
+        self.origin = np.array([wo.X, wo.Y, wo.Z], dtype=np.float64)
 
-        # Axes — pure directions, no translation needed
         xd = b3d_plane.x_dir
-        yd = b3d_plane.y_dir   # build123d calls this the in-plane Y
-        zd = b3d_plane.z_dir   # face normal
+        yd = b3d_plane.y_dir
+        zd = b3d_plane.z_dir
 
-        self.x_axis  = np.array([xd.X, xd.Y, xd.Z], dtype=np.float64)
-        self.y_axis  = np.array([yd.X, yd.Y, yd.Z], dtype=np.float64)
-        self.normal  = np.array([zd.X, zd.Y, zd.Z], dtype=np.float64)
+        self.x_axis = np.array([xd.X, xd.Y, xd.Z], dtype=np.float64)
+        self.y_axis = np.array([yd.X, yd.Y, yd.Z], dtype=np.float64)
+        self.normal = np.array([zd.X, zd.Y, zd.Z], dtype=np.float64)
 
-        # Normalise (should already be unit, but floating-point safety)
         self.x_axis /= np.linalg.norm(self.x_axis)
         self.y_axis /= np.linalg.norm(self.y_axis)
         self.normal  /= np.linalg.norm(self.normal)
@@ -85,34 +89,38 @@ class SketchPlane:
     def ray_intersect(self, ray_origin: np.ndarray, ray_dir: np.ndarray
                       ) -> tuple[np.ndarray | None, np.ndarray | None]:
         """
-        Intersect a ray with this plane (all in normalised GL space).
-
-        Returns
-        -------
-        pt3d  : (3,) world-space intersection, or None if parallel
-        pt2d  : (2,) sketch-space (u, v) coords, or None if parallel
+        Intersect a ray with this plane (world mm).
+        Returns (pt3d, pt2d) or (None, None) if parallel / behind.
         """
         denom = float(np.dot(ray_dir, self.normal))
         if abs(denom) < 1e-9:
             return None, None
-
         t = float(np.dot(self.origin - ray_origin, self.normal)) / denom
         if t < 0:
             return None, None
-
-        pt3d = ray_origin + t * ray_dir
+        pt3d  = ray_origin + t * ray_dir
         delta = pt3d - self.origin
         u = float(np.dot(delta, self.x_axis))
         v = float(np.dot(delta, self.y_axis))
         return pt3d, np.array([u, v], dtype=np.float64)
 
     # ------------------------------------------------------------------
-    # 2-D → 3-D (for rendering entities)
+    # 2-D → 3-D
     # ------------------------------------------------------------------
 
     def to_3d(self, u: float, v: float) -> np.ndarray:
-        """Convert sketch-space coords to normalised GL-space 3-D point."""
+        """Sketch (u, v) in mm → world 3-D point."""
         return self.origin + u * self.x_axis + v * self.y_axis
+
+    def project_point(self, world_pt: np.ndarray) -> np.ndarray:
+        """
+        Orthographically project a world 3-D point onto this plane.
+        Returns (u, v) sketch coordinates in mm.
+        """
+        delta = np.array(world_pt, dtype=np.float64) - self.origin
+        u = float(np.dot(delta, self.x_axis))
+        v = float(np.dot(delta, self.y_axis))
+        return np.array([u, v], dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -123,53 +131,93 @@ class SketchMode:
     """
     Holds everything about the active sketch session.
 
-    Create one when the user double-clicks a planar face; discard on Escape.
+    Created when the user double-clicks a planar face.
+    Discarded on ESC or when the sketch is committed.
+
+    Parameters
+    ----------
+    b3d_plane : build123d.Plane   — the face plane in world mm
+    body_id   : str               — which body this sketch is on
+    face_idx  : int               — face index within that body
     """
 
-    def __init__(self, sketch_plane: SketchPlane, face_idx: int):
-        self.plane     = sketch_plane
-        self.face_idx  = face_idx
-        self.entities: list = []         # LineEntity, etc.
-        self.tool      = SketchTool.NONE
+    def __init__(self, b3d_plane: Plane, body_id: str, face_idx: int):
+        self.plane    = SketchPlane(b3d_plane)
+        self.body_id  = body_id
+        self.face_idx = face_idx
+        self.entities: list = []
+        self.tool = SketchTool.NONE
 
-        # In-progress line tool state
         self._line_start: np.ndarray | None = None
-        self._cursor_2d:  np.ndarray | None = None  # live cursor position
+        self._cursor_2d:  np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # Tool helpers
     # ------------------------------------------------------------------
 
     def set_tool(self, tool: SketchTool):
-        self.tool = tool
+        self.tool        = tool
         self._line_start = None
         self._cursor_2d  = None
 
-    def handle_mouse_move(self, ray_origin, ray_dir):
-        """Update live cursor. Call from Viewport.mouseMoveEvent in SKETCH mode."""
-        _, pt2d = self.plane.ray_intersect(
-            np.array(ray_origin), np.array(ray_dir)
-        )
-        self._cursor_2d = pt2d  # may be None if ray is parallel to plane
+    def handle_mouse_move(self, ray_origin: np.ndarray, ray_dir: np.ndarray):
+        _, pt2d = self.plane.ray_intersect(ray_origin, ray_dir)
+        self._cursor_2d = pt2d
 
-    def handle_click(self, ray_origin, ray_dir) -> bool:
-        """
-        Handle a left-click in sketch mode.
-        Returns True if a repaint is needed.
-        """
-        _, pt2d = self.plane.ray_intersect(
-            np.array(ray_origin), np.array(ray_dir)
-        )
+    def handle_click(self, ray_origin: np.ndarray, ray_dir: np.ndarray) -> bool:
+        _, pt2d = self.plane.ray_intersect(ray_origin, ray_dir)
         if pt2d is None:
             return False
-
         if self.tool == SketchTool.LINE:
             if self._line_start is None:
                 self._line_start = pt2d.copy()
-                return True
             else:
                 self.entities.append(LineEntity(self._line_start, pt2d))
-                self._line_start = pt2d.copy()   # chain: next segment starts here
-                return True
-
+                self._line_start = pt2d.copy()
+            return True
         return False
+
+    @property
+    def is_empty(self) -> bool:
+        return len(self.entities) == 0
+
+    # ------------------------------------------------------------------
+    # Include (reference geometry projection)
+    # ------------------------------------------------------------------
+
+    def include_selection(self, selection, meshes: dict) -> int:
+        """
+        Project all selected edges and vertices onto the sketch plane as
+        ReferenceEntity instances and append them to self.entities.
+
+        Parameters
+        ----------
+        selection : SelectionSet
+        meshes    : dict[body_id, Mesh]
+
+        Returns the number of reference entities added.
+        """
+        added = 0
+
+        # Selected edges → project each polyline point
+        for es in selection.edges:
+            mesh = meshes.get(es.body_id)
+            if mesh is None or es.edge_idx >= len(mesh.topo_edges):
+                continue
+            world_pts = mesh.topo_edges[es.edge_idx]   # (N, 3) float32
+            uv_pts = [self.plane.project_point(p) for p in world_pts]
+            if len(uv_pts) >= 2:
+                self.entities.append(ReferenceEntity(uv_pts, source_type='edge'))
+                added += 1
+
+        # Selected vertices → each becomes a single-point reference
+        for vs in selection.vertices:
+            mesh = meshes.get(vs.body_id)
+            if mesh is None or vs.vertex_idx >= len(mesh.topo_verts):
+                continue
+            world_pt = mesh.topo_verts[vs.vertex_idx]
+            uv_pt    = self.plane.project_point(world_pt)
+            self.entities.append(ReferenceEntity([uv_pt], source_type='vertex'))
+            added += 1
+
+        return added

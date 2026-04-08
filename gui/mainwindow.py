@@ -38,11 +38,36 @@ class MainWindow(QMainWindow):
             }
             QStatusBar::item { border: none; }
         """)
-        # Permanent widget on the right — shows selection count
         from PyQt6.QtWidgets import QLabel
+        # Left side — sketch mode indicator
+        self._sketch_label = QLabel("")
+        self._sketch_label.setStyleSheet(
+            "color: #4fc3f7; font-weight: bold; padding-left: 8px;")
+        sb.addWidget(self._sketch_label)
+
+        # Right side — selection count
         self._sel_label = QLabel("")
         self._sel_label.setStyleSheet("color: #888; padding-right: 8px;")
         sb.addPermanentWidget(self._sel_label)
+
+    def _update_sketch_label(self, in_sketch: bool):
+        if not in_sketch:
+            self._sketch_label.setText("")
+            return
+        # Show which tool is active
+        sketch = self._viewport._sketch if self._viewport else None
+        if sketch is None:
+            self._sketch_label.setText("")
+            return
+        from cad.sketch import SketchTool
+        tool_hints = {
+            SketchTool.NONE:   "✏  SKETCH MODE  —  L = line  |  I = include geometry  |  ESC = exit",
+            SketchTool.LINE:   "✏  LINE TOOL  —  click to draw  |  ESC = cancel tool",
+            SketchTool.CIRCLE: "✏  CIRCLE TOOL  —  click to draw  |  ESC = cancel tool",
+            SketchTool.ARC:    "✏  ARC TOOL  —  click to draw  |  ESC = cancel tool",
+        }
+        self._sketch_label.setText(
+            tool_hints.get(sketch.tool, "✏  SKETCH MODE"))
 
     def _update_selection_label(self):
         if self._viewport is None:
@@ -66,6 +91,11 @@ class MainWindow(QMainWindow):
         self._proj_action.triggered.connect(self._toggle_projection)
         view_menu.addAction(self._proj_action)
 
+        view_menu.addSeparator()
+        prefs_act = QAction("Preferences…", self)
+        prefs_act.triggered.connect(self._open_prefs)
+        view_menu.addAction(prefs_act)
+
         ops_menu = menubar.addMenu("Operations")
 
         extrude_act = QAction("Extrude face…  (E)", self)
@@ -83,6 +113,18 @@ class MainWindow(QMainWindow):
         redo_act.setShortcut(QKeySequence.StandardKey.Redo)
         redo_act.triggered.connect(lambda: self._viewport and self._viewport._do_redo())
         ops_menu.addAction(redo_act)
+
+    def _open_prefs(self):
+        from gui.prefs_dialog import PrefsDialog
+        dlg = PrefsDialog(self)
+        if dlg.exec() and self._viewport:
+            # Re-apply background color immediately
+            from OpenGL.GL import glClearColor
+            r, g, b = __import__('cad.prefs', fromlist=['prefs']).prefs.background_color
+            self._viewport.makeCurrent()
+            glClearColor(r, g, b, 1.0)
+            self._viewport.doneCurrent()
+            self._viewport.update()
 
     def _toggle_projection(self):
         if self._viewport:
@@ -166,6 +208,8 @@ class MainWindow(QMainWindow):
 
         # Wire selection → status bar
         vp.selection_changed.connect(self._update_selection_label)
+        # Wire sketch mode → status bar
+        vp.sketch_mode_changed.connect(self._update_sketch_label)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(panel)

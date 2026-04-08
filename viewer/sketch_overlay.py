@@ -1,31 +1,31 @@
 """
 viewer/sketch_overlay.py
-Renders the sketch grid and entities into the existing OpenGL context.
 
-All drawing happens in normalised mesh-space (same space as the mesh VBOs).
-Uses immediate-mode GL lines — good enough for an overlay; no extra VBOs needed
-since sketch geometry changes every frame while editing.
+Renders the sketch grid, axes, entities, and cursor.
+All colors read from cad.prefs.  All coordinates in world mm.
 """
 
 from __future__ import annotations
 import numpy as np
 from OpenGL.GL import *
-from cad.sketch import SketchMode, SketchTool, LineEntity
+from cad.sketch import SketchMode, SketchTool, LineEntity, ReferenceEntity
+from cad.prefs import prefs
 
 
 # ---------------------------------------------------------------------------
 # Adaptive grid spacing
 # ---------------------------------------------------------------------------
 
-_GRID_STEPS = [0.001, 0.002, 0.005,
-               0.01,  0.02,  0.05,
-               0.1,   0.2,   0.5,
-               1.0,   2.0,   5.0,
-               10.0,  20.0,  50.0]
+_GRID_STEPS = [
+    0.01, 0.02, 0.05,
+    0.1,  0.2,  0.5,
+    1.0,  2.0,  5.0,
+    10.0, 20.0, 50.0,
+    100.0, 200.0, 500.0,
+]
 
-def _choose_spacing(ortho_scale: float) -> float:
-    """Pick a grid line spacing that puts roughly 8–20 lines on screen."""
-    target = ortho_scale / 10.0
+def _choose_spacing(camera_distance: float) -> float:
+    target = camera_distance / 15.0
     for s in _GRID_STEPS:
         if s >= target:
             return s
@@ -37,173 +37,148 @@ def _choose_spacing(ortho_scale: float) -> float:
 # ---------------------------------------------------------------------------
 
 class SketchOverlay:
-    """
-    Stateless helper — call draw() every paintGL when in SKETCH mode.
+    """Stateless helper — call draw() every paintGL when in sketch mode."""
 
-    Parameters passed at draw time so there is nothing to keep in sync.
-    """
-
-    # Grid colours
-    GRID_MAJOR_COLOR  = (0.45, 0.55, 0.70, 0.85)   # blueish, opaque enough
-    GRID_MINOR_COLOR  = (0.30, 0.38, 0.50, 0.45)
-    AXIS_X_COLOR      = (0.85, 0.25, 0.25, 1.0)    # red  — sketch X
-    AXIS_Y_COLOR      = (0.25, 0.75, 0.35, 1.0)    # green — sketch Y
-    ENTITY_COLOR      = (0.15, 0.75, 1.00, 1.0)    # cyan — committed lines
-    PREVIEW_COLOR     = (1.00, 0.85, 0.20, 1.0)    # yellow — in-progress line
-    CURSOR_COLOR      = (1.00, 1.00, 1.00, 0.90)   # white crosshair
-
-    GRID_HALF_EXTENT  = 2.5   # how far the grid extends in normalised space
-    AXIS_HALF_LENGTH  = 2.5
-    CURSOR_RADIUS     = 0.012  # crosshair arm length
-
-    def draw(self, sketch: SketchMode, ortho_scale: float):
-        """
-        Draw the full overlay.  Must be called while the GL context is current,
-        after the mesh has been drawn (overlay is rendered on top).
-
-        sketch      — active SketchMode instance
-        ortho_scale — Camera.ortho_scale (drives grid spacing)
-        """
-        plane = sketch.plane
-
-        # Save all relevant GL state
+    def draw(self, sketch: SketchMode, camera_distance: float):
         glPushAttrib(GL_ALL_ATTRIB_BITS)
-
         glDisable(GL_LIGHTING)
         glDisable(GL_DEPTH_TEST)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        glLineWidth(1.0)
 
-        spacing = _choose_spacing(ortho_scale)
-        self._draw_grid(plane, spacing)
-        self._draw_axes(plane)
-        self._draw_entities(sketch, plane)
-        self._draw_preview(sketch, plane)
-        self._draw_cursor(sketch, plane)
+        spacing = _choose_spacing(camera_distance)
+        extent  = camera_distance * 2.0
+
+        self._draw_grid(sketch.plane, spacing, extent)
+        self._draw_axes(sketch.plane, extent)
+        self._draw_references(sketch)
+        self._draw_entities(sketch)
+        self._draw_preview(sketch)
+        self._draw_cursor(sketch, camera_distance)
 
         glPopAttrib()
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Helpers
     # ------------------------------------------------------------------
 
     def _pt(self, plane, u, v):
-        """Plane-space → 3-D (returns a flat Python list for glVertex3f)."""
         p = plane.to_3d(u, v)
         return (float(p[0]), float(p[1]), float(p[2]))
 
-    def _draw_grid(self, plane, spacing):
-        half = self.GRID_HALF_EXTENT
-        n = int(half / spacing) + 1
+    def _draw_grid(self, plane, spacing, extent):
+        n  = int(extent / spacing) + 1
+        nm = int(extent / (spacing * 5)) + 1
 
         glBegin(GL_LINES)
 
-        # Minor grid — every 'spacing'
-        r, g, b, a = self.GRID_MINOR_COLOR
-        glColor4f(r, g, b, a)
+        r, g, b = prefs.sketch_grid_minor_color
+        glColor4f(r, g, b, 0.35)
         for i in range(-n, n + 1):
             t = i * spacing
-            if abs(t) < 1e-9:
-                continue   # skip axes (drawn separately)
-            p0 = self._pt(plane, t, -half)
-            p1 = self._pt(plane, t,  half)
-            glVertex3f(*p0); glVertex3f(*p1)
-            p0 = self._pt(plane, -half, t)
-            p1 = self._pt(plane,  half, t)
-            glVertex3f(*p0); glVertex3f(*p1)
+            if abs(t) < spacing * 0.01:
+                continue
+            glVertex3f(*self._pt(plane,  t,      -extent))
+            glVertex3f(*self._pt(plane,  t,       extent))
+            glVertex3f(*self._pt(plane, -extent,  t))
+            glVertex3f(*self._pt(plane,  extent,  t))
 
-        # Major grid — every 5× spacing
         major = spacing * 5.0
-        nm = int(half / major) + 1
-        r, g, b, a = self.GRID_MAJOR_COLOR
-        glColor4f(r, g, b, a)
+        r, g, b = prefs.sketch_grid_major_color
+        glColor4f(r, g, b, 0.70)
         for i in range(-nm, nm + 1):
             t = i * major
-            if abs(t) < 1e-9:
+            if abs(t) < major * 0.01:
                 continue
-            p0 = self._pt(plane, t, -half)
-            p1 = self._pt(plane, t,  half)
-            glVertex3f(*p0); glVertex3f(*p1)
-            p0 = self._pt(plane, -half, t)
-            p1 = self._pt(plane,  half, t)
-            glVertex3f(*p0); glVertex3f(*p1)
+            glVertex3f(*self._pt(plane,  t,      -extent))
+            glVertex3f(*self._pt(plane,  t,       extent))
+            glVertex3f(*self._pt(plane, -extent,  t))
+            glVertex3f(*self._pt(plane,  extent,  t))
 
         glEnd()
 
-    def _draw_axes(self, plane):
-        half = self.AXIS_HALF_LENGTH
+    def _draw_axes(self, plane, extent):
         glLineWidth(1.8)
         glBegin(GL_LINES)
-
-        # X axis (red)
-        r, g, b, a = self.AXIS_X_COLOR
-        glColor4f(r, g, b, a)
-        glVertex3f(*self._pt(plane, -half, 0))
-        glVertex3f(*self._pt(plane,  half, 0))
-
-        # Y axis (green)
-        r, g, b, a = self.AXIS_Y_COLOR
-        glColor4f(r, g, b, a)
-        glVertex3f(*self._pt(plane, 0, -half))
-        glVertex3f(*self._pt(plane, 0,  half))
-
+        glColor3f(*prefs.sketch_axis_x_color)
+        glVertex3f(*self._pt(plane, -extent, 0))
+        glVertex3f(*self._pt(plane,  extent, 0))
+        glColor3f(*prefs.sketch_axis_y_color)
+        glVertex3f(*self._pt(plane, 0, -extent))
+        glVertex3f(*self._pt(plane, 0,  extent))
         glEnd()
         glLineWidth(1.0)
 
-    def _draw_entities(self, sketch, plane):
-        r, g, b, a = self.ENTITY_COLOR
-        glColor4f(r, g, b, a)
+    def _draw_references(self, sketch: SketchMode):
+        refs = [e for e in sketch.entities if isinstance(e, ReferenceEntity)]
+        if not refs:
+            return
+        r, g, b = prefs.sketch_reference_color
+        glColor4f(r, g, b, 0.75)
+        glLineWidth(1.2)
+        for ref in refs:
+            if len(ref.points) == 1:
+                p  = ref.points[0]
+                cr = 0.8
+                glBegin(GL_LINES)
+                glVertex3f(*self._pt(sketch.plane, p[0] - cr, p[1]))
+                glVertex3f(*self._pt(sketch.plane, p[0] + cr, p[1]))
+                glVertex3f(*self._pt(sketch.plane, p[0], p[1] - cr))
+                glVertex3f(*self._pt(sketch.plane, p[0], p[1] + cr))
+                glEnd()
+            else:
+                glBegin(GL_LINE_STRIP)
+                for p in ref.points:
+                    glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
+                glEnd()
+        glLineWidth(1.0)
+
+    def _draw_entities(self, sketch: SketchMode):
+        lines = [e for e in sketch.entities if isinstance(e, LineEntity)]
+        if not lines:
+            return
+        glColor3f(*prefs.sketch_line_color)
         glLineWidth(2.0)
         glBegin(GL_LINES)
-        for ent in sketch.entities:
-            if isinstance(ent, LineEntity):
-                glVertex3f(*self._pt(plane, ent.p0[0], ent.p0[1]))
-                glVertex3f(*self._pt(plane, ent.p1[0], ent.p1[1]))
+        for ent in lines:
+            glVertex3f(*self._pt(sketch.plane, ent.p0[0], ent.p0[1]))
+            glVertex3f(*self._pt(sketch.plane, ent.p1[0], ent.p1[1]))
         glEnd()
         glLineWidth(1.0)
 
-    def _draw_preview(self, sketch, plane):
-        """Draw the in-progress line from the first click to the cursor."""
+    def _draw_preview(self, sketch: SketchMode):
         if sketch.tool != SketchTool.LINE:
             return
         if sketch._line_start is None or sketch._cursor_2d is None:
             return
-
-        r, g, b, a = self.PREVIEW_COLOR
-        glColor4f(r, g, b, a)
+        r, g, b = prefs.sketch_preview_color
+        glColor3f(r, g, b)
         glLineWidth(1.6)
         glBegin(GL_LINES)
-        glVertex3f(*self._pt(plane, sketch._line_start[0], sketch._line_start[1]))
-        glVertex3f(*self._pt(plane, sketch._cursor_2d[0],  sketch._cursor_2d[1]))
+        glVertex3f(*self._pt(sketch.plane,
+                             sketch._line_start[0], sketch._line_start[1]))
+        glVertex3f(*self._pt(sketch.plane,
+                             sketch._cursor_2d[0],  sketch._cursor_2d[1]))
         glEnd()
-
-        # Small dot at the anchor point
-        self._draw_point(plane, sketch._line_start[0], sketch._line_start[1],
-                         r, g, b, a, size=5.0)
+        glPointSize(5.0)
+        glBegin(GL_POINTS)
+        glVertex3f(*self._pt(sketch.plane,
+                             sketch._line_start[0], sketch._line_start[1]))
+        glEnd()
+        glPointSize(1.0)
         glLineWidth(1.0)
 
-    def _draw_cursor(self, sketch, plane):
-        """Small crosshair at current cursor position."""
+    def _draw_cursor(self, sketch: SketchMode, camera_distance: float):
         if sketch._cursor_2d is None:
             return
         u, v = sketch._cursor_2d
-        cr = self.CURSOR_RADIUS
-        r, g, b, a = self.CURSOR_COLOR
-        glColor4f(r, g, b, a)
+        cr   = camera_distance * 0.008
+        glColor3f(*prefs.sketch_cursor_color)
         glLineWidth(1.2)
         glBegin(GL_LINES)
-        glVertex3f(*self._pt(plane, u - cr, v))
-        glVertex3f(*self._pt(plane, u + cr, v))
-        glVertex3f(*self._pt(plane, u, v - cr))
-        glVertex3f(*self._pt(plane, u, v + cr))
+        glVertex3f(*self._pt(sketch.plane, u - cr, v))
+        glVertex3f(*self._pt(sketch.plane, u + cr, v))
+        glVertex3f(*self._pt(sketch.plane, u,      v - cr))
+        glVertex3f(*self._pt(sketch.plane, u,      v + cr))
         glEnd()
         glLineWidth(1.0)
-
-    def _draw_point(self, plane, u, v, r, g, b, a, size=4.0):
-        glPointSize(size)
-        glColor4f(r, g, b, a)
-        glBegin(GL_POINTS)
-        glVertex3f(*self._pt(plane, u, v))
-        glEnd()
-        glPointSize(1.0)

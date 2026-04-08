@@ -1,21 +1,24 @@
 """
 viewer/renderer.py
 
-OpenGL draw calls split into two phases so the caller can read the depth
-buffer between them (for hover occlusion testing):
+OpenGL draw calls split into two phases:
 
-    draw_opaque(...)   — solid geometry + wireframe edges
-    draw_overlays(...) — selected/hovered highlights on top
+    draw_opaque(...)   — solid geometry + optional wireframe edges
+    draw_overlays(...) — selection/hover highlights + optional sketch overlay
+
+All colors read from cad.prefs so they can be changed without touching
+this file.
 """
 
 import ctypes
 from OpenGL.GL import *
+from cad.prefs import prefs
 
 
 def draw_opaque(meshes, workspace, selection):
     """
-    Phase 1: draw solid geometry and wireframe edges.
-    Depth buffer is valid and complete after this returns.
+    Phase 1: solid geometry, optional wireframe, selected face highlights.
+    Depth buffer is fully populated after this returns.
     """
     glEnable(GL_LIGHTING)
     glEnable(GL_DEPTH_TEST)
@@ -24,15 +27,16 @@ def draw_opaque(meshes, workspace, selection):
         body = workspace.bodies.get(body_id)
         if body and not body.visible:
             continue
-        glColor3f(0.6, 0.82, 1.0) if body_id == workspace.active_body_id \
-            else glColor3f(0.45, 0.60, 0.78)
+        c = prefs.body_color_active if body_id == workspace.active_body_id \
+            else prefs.body_color
+        glColor3f(*c)
         mesh.draw()
 
     glDisable(GL_LIGHTING)
 
     # Selected face highlights
     if selection.face_count > 0:
-        glColor3f(1.0, 0.4, 0.0)
+        glColor3f(*prefs.face_selected_color)
         glDisable(GL_DEPTH_TEST)
         glEnableClientState(GL_VERTEX_ARRAY)
         for face_sel in selection.faces:
@@ -50,22 +54,25 @@ def draw_opaque(meshes, workspace, selection):
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0)
         glEnable(GL_DEPTH_TEST)
 
-    # Wireframe edges
-    glColor3f(1.0, 1.0, 1.0)
-    glLineWidth(3.0)
-    for body_id, mesh in meshes.items():
-        body = workspace.bodies.get(body_id)
-        if body and not body.visible:
-            continue
-        mesh.draw_edges()
-    glLineWidth(1.0)
+    # Wireframe edges — optional, respects prefs
+    if prefs.show_edges:
+        glColor3f(*prefs.edge_color)
+        glLineWidth(prefs.edge_width)
+        for body_id, mesh in meshes.items():
+            body = workspace.bodies.get(body_id)
+            if body and not body.visible:
+                continue
+            mesh.draw_edges()
+        glLineWidth(1.0)
+
     glEnable(GL_LIGHTING)
 
 
-def draw_overlays(meshes, selection, hovered_vertex, hovered_edge):
+def draw_overlays(meshes, selection, hovered_vertex, hovered_edge,
+                  sketch=None, camera_distance: float = 1.0):
     """
-    Phase 2: edge/vertex highlights drawn on top, depth test off.
-    Call this AFTER hover.rebuild() so occlusion is already baked in.
+    Phase 2: hover/selection overlays + optional sketch overlay.
+    Call after hover.rebuild() so occlusion is baked in.
     """
     glDisable(GL_LIGHTING)
     glDisable(GL_DEPTH_TEST)
@@ -73,10 +80,10 @@ def draw_overlays(meshes, selection, hovered_vertex, hovered_edge):
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
     glEnable(GL_POINT_SMOOTH)
 
-    # Selected edges — cyan
+    # Selected edges
     if selection.edge_count > 0:
-        glLineWidth(3.5)
-        glColor3f(0.0, 0.85, 1.0)
+        glLineWidth(3.0)
+        glColor3f(*prefs.edge_selected_color)
         for es in selection.edges:
             mesh = meshes.get(es.body_id)
             if mesh is None or es.edge_idx >= len(mesh.topo_edges):
@@ -84,20 +91,20 @@ def draw_overlays(meshes, selection, hovered_vertex, hovered_edge):
             _draw_polyline(mesh.topo_edges[es.edge_idx])
         glLineWidth(1.0)
 
-    # Hovered edge — bright cyan
+    # Hovered edge
     hov_ebody, hov_eidx = hovered_edge
     if hov_ebody is not None:
         mesh = meshes.get(hov_ebody)
         if mesh is not None and hov_eidx < len(mesh.topo_edges):
-            glLineWidth(4.5)
-            glColor3f(0.4, 1.0, 1.0)
+            glLineWidth(4.0)
+            glColor3f(*prefs.edge_hovered_color)
             _draw_polyline(mesh.topo_edges[hov_eidx])
             glLineWidth(1.0)
 
-    # Selected vertices — yellow
+    # Selected vertices
     if selection.vertex_count > 0:
         glPointSize(10.0)
-        glColor3f(1.0, 0.85, 0.0)
+        glColor3f(*prefs.vertex_selected_color)
         glBegin(GL_POINTS)
         for vs in selection.vertices:
             mesh = meshes.get(vs.body_id)
@@ -107,14 +114,14 @@ def draw_overlays(meshes, selection, hovered_vertex, hovered_edge):
             glVertex3f(float(p[0]), float(p[1]), float(p[2]))
         glEnd()
 
-    # Hovered vertex — white
+    # Hovered vertex
     hov_body, hov_idx = hovered_vertex
     if hov_body is not None:
         mesh = meshes.get(hov_body)
         if mesh is not None and hov_idx < len(mesh.topo_verts):
             p = mesh.topo_verts[hov_idx]
             glPointSize(12.0)
-            glColor3f(1.0, 1.0, 1.0)
+            glColor3f(*prefs.vertex_hovered_color)
             glBegin(GL_POINTS)
             glVertex3f(float(p[0]), float(p[1]), float(p[2]))
             glEnd()
@@ -124,6 +131,11 @@ def draw_overlays(meshes, selection, hovered_vertex, hovered_edge):
     glDisable(GL_BLEND)
     glEnable(GL_DEPTH_TEST)
     glEnable(GL_LIGHTING)
+
+    # Sketch overlay — drawn last, on top of everything
+    if sketch is not None:
+        from viewer.sketch_overlay import SketchOverlay
+        SketchOverlay().draw(sketch, camera_distance)
 
 
 def _draw_polyline(pts):
