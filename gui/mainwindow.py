@@ -14,7 +14,7 @@ from viewer.mesh import Mesh
 from cad.importer import load_step
 from cad.history import History
 from cad.workspace import Workspace
-from gui.history_panel import HistoryPanel
+from gui.sidebar import Sidebar
 
 
 class MainWindow(QMainWindow):
@@ -22,8 +22,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("cadapp")
         self.resize(1280, 768)
-        self._viewport:      Viewport     | None = None
-        self._history_panel: HistoryPanel | None = None
+        self._viewport: Viewport | None = None
+        self._sidebar:  Sidebar  | None = None
         self._build_menu()
         self._build_statusbar()
 
@@ -201,18 +201,22 @@ class MainWindow(QMainWindow):
         vp.camera_projection_changed = self._sync_proj_menu
         vp.request_extrude_distance  = self._show_extrude_dialog
 
-        panel = HistoryPanel(workspace, history)
-        panel.seek_requested.connect(vp.seek_history)
-        panel.replay_requested.connect(vp.do_replay)
-        vp.history_changed.connect(panel.refresh)
+        sidebar = Sidebar(workspace, history)
+        sidebar.seek_requested.connect(vp.seek_history)
+        sidebar.replay_requested.connect(vp.do_replay)
+        sidebar.body_visibility_changed.connect(vp.set_body_visible)
+        vp.history_changed.connect(sidebar.refresh)
+        vp.body_selected.connect(sidebar.parts_panel.set_selected_body)
+        vp.body_selected.connect(sidebar.history_panel.set_selected_body)
+        sidebar.parts_panel.body_selected.connect(vp.set_active_body)
+        sidebar.parts_panel.body_selected.connect(sidebar.history_panel.set_selected_body)
 
-        # Wire selection → status bar
+        # Wire selection + sketch → status bar
         vp.selection_changed.connect(self._update_selection_label)
-        # Wire sketch mode → status bar
         vp.sketch_mode_changed.connect(self._update_sketch_label)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(panel)
+        splitter.addWidget(sidebar)
         splitter.addWidget(vp)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -220,7 +224,7 @@ class MainWindow(QMainWindow):
         splitter.setHandleWidth(2)
         splitter.setStyleSheet("QSplitter::handle { background: #2a2a2a; }")
 
-        self._viewport      = vp
-        self._history_panel = panel
+        self._viewport = vp
+        self._sidebar  = sidebar
         self.setCentralWidget(splitter)
         print("Done.")

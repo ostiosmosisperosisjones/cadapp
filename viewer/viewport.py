@@ -16,23 +16,27 @@ from viewer.camera import Camera
 from viewer.mesh import Mesh
 from viewer.renderer import draw_opaque, draw_overlays
 from viewer.hover import HoverState
+from viewer.view_cube import ViewCube
 from cad.workspace import Workspace
 from cad.history import History
 from cad.selection import SelectionSet
 
 
 class Viewport(QOpenGLWidget):
-    history_changed   = pyqtSignal()
-    selection_changed = pyqtSignal()
-    sketch_mode_changed = pyqtSignal(bool)   # True = entered, False = exited
+    history_changed     = pyqtSignal()
+    selection_changed   = pyqtSignal()
+    sketch_mode_changed = pyqtSignal(bool)
+    body_selected       = pyqtSignal(object)   # str | None
 
     def __init__(self, workspace: Workspace, history: History):
         super().__init__()
         self.workspace = workspace
         self.history   = history
         self.camera    = Camera()
+        self._view_cube = ViewCube()
 
         self._meshes: dict[str, Mesh] = {}
+        self._body_visible: dict[str, bool] = {}  # True = visible (default)
 
         self._modelview  = None
         self._projection = None
@@ -83,7 +87,26 @@ class Viewport(QOpenGLWidget):
         self.makeCurrent()
         for body_id, shape in self.workspace.all_current_shapes():
             self._meshes[body_id] = Mesh(shape)
+            self._body_visible.setdefault(body_id, True)
         self.doneCurrent()
+
+    def set_body_visible(self, body_id: str, visible: bool):
+        self._body_visible[body_id] = visible
+        self.update()
+
+    def set_active_body(self, body_id: str | None):
+        """Driven externally (e.g. parts panel click) — sets active body
+        and clears selection without re-emitting body_selected."""
+        self.selection.clear()
+        if body_id is not None:
+            self.workspace.set_active_body(body_id)
+        self.selection_changed.emit()
+        self.update()
+
+    def _visible_meshes(self) -> dict:
+        """Return only meshes whose body is currently visible."""
+        return {bid: m for bid, m in self._meshes.items()
+                if self._body_visible.get(bid, True)}
 
     def fit_camera_to_scene(self):
         if not self._meshes:
@@ -182,22 +205,27 @@ class Viewport(QOpenGLWidget):
                   c.target[0], c.target[1], c.target[2],
                   up[0], up[1], up[2])
 
-        draw_opaque(self._meshes, self.workspace, self.selection)
+        visible = self._visible_meshes()
+        draw_opaque(visible, self.workspace, self.selection)
 
         # Capture matrices and rebuild hover cache while depth buffer
         # contains only opaque geometry — gives correct occlusion results.
         self._modelview  = glGetDoublev(GL_MODELVIEW_MATRIX)
         self._projection = glGetDoublev(GL_PROJECTION_MATRIX)
         self._viewport   = glGetIntegerv(GL_VIEWPORT)
-        self.hover.rebuild(self._meshes, self.workspace,
+        self.hover.rebuild(visible, self.workspace,
                            self._modelview, self._projection,
                            self._viewport, self.devicePixelRatio(),
                            camera_eye=self.camera.get_eye())
 
-        draw_overlays(self._meshes, self.selection,
+        draw_overlays(visible, self.selection,
                       self._hovered_vertex, self._hovered_edge,
                       sketch=self._sketch,
                       camera_distance=self.camera.distance)
+
+        from viewer.camera import _quat_to_matrix
+        R = _quat_to_matrix(self.camera.rotation)
+        self._view_cube.draw(R, self.width(), self.height(), self.devicePixelRatio())
 
     # ------------------------------------------------------------------
     # Ray casting
@@ -252,6 +280,7 @@ class Viewport(QOpenGLWidget):
                     self._exit_sketch()
             else:
                 self.selection.clear()
+                self.body_selected.emit(None)
                 self.selection_changed.emit()
             self.update()
             return
@@ -438,6 +467,18 @@ class Viewport(QOpenGLWidget):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
+            # Check view cube first — it lives in a corner and should
+            # consume clicks before normal selection logic
+            from viewer.camera import _quat_to_matrix
+            R = _quat_to_matrix(self.camera.rotation)
+            mx, my = int(e.position().x()), int(e.position().y())
+            cube_hit = self._view_cube.handle_mouse_press(
+                mx, my, self.width(), self.height(), R, self.devicePixelRatio())
+            if cube_hit is not None:
+                normal, is_corner = cube_hit
+                self.camera.snap_to_normal(*normal)
+                self.update()
+                return
             if self._sketch is not None:
                 from cad.sketch import SketchTool
                 if self._sketch.tool != SketchTool.NONE:
@@ -458,6 +499,7 @@ class Viewport(QOpenGLWidget):
                 self.selection.select_vertex(hov_body, hov_idx,
                                              additive=additive)
                 self.workspace.set_active_body(hov_body)
+                self.body_selected.emit(hov_body)
                 p = self._meshes[hov_body].topo_verts[hov_idx]
                 print(f"Picked vertex {hov_idx} | "
                       f"{self.workspace.bodies[hov_body].name} | "
@@ -467,6 +509,7 @@ class Viewport(QOpenGLWidget):
                 self.selection.select_edge(hov_ebody, hov_eidx,
                                            additive=additive)
                 self.workspace.set_active_body(hov_ebody)
+                self.body_selected.emit(hov_ebody)
                 print(f"Picked edge {hov_eidx} | "
                       f"{self.workspace.bodies[hov_ebody].name}")
 
@@ -475,6 +518,7 @@ class Viewport(QOpenGLWidget):
                 if idx is not None:
                     self.selection.select_face(body_id, idx, additive=additive)
                     self.workspace.set_active_body(body_id)
+                    self.body_selected.emit(body_id)
                     mesh = self._meshes[body_id]
                     try:
                         from build123d import Plane
@@ -488,11 +532,15 @@ class Viewport(QOpenGLWidget):
                               f"non-planar")
                 elif not additive:
                     self.selection.clear()
+                    self.body_selected.emit(None)
 
             self.selection_changed.emit()
             self.update()
 
         elif e.button() == Qt.MouseButton.RightButton:
+            mx, my = int(e.position().x()), int(e.position().y())
+            if self._view_cube.is_over_cube(mx, my, self.width(), self.height(), self.devicePixelRatio()):
+                return  # don't start orbit when clicking on the cube
             body_id, idx = self._pick_at(e.position())
             pivot = None
             if idx is not None and body_id in self._meshes:
@@ -514,6 +562,14 @@ class Viewport(QOpenGLWidget):
             self.camera.pan(e.position());   self.update(); return
 
         x, y = e.position().x(), e.position().y()
+
+        # View cube hover — check before scene hover
+        from viewer.camera import _quat_to_matrix
+        R = _quat_to_matrix(self.camera.rotation)
+        cube_changed = self._view_cube.handle_mouse_move(
+            int(x), int(y), self.width(), self.height(), R, self.devicePixelRatio())
+        if cube_changed:
+            self.update()
 
         # Always update vertex/edge hover (visible in both 3D and sketch mode)
         new_v = self.hover.vertex_at(x, y)

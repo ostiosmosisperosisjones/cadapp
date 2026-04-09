@@ -1,32 +1,39 @@
 """
 gui/history_panel.py
 
-Sidebar showing the flat workspace history, grouped visually by body.
-Double-click an entry to edit its parameters (parametric replay).
+HistoryPanel — flat chronological operation list.
+  - Click any entry to seek the history cursor there
+  - Body-selection highlighting (via PartsPanel)
+  - Hidden body entry dimming
+  - Double-click past entry to edit parameters (parametric replay)
 """
 
 from __future__ import annotations
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QFrame, QSizePolicy, QDialog, QFormLayout,
-    QDoubleSpinBox, QDialogButtonBox, QMessageBox
+    QDoubleSpinBox, QDialogButtonBox, QMessageBox,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from cad.history import History, HistoryEntry
 from cad.workspace import Workspace
 from cad.operations import EDIT_SCHEMA
 
-_BG          = "#1e1e1e"
-_BG_ENTRY    = "#2a2a2a"
-_BG_CURRENT  = "#2f3f52"
-_BG_FUTURE   = "#212121"
-_TEXT        = "#d4d4d4"
-_TEXT_FUTURE = "#484848"
-_BORDER_SEL  = "#4a90d9"
-_BORDER_PAST = "#404040"
+_BG            = "#1e1e1e"
+_BG_ENTRY      = "#2a2a2a"
+_BG_CURRENT    = "#2f3f52"
+_BG_FUTURE     = "#212121"
+_BG_DIM        = "#1e1e1e"
+_BG_HIDDEN     = "#191919"
+_TEXT          = "#d4d4d4"
+_TEXT_DIM      = "#404040"
+_TEXT_HIDDEN   = "#2e2e2e"
+_TEXT_FUTURE   = "#383838"
+_BORDER_SEL    = "#4a90d9"
+_BORDER_PAST   = "#404040"
+_BORDER_DIM    = "#282828"
 _BORDER_FUTURE = "#2a2a2a"
 
-# Per-operation accent colours (left border only, subtle)
 _OP_ACCENT = {
     "import":  "#505050",
     "extrude": "#3a6e44",
@@ -39,7 +46,7 @@ def _op_icon(op: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Generic edit dialog — driven entirely by EDIT_SCHEMA
+# Edit dialog
 # ---------------------------------------------------------------------------
 
 class _EditDialog(QDialog):
@@ -60,7 +67,6 @@ class _EditDialog(QDialog):
 
         self._spinboxes: dict[str, QDoubleSpinBox] = {}
 
-        # Reconstruct signed value
         signed_val = float(entry.params.get("distance", 0))
         if entry.operation == "cut":
             signed_val = -abs(signed_val)
@@ -82,8 +88,7 @@ class _EditDialog(QDialog):
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
-            QDialogButtonBox.StandardButton.Cancel
-        )
+            QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
@@ -102,20 +107,24 @@ class _EntryWidget(QFrame):
     double_clicked = pyqtSignal(int)
 
     def __init__(self, entry: HistoryEntry, index: int,
-                 is_current: bool, is_future: bool, body_name: str):
+                 is_current: bool, is_future: bool,
+                 body_name: str, is_selected_body: bool,
+                 is_hidden_body: bool):
         super().__init__()
         self._index = index
-        editable = entry.operation in EDIT_SCHEMA
 
-        if is_current:
-            border = _BORDER_SEL
-            bg     = _BG_CURRENT
+        if is_hidden_body:
+            bg, text_color, border = _BG_HIDDEN, _TEXT_HIDDEN, _BORDER_DIM
         elif is_future:
-            border = _BORDER_FUTURE
-            bg     = _BG_FUTURE
+            bg, text_color, border = _BG_FUTURE, _TEXT_FUTURE, _BORDER_FUTURE
+        elif is_current:
+            bg, text_color, border = _BG_CURRENT, _TEXT, _BORDER_SEL
+        elif not is_selected_body:
+            bg, text_color, border = _BG_DIM, _TEXT_DIM, _BORDER_DIM
         else:
-            border = _OP_ACCENT.get(entry.operation, _BORDER_PAST)
-            bg     = _BG_ENTRY
+            bg         = _BG_ENTRY
+            text_color = _TEXT
+            border     = _OP_ACCENT.get(entry.operation, _BORDER_PAST)
 
         self.setStyleSheet(f"""
             QFrame {{
@@ -126,39 +135,43 @@ class _EntryWidget(QFrame):
             }}
         """)
 
+        editable = entry.operation in EDIT_SCHEMA and not is_future
+
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(10, 5, 10, 5)
+        outer.setContentsMargins(10, 4, 10, 4)
         outer.setSpacing(1)
 
-        # Body name (dim, small)
         if entry.operation != "import":
             body_lbl = QLabel(body_name)
             body_lbl.setStyleSheet(
-                f"color: #484848; font-size: 10px; border: none; background: transparent;")
+                "color: #333; font-size: 10px; "
+                "border: none; background: transparent;")
             outer.addWidget(body_lbl)
 
         row = QHBoxLayout()
         row.setSpacing(6)
         row.setContentsMargins(0, 0, 0, 0)
 
-        icon_color = border if not is_future else "#333"
         tag = QLabel(_op_icon(entry.operation))
         tag.setFixedWidth(16)
         tag.setStyleSheet(
-            f"color: {icon_color}; font-size: 11px; border: none; background: transparent;")
+            f"color: {border}; font-size: 11px; "
+            "border: none; background: transparent;")
         row.addWidget(tag)
 
-        text_color = _TEXT_FUTURE if is_future else _TEXT
         lbl = QLabel(entry.label)
         lbl.setStyleSheet(
-            f"color: {text_color}; font-size: 12px; border: none; background: transparent;")
+            f"color: {text_color}; font-size: 12px; "
+            "border: none; background: transparent;")
         lbl.setSizePolicy(QSizePolicy.Policy.Expanding,
                           QSizePolicy.Policy.Preferred)
         row.addWidget(lbl)
 
-        if editable and not is_future:
+        if editable:
             hint = QLabel("✎")
-            hint.setStyleSheet("color: #383838; font-size: 10px; border: none; background: transparent;")
+            hint.setStyleSheet(
+                "color: #303030; font-size: 10px; "
+                "border: none; background: transparent;")
             hint.setToolTip("Double-click to edit")
             row.addWidget(hint)
 
@@ -185,14 +198,25 @@ class HistoryPanel(QWidget):
 
     def __init__(self, workspace: Workspace, history: History, parent=None):
         super().__init__(parent)
-        self._workspace = workspace
-        self._history   = history
+        self._workspace      = workspace
+        self._history        = history
+        self._selected_body: str | None = None
+        self._hidden_bodies: set[str]   = set()
         self._setup()
         self.refresh()
 
+    def set_selected_body(self, body_id: str | None):
+        self._selected_body = body_id
+        self.refresh()
+
+    def set_body_hidden(self, body_id: str, hidden: bool):
+        if hidden:
+            self._hidden_bodies.add(body_id)
+        else:
+            self._hidden_bodies.discard(body_id)
+        self.refresh()
+
     def _setup(self):
-        self.setMinimumWidth(190)
-        self.setMaximumWidth(270)
         self.setStyleSheet(f"background: {_BG};")
 
         root = QVBoxLayout(self)
@@ -200,7 +224,7 @@ class HistoryPanel(QWidget):
         root.setSpacing(0)
 
         header = QLabel("  History")
-        header.setFixedHeight(32)
+        header.setFixedHeight(28)
         header.setStyleSheet("""
             background: #161616;
             color: #555;
@@ -227,18 +251,14 @@ class HistoryPanel(QWidget):
 
         btn_style = """
             QPushButton {
-                background: #222;
-                color: #666;
-                border: none;
+                background: #222; color: #666; border: none;
                 border-top: 1px solid #2a2a2a;
-                font-size: 12px;
-                padding: 8px 0;
+                font-size: 12px; padding: 6px 0;
             }
             QPushButton:hover   { background: #2a2a2a; color: #d4d4d4; }
             QPushButton:pressed { background: #1a1a1a; }
-            QPushButton:disabled { color: #333; }
+            QPushButton:disabled { color: #2e2e2e; }
         """
-
         btn_row = QHBoxLayout()
         btn_row.setSpacing(0)
         btn_row.setContentsMargins(0, 0, 0, 0)
@@ -260,8 +280,6 @@ class HistoryPanel(QWidget):
         bc.setLayout(btn_row)
         root.addWidget(bc)
 
-    # ------------------------------------------------------------------
-
     def refresh(self):
         while self._list_layout.count() > 1:
             item = self._list_layout.takeAt(0)
@@ -272,12 +290,23 @@ class HistoryPanel(QWidget):
         cursor  = self._history.cursor
 
         for i, entry in enumerate(entries):
-            body = self._workspace.bodies.get(entry.body_id)
+            body      = self._workspace.bodies.get(entry.body_id)
             body_name = body.name if body else "?"
-            w = _EntryWidget(entry, i,
-                             is_current=(i == cursor),
-                             is_future=(i > cursor),
-                             body_name=body_name)
+
+            is_selected_body = (
+                self._selected_body is None
+                or entry.body_id == self._selected_body
+            )
+            is_hidden_body = entry.body_id in self._hidden_bodies
+
+            w = _EntryWidget(
+                entry, i,
+                is_current       = (i == cursor),
+                is_future        = (i > cursor),
+                body_name        = body_name,
+                is_selected_body = is_selected_body,
+                is_hidden_body   = is_hidden_body,
+            )
             w.clicked.connect(self._on_entry_clicked)
             w.double_clicked.connect(self._on_entry_double_clicked)
             self._list_layout.insertWidget(i, w)
@@ -287,8 +316,6 @@ class HistoryPanel(QWidget):
         self._scroll.verticalScrollBar().setValue(
             self._scroll.verticalScrollBar().maximum())
 
-    # ------------------------------------------------------------------
-
     def _on_entry_clicked(self, index: int):
         self.seek_requested.emit(index)
 
@@ -297,10 +324,8 @@ class HistoryPanel(QWidget):
         if index >= len(entries):
             return
         entry = entries[index]
-
         if entry.operation not in EDIT_SCHEMA:
             return
-
         if index > self._history.cursor:
             QMessageBox.information(
                 self, "Can't edit future entry",
