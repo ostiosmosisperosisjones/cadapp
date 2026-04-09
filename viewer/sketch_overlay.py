@@ -3,6 +3,9 @@ viewer/sketch_overlay.py
 
 Renders the sketch grid, axes, entities, and cursor.
 All colors read from cad.prefs.  All coordinates in world mm.
+
+draw()           — active sketch session (grid + axes + entities + cursor)
+draw_committed() — persistent committed SketchEntry overlay (entities only)
 """
 
 from __future__ import annotations
@@ -57,12 +60,42 @@ class SketchOverlay:
 
         glPopAttrib()
 
+    def draw_committed(self, entry, camera_distance: float):
+        """
+        Draw a committed SketchEntry as a persistent overlay.
+        No grid, no axes, no cursor — just the entities, slightly dimmed.
+
+        Parameters
+        ----------
+        entry : SketchEntry
+        camera_distance : float
+        """
+        from cad.sketch import SketchEntry
+        if not isinstance(entry, SketchEntry) or not entry.visible:
+            return
+
+        glPushAttrib(GL_ALL_ATTRIB_BITS)
+        glDisable(GL_LIGHTING)
+        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        self._draw_committed_references(entry)
+        self._draw_committed_lines(entry)
+
+        glPopAttrib()
+
     # ------------------------------------------------------------------
-    # Helpers
+    # Helpers shared by active sketch
     # ------------------------------------------------------------------
 
     def _pt(self, plane, u, v):
         p = plane.to_3d(u, v)
+        return (float(p[0]), float(p[1]), float(p[2]))
+
+    def _pt_from_entry(self, entry, u, v):
+        """Convert (u, v) sketch coords to world 3D using SketchEntry axes."""
+        p = entry.plane_origin + u * entry.plane_x_axis + v * entry.plane_y_axis
         return (float(p[0]), float(p[1]), float(p[2]))
 
     def _draw_grid(self, plane, spacing, extent):
@@ -184,4 +217,46 @@ class SketchOverlay:
         glVertex3f(*self._pt(sketch.plane, u,      v - cr))
         glVertex3f(*self._pt(sketch.plane, u,      v + cr))
         glEnd()
+        glLineWidth(1.0)
+
+    # ------------------------------------------------------------------
+    # Committed sketch rendering (SketchEntry)
+    # ------------------------------------------------------------------
+
+    def _draw_committed_lines(self, entry):
+        lines = [e for e in entry.entities if isinstance(e, LineEntity)]
+        if not lines:
+            return
+        r, g, b = prefs.sketch_line_color
+        glColor4f(r, g, b, 0.55)
+        glLineWidth(prefs.sketch_line_width)
+        glBegin(GL_LINES)
+        for ent in lines:
+            glVertex3f(*self._pt_from_entry(entry, ent.p0[0], ent.p0[1]))
+            glVertex3f(*self._pt_from_entry(entry, ent.p1[0], ent.p1[1]))
+        glEnd()
+        glLineWidth(1.0)
+
+    def _draw_committed_references(self, entry):
+        refs = [e for e in entry.entities if isinstance(e, ReferenceEntity)]
+        if not refs:
+            return
+        r, g, b = prefs.sketch_reference_color
+        glColor4f(r, g, b, 0.45)
+        glLineWidth(prefs.sketch_reference_width)
+        for ref in refs:
+            if len(ref.points) == 1:
+                p  = ref.points[0]
+                cr = 0.8
+                glBegin(GL_LINES)
+                glVertex3f(*self._pt_from_entry(entry, p[0] - cr, p[1]))
+                glVertex3f(*self._pt_from_entry(entry, p[0] + cr, p[1]))
+                glVertex3f(*self._pt_from_entry(entry, p[0],      p[1] - cr))
+                glVertex3f(*self._pt_from_entry(entry, p[0],      p[1] + cr))
+                glEnd()
+            else:
+                glBegin(GL_LINE_STRIP)
+                for p in ref.points:
+                    glVertex3f(*self._pt_from_entry(entry, p[0], p[1]))
+                glEnd()
         glLineWidth(1.0)

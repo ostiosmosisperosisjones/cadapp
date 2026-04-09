@@ -221,7 +221,8 @@ class Viewport(QOpenGLWidget):
         draw_overlays(visible, self.selection,
                       self._hovered_vertex, self._hovered_edge,
                       sketch=self._sketch,
-                      camera_distance=self.camera.distance)
+                      camera_distance=self.camera.distance,
+                      history=self.history)
 
         from viewer.camera import _quat_to_matrix
         R = _quat_to_matrix(self.camera.rotation)
@@ -303,6 +304,8 @@ class Viewport(QOpenGLWidget):
                 else:
                     print("[Sketch] Nothing selected to include — "
                           "select edges or vertices first.")
+            elif key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
+                self._complete_sketch()
             elif key == Qt.Key.Key_5:
                 self.toggle_projection()
             else:
@@ -413,10 +416,6 @@ class Viewport(QOpenGLWidget):
         self.history_changed.emit()
 
     # ------------------------------------------------------------------
-    # Mouse
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
     # Sketch modal
     # ------------------------------------------------------------------
 
@@ -453,6 +452,44 @@ class Viewport(QOpenGLWidget):
         self.sketch_mode_changed.emit(False)
         self.update()
         print("[Sketch] Exited sketch mode.")
+
+    def _complete_sketch(self):
+        """Commit the current sketch to history as a 'sketch' operation."""
+        if self._sketch is None:
+            return
+        sketch = self._sketch
+
+        from cad.sketch import LineEntity, ReferenceEntity, SketchEntry
+        lines = [e for e in sketch.entities if isinstance(e, LineEntity)]
+        refs  = [e for e in sketch.entities if isinstance(e, ReferenceEntity)]
+        if not lines and not refs:
+            print("[Sketch] Nothing to commit — draw lines or include geometry first.")
+            return
+        entity_count = len(lines) + len(refs)
+
+        from cad.face_ref import FaceRef
+        mesh = self._meshes.get(sketch.body_id)
+        face_ref = (FaceRef.from_b3d_face(mesh.occt_faces[sketch.face_idx])
+                    if mesh else None)
+
+        current_shape = self.workspace.current_shape(sketch.body_id)
+        entry = SketchEntry.from_sketch_mode(sketch)
+
+        self.history.push(
+            label        = f"Sketch  ({entity_count} entities)",
+            operation    = "sketch",
+            params       = {"sketch_entry": entry},
+            body_id      = sketch.body_id,
+            face_ref     = face_ref,
+            shape_before = current_shape,
+            shape_after  = current_shape,   # sketch doesn't mutate geometry
+        )
+
+        self._sketch = None
+        self.sketch_mode_changed.emit(False)
+        self.history_changed.emit()
+        self.update()
+        print(f"[Sketch] Committed {entity_count} entities to history.")
 
     def mouseDoubleClickEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:

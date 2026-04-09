@@ -6,6 +6,7 @@ HistoryPanel — flat chronological operation list.
   - Body-selection highlighting (via PartsPanel)
   - Hidden body entry dimming
   - Double-click past entry to edit parameters (parametric replay)
+  - Sketch entries have a visibility eye toggle
 """
 
 from __future__ import annotations
@@ -38,11 +39,17 @@ _OP_ACCENT = {
     "import":  "#505050",
     "extrude": "#3a6e44",
     "cut":     "#6e3a3a",
+    "sketch":  "#4a6e8a",
 }
 
 
 def _op_icon(op: str) -> str:
-    return {"import": "⬡", "extrude": "▲", "cut": "▼"}.get(op, "•")
+    return {
+        "import":  "⬡",
+        "extrude": "▲",
+        "cut":     "▼",
+        "sketch":  "⬜",
+    }.get(op, "•")
 
 
 # ---------------------------------------------------------------------------
@@ -103,8 +110,9 @@ class _EditDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 class _EntryWidget(QFrame):
-    clicked        = pyqtSignal(int)
-    double_clicked = pyqtSignal(int)
+    clicked               = pyqtSignal(int)
+    double_clicked        = pyqtSignal(int)
+    sketch_vis_toggled    = pyqtSignal(int)   # emits entry index
 
     def __init__(self, entry: HistoryEntry, index: int,
                  is_current: bool, is_future: bool,
@@ -175,6 +183,26 @@ class _EntryWidget(QFrame):
             hint.setToolTip("Double-click to edit")
             row.addWidget(hint)
 
+        # Sketch entries get a clickable visibility eye
+        if entry.operation == "sketch":
+            se = entry.params.get("sketch_entry")
+            is_visible = (se is None or se.visible)
+            eye_btn = QPushButton("◉" if is_visible else "○")
+            eye_btn.setFixedWidth(18)
+            eye_btn.setToolTip("Toggle sketch visibility")
+            eye_btn.setStyleSheet("""
+                QPushButton {
+                    color: #4a6e8a;
+                    font-size: 11px;
+                    background: transparent;
+                    border: none;
+                    padding: 0;
+                }
+                QPushButton:hover { color: #7ab3d4; }
+            """)
+            eye_btn.clicked.connect(lambda _: self.sketch_vis_toggled.emit(self._index))
+            row.addWidget(eye_btn)
+
         outer.addLayout(row)
 
     def mousePressEvent(self, e):
@@ -193,8 +221,9 @@ class _EntryWidget(QFrame):
 # ---------------------------------------------------------------------------
 
 class HistoryPanel(QWidget):
-    seek_requested   = pyqtSignal(int)
-    replay_requested = pyqtSignal(int)
+    seek_requested        = pyqtSignal(int)
+    replay_requested      = pyqtSignal(int)
+    sketch_vis_changed    = pyqtSignal()      # viewport should repaint
 
     def __init__(self, workspace: Workspace, history: History, parent=None):
         super().__init__(parent)
@@ -309,6 +338,7 @@ class HistoryPanel(QWidget):
             )
             w.clicked.connect(self._on_entry_clicked)
             w.double_clicked.connect(self._on_entry_double_clicked)
+            w.sketch_vis_toggled.connect(self._on_sketch_vis_toggled)
             self._list_layout.insertWidget(i, w)
 
         self._undo_btn.setEnabled(self._history.can_undo)
@@ -347,3 +377,15 @@ class HistoryPanel(QWidget):
             return
 
         self.replay_requested.emit(index)
+
+    def _on_sketch_vis_toggled(self, index: int):
+        entries = self._history.entries
+        if index >= len(entries):
+            return
+        entry = entries[index]
+        se = entry.params.get("sketch_entry")
+        if se is None:
+            return
+        se.visible = not se.visible
+        self.refresh()                   # redraw the eye icon
+        self.sketch_vis_changed.emit()   # tell viewport to repaint

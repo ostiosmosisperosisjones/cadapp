@@ -4,7 +4,7 @@ viewer/renderer.py
 OpenGL draw calls split into two phases:
 
     draw_opaque(...)   — solid geometry + optional wireframe edges
-    draw_overlays(...) — selection/hover highlights + optional sketch overlay
+    draw_overlays(...) — selection/hover highlights + sketch overlays
 
 All colors read from cad.prefs so they can be changed without touching
 this file.
@@ -69,10 +69,18 @@ def draw_opaque(meshes, workspace, selection):
 
 
 def draw_overlays(meshes, selection, hovered_vertex, hovered_edge,
-                  sketch=None, camera_distance: float = 1.0):
+                  sketch=None, camera_distance: float = 1.0,
+                  history=None):
     """
-    Phase 2: hover/selection overlays + optional sketch overlay.
-    Call after hover.rebuild() so occlusion is baked in.
+    Phase 2: hover/selection overlays + sketch overlays.
+
+    Draws committed sketches from history first (persistent, dimmed),
+    then the active sketch session on top (if any).
+
+    Parameters
+    ----------
+    history : History | None
+        If provided, all visible committed sketch entries are rendered.
     """
     glDisable(GL_LIGHTING)
     glDisable(GL_DEPTH_TEST)
@@ -132,10 +140,24 @@ def draw_overlays(meshes, selection, hovered_vertex, hovered_edge,
     glEnable(GL_DEPTH_TEST)
     glEnable(GL_LIGHTING)
 
-    # Sketch overlay — drawn last, on top of everything
+    # ------------------------------------------------------------------
+    # Sketch overlays — drawn last, on top of everything
+    # ------------------------------------------------------------------
+    from viewer.sketch_overlay import SketchOverlay
+    overlay = SketchOverlay()
+
+    # Committed sketches from history (persistent, dimmed)
+    if history is not None:
+        for entry in history.entries:
+            if entry.operation != "sketch":
+                continue
+            se = entry.params.get("sketch_entry")
+            if se is not None and se.visible:
+                overlay.draw_committed(se, camera_distance)
+
+    # Active sketch session (grid + axes + live entities + cursor)
     if sketch is not None:
-        from viewer.sketch_overlay import SketchOverlay
-        SketchOverlay().draw(sketch, camera_distance)
+        overlay.draw(sketch, camera_distance)
 
 
 def _draw_polyline(pts):
