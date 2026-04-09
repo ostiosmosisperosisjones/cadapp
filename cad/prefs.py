@@ -72,6 +72,17 @@ class Prefs:
     sketch_axis_y_color:    Color3 = field(default_factory=lambda: _p(0.20, 0.75, 0.30))
     sketch_grid_major_color:Color3 = field(default_factory=lambda: _p(0.35, 0.45, 0.60))
     sketch_grid_minor_color:Color3 = field(default_factory=lambda: _p(0.22, 0.30, 0.42))
+    sketch_line_width:      float  = 2.5
+    sketch_reference_width: float  = 1.8
+
+    # ------------------------------------------------------------------
+    # Camera
+    # ------------------------------------------------------------------
+    camera_rotate_speed:    float  = 1.0
+    camera_pan_speed:       float  = 1.0
+    camera_mode:            str    = 'trackball'  # 'trackball' | 'arcball'
+    camera_invert_yaw:      bool   = False
+    camera_invert_pitch:    bool   = False
 
     # ------------------------------------------------------------------
     # Persistence

@@ -12,7 +12,7 @@ saved to disk on OK.
 from __future__ import annotations
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QWidget, QCheckBox, QDoubleSpinBox,
+    QScrollArea, QWidget, QCheckBox, QDoubleSpinBox, QComboBox,
     QDialogButtonBox, QFrame, QSizePolicy
 )
 from PyQt6.QtGui import QColor
@@ -41,6 +41,19 @@ _LABELS = {
     'sketch_axis_y_color':     ('Sketch',    'Y axis color'),
     'sketch_grid_major_color': ('Sketch',    'Grid major color'),
     'sketch_grid_minor_color': ('Sketch',    'Grid minor color'),
+    'sketch_line_width':       ('Sketch',    'Sketch line width'),
+    'sketch_reference_width':  ('Sketch',    'Reference line width'),
+    'camera_rotate_speed':     ('Camera',    'Rotate speed'),
+    'camera_pan_speed':        ('Camera',    'Pan speed'),
+    'camera_mode':             ('Camera',    'Rotation mode'),
+    'camera_invert_yaw':       ('Camera',    'Invert yaw'),
+    'camera_invert_pitch':     ('Camera',    'Invert pitch'),
+}
+
+
+# Options for string-valued prefs (key → list of valid values)
+_STR_OPTIONS = {
+    'camera_mode': ['trackball', 'arcball'],
 }
 
 
@@ -130,13 +143,22 @@ class PrefsDialog(QDialog):
                 sp = QDoubleSpinBox()
                 sp.setDecimals(2)
                 sp.setMinimum(0.1)
-                sp.setMaximum(10.0)
+                sp.setMaximum(20.0)
                 sp.setSingleStep(0.1)
                 sp.setValue(val)
                 sp.setFixedWidth(80)
                 sp.setProperty('pref_key', key)
                 self._widgets[key] = sp
                 row.addWidget(sp)
+
+            elif isinstance(val, str):             # Enum (combobox)
+                cb = QComboBox()
+                for option in _STR_OPTIONS.get(key, [val]):
+                    cb.addItem(option)
+                cb.setCurrentText(val)
+                cb.setProperty('pref_key', key)
+                self._widgets[key] = cb
+                row.addWidget(cb)
 
             row_w = QWidget()
             row_w.setLayout(row)
@@ -188,6 +210,8 @@ class PrefsDialog(QDialog):
                 setattr(prefs, key, widget.isChecked())
             elif isinstance(widget, QDoubleSpinBox):
                 setattr(prefs, key, widget.value())
+            elif isinstance(widget, QComboBox):
+                setattr(prefs, key, widget.currentText())
         prefs.save()
         self.accept()
 

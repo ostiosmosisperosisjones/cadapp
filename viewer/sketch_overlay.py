@@ -43,7 +43,6 @@ class SketchOverlay:
         glPushAttrib(GL_ALL_ATTRIB_BITS)
         glDisable(GL_LIGHTING)
         glDisable(GL_DEPTH_TEST)
-        glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
         spacing = _choose_spacing(camera_distance)
@@ -70,6 +69,7 @@ class SketchOverlay:
         n  = int(extent / spacing) + 1
         nm = int(extent / (spacing * 5)) + 1
 
+        glEnable(GL_BLEND)
         glBegin(GL_LINES)
 
         r, g, b = prefs.sketch_grid_minor_color
@@ -96,6 +96,7 @@ class SketchOverlay:
             glVertex3f(*self._pt(plane,  extent,  t))
 
         glEnd()
+        glDisable(GL_BLEND)
 
     def _draw_axes(self, plane, extent):
         glLineWidth(1.8)
@@ -114,8 +115,9 @@ class SketchOverlay:
         if not refs:
             return
         r, g, b = prefs.sketch_reference_color
+        glEnable(GL_BLEND)
         glColor4f(r, g, b, 0.75)
-        glLineWidth(1.2)
+        glLineWidth(prefs.sketch_reference_width)
         for ref in refs:
             if len(ref.points) == 1:
                 p  = ref.points[0]
@@ -132,13 +134,14 @@ class SketchOverlay:
                     glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
                 glEnd()
         glLineWidth(1.0)
+        glDisable(GL_BLEND)
 
     def _draw_entities(self, sketch: SketchMode):
         lines = [e for e in sketch.entities if isinstance(e, LineEntity)]
         if not lines:
             return
         glColor3f(*prefs.sketch_line_color)
-        glLineWidth(2.0)
+        glLineWidth(prefs.sketch_line_width)
         glBegin(GL_LINES)
         for ent in lines:
             glVertex3f(*self._pt(sketch.plane, ent.p0[0], ent.p0[1]))

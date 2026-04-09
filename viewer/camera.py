@@ -1,5 +1,5 @@
 import numpy as np
-from math import radians, degrees, asin, atan2, sqrt, cos, sin
+from math import radians, degrees, asin, acos, atan2, sqrt, cos, sin, pi
 
 # ---------------------------------------------------------------------------
 # Quaternion helpers (w, x, y, z convention)
@@ -95,7 +95,8 @@ class Camera:
         self.rotation /= np.linalg.norm(self.rotation)
         # Orbit drag state
         self._orbit_start_q  = None   # rotation snapshot at drag start
-        self._orbit_start_v  = None   # sphere vector at drag start
+        self._orbit_start_v  = None   # sphere vector at drag start (arcball)
+        self._orbit_last_pos = None   # last pixel position (trackball)
         self._vw = 1                  # viewport width  (updated each drag)
         self._vh = 1                  # viewport height
         # Pan drag state
@@ -129,45 +130,95 @@ class Camera:
         """
         if pivot is not None:
             pivot = np.array(pivot, dtype=float)
-            old_eye = self.get_eye()
-            self.target   = pivot
-            self.distance = float(np.linalg.norm(old_eye - pivot))
-            self.distance = max(0.01, self.distance)
+            # Only re-centre the orbit target if the clicked point is far enough
+            # away from the current target — prevents constant jumping when
+            # inspecting small geometry with repeated right-click drags.
+            _REPIVOT_THRESHOLD = 55.0  # mm
+            if np.linalg.norm(pivot - self.target) > _REPIVOT_THRESHOLD:
+                old_eye = self.get_eye()
+                self.target   = pivot
+                self.distance = float(np.linalg.norm(old_eye - pivot))
+                self.distance = max(0.01, self.distance)
         self._vw = vw
         self._vh = vh
-        self._orbit_start_q = self.rotation.copy()
-        self._orbit_start_v = _screen_to_sphere(pos.x(), pos.y(), vw, vh)
+        self._orbit_start_q  = self.rotation.copy()
+        self._orbit_start_v  = _screen_to_sphere(pos.x(), pos.y(), vw, vh)
+        self._orbit_last_pos = (pos.x(), pos.y())
 
     def orbit(self, pos):
         """Called on right-drag mouse-move."""
+        from cad.prefs import prefs
+        if prefs.camera_mode == 'arcball':
+            self._orbit_arcball(pos)
+        else:
+            self._orbit_trackball(pos)
+
+    def _orbit_arcball(self, pos):
+        """Sphere-projection arcball — accurate but has pole singularities."""
         if self._orbit_start_v is None:
             return
         v2 = _screen_to_sphere(pos.x(), pos.y(), self._vw, self._vh)
         v1 = self._orbit_start_v
 
-        # Rotation axis is cross product of the two sphere vectors
-        axis = np.cross(v1, v2)
-        axis_len = np.linalg.norm(axis)
+        axis_cam = np.cross(v1, v2)
+        axis_len = np.linalg.norm(axis_cam)
         if axis_len < 1e-10:
             return
-        axis /= axis_len
+        axis_cam /= axis_len
 
-        # Angle between the two vectors
+        # Transform screen-space axis into world space
+        R = _quat_to_matrix(self._orbit_start_q)
+        axis_world = R @ axis_cam
+
         dot = float(np.clip(np.dot(v1, v2), -1.0, 1.0))
-        angle = 2.0 * asin(sqrt(max(0.0, 1.0 - dot*dot) / 2.0 + 0.0))
-        # Simpler and more stable: angle = arccos(dot)
-        import math
-        angle = math.acos(dot)
+        angle = acos(dot)
 
-        # Delta quaternion in *world* space, applied on the left so the
-        # rotation accumulates naturally (orbiting the object, not the camera)
-        dq = _quat_from_axis_angle(axis, angle)
-        self.rotation = _quat_mul(self._orbit_start_q, dq)
+        from cad.prefs import prefs
+        angle *= prefs.camera_rotate_speed
+
+        dq = _quat_from_axis_angle(axis_world, angle)
+        self.rotation = _quat_mul(dq, self._orbit_start_q)
+        self.rotation /= np.linalg.norm(self.rotation)
+
+    def _orbit_trackball(self, pos):
+        """Incremental trackball — no poles, rotates indefinitely in any direction."""
+        if self._orbit_last_pos is None:
+            return
+        from cad.prefs import prefs
+        dx = pos.x() - self._orbit_last_pos[0]
+        dy = pos.y() - self._orbit_last_pos[1]
+        self._orbit_last_pos = (pos.x(), pos.y())
+
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return
+
+        if prefs.camera_invert_yaw:
+            dx = -dx
+        if prefs.camera_invert_pitch:
+            dy = -dy
+
+        # Scale pixels to radians — pi radians across the short viewport dimension
+        scale = prefs.camera_rotate_speed * pi / min(self._vw, self._vh)
+        angle_yaw   = -dx * scale   # horizontal drag → yaw around world Z-up
+        angle_pitch =  dy * scale   # vertical drag   → pitch around camera right
+
+        R = _quat_to_matrix(self.rotation)
+        right = R[:, 0]   # camera local X in world space
+        up    = R[:, 1]   # camera local Y in world space
+
+        # Yaw around the camera's own up axis — decoupled from world Z
+        q_yaw   = _quat_from_axis_angle(up,    angle_yaw)
+        # Pitch around the camera's own right axis
+        q_pitch = _quat_from_axis_angle(right, angle_pitch)
+
+        # Apply both from the same snapshot so order doesn't matter
+        self.rotation = _quat_mul(q_pitch, _quat_mul(q_yaw, self.rotation))
         self.rotation /= np.linalg.norm(self.rotation)
 
     def end_orbit(self):
-        self._orbit_start_q = None
-        self._orbit_start_v = None
+        self._orbit_start_q  = None
+        self._orbit_start_v  = None
+        self._orbit_last_pos = None
 
     # ------------------------------------------------------------------
     # Pan
@@ -185,8 +236,9 @@ class Camera:
         right = R[:, 0]   # camera local X
         up    = R[:, 1]   # camera local Y
         scale = self.ortho_scale if self.ortho else self.distance
-        self.target -= right * dx * 0.002 * scale
-        self.target += up    * dy * 0.002 * scale
+        from cad.prefs import prefs
+        self.target -= right * dx * 0.002 * scale * prefs.camera_pan_speed
+        self.target += up    * dy * 0.002 * scale * prefs.camera_pan_speed
         self._pan_last = (pos.x(), pos.y())
 
     def end_pan(self):
