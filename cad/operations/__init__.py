@@ -12,13 +12,13 @@ Adding a new operation:
     pick it up automatically.
 """
 
-from cad.operations.extrude import extrude_face
+from cad.operations.extrude import extrude_face, extrude_face_direct
 
 # ---------------------------------------------------------------------------
 # Execution registry
 #
 # Each entry: operation_name -> callable(shape, face_idx, params) -> new_shape
-# face_idx may be None for ops that don't target a specific face (future).
+# face_idx may be None for ops that don't target a specific face.
 # ---------------------------------------------------------------------------
 
 REGISTRY: dict[str, callable] = {
@@ -26,6 +26,8 @@ REGISTRY: dict[str, callable] = {
                    shape, face_idx,  params["distance"]),
     "cut":     lambda shape, face_idx, params: extrude_face(
                    shape, face_idx, -abs(params["distance"])),
+    # "sketch" is intentionally absent — it is a no-op on geometry,
+    # replay just carries shape_before forward unchanged.
     # Future:
     # "fillet":  lambda shape, face_idx, params: fillet_face(
     #                shape, face_idx, params["radius"]),
@@ -49,11 +51,6 @@ EDIT_SCHEMA: dict[str, list[tuple]] = {
     "cut": [
         ("distance", "Depth (mm)", float, 0.001, 1000.0, 3),
     ],
-    # "fillet": [
-    #     ("radius", "Radius (mm)", float, 0.01, 100.0, 3),
-    # ],
 }
 
-# Convenience re-export so callers can still do:
-#   from cad.operations import extrude_face
-__all__ = ["extrude_face", "REGISTRY", "EDIT_SCHEMA"]
+__all__ = ["extrude_face", "extrude_face_direct", "REGISTRY", "EDIT_SCHEMA"]

@@ -1,14 +1,18 @@
 """
 cad/sketch.py
 
-Sketch mode data model.  All coordinates in world millimetres — no
-normalisation, matching the rest of the pipeline since mesh coordinates
-were moved to world space.
+Sketch data model.  All coordinates in world millimetres.
 
-SketchPlane  — wraps a build123d Plane, provides world-space axes/origin
-               and ray intersection / coordinate conversion helpers.
-SketchMode   — holds the active plane, entities, and tool state.
-SketchEntry  — immutable snapshot of a committed sketch, stored in history.
+Classes
+-------
+SketchTool      — enum of available tools (add new values here when adding tools)
+LineEntity      — a committed 2-D line segment
+ReferenceEntity — a projected reference edge/vertex from existing geometry
+SketchPlane     — wraps a build123d Plane; ray intersection + coord conversion
+SketchMode      — the live sketch session (plane, entities, active tool instance)
+SketchEntry     — immutable committed snapshot stored in history
+
+Tool logic lives in cad/sketch_tools/.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from build123d import Plane
 
 
 # ---------------------------------------------------------------------------
-# Tool enum
+# Tool enum  — add a value here when adding a new tool
 # ---------------------------------------------------------------------------
 
 class SketchTool(Enum):
@@ -44,16 +48,16 @@ class ReferenceEntity:
     """
     A projected reference polyline — created by the Include tool.
 
-    Stores a list of 2-D (u, v) points forming a polyline projected from
-    a selected 3-D edge or vertex onto the sketch plane.  Rendered in a
-    distinct dim style and used as snap targets; not part of the sketch
-    profile for extrude.
-
+    points      : list of (u, v) np.ndarray — projected onto sketch plane
     source_type : 'edge' | 'vertex'
+    occ_edges   : list of TopoDS_Edge | None
+                  Original OCCT edges preserved for exact face construction.
     """
-    def __init__(self, points: list[np.ndarray], source_type: str = 'edge'):
+    def __init__(self, points: list[np.ndarray], source_type: str = 'edge',
+                 occ_edges=None):
         self.points      = [np.array(p, dtype=np.float64) for p in points]
         self.source_type = source_type
+        self.occ_edges   = occ_edges
 
 
 # ---------------------------------------------------------------------------
@@ -84,10 +88,6 @@ class SketchPlane:
         self.y_axis /= np.linalg.norm(self.y_axis)
         self.normal  /= np.linalg.norm(self.normal)
 
-    # ------------------------------------------------------------------
-    # Ray → 2-D sketch coords
-    # ------------------------------------------------------------------
-
     def ray_intersect(self, ray_origin: np.ndarray, ray_dir: np.ndarray
                       ) -> tuple[np.ndarray | None, np.ndarray | None]:
         """
@@ -106,19 +106,12 @@ class SketchPlane:
         v = float(np.dot(delta, self.y_axis))
         return pt3d, np.array([u, v], dtype=np.float64)
 
-    # ------------------------------------------------------------------
-    # 2-D → 3-D
-    # ------------------------------------------------------------------
-
     def to_3d(self, u: float, v: float) -> np.ndarray:
         """Sketch (u, v) in mm → world 3-D point."""
         return self.origin + u * self.x_axis + v * self.y_axis
 
     def project_point(self, world_pt: np.ndarray) -> np.ndarray:
-        """
-        Orthographically project a world 3-D point onto this plane.
-        Returns (u, v) sketch coordinates in mm.
-        """
+        """Orthographic projection of a world point → (u, v) sketch coords."""
         delta = np.array(world_pt, dtype=np.float64) - self.origin
         u = float(np.dot(delta, self.x_axis))
         v = float(np.dot(delta, self.y_axis))
@@ -131,16 +124,10 @@ class SketchPlane:
 
 class SketchMode:
     """
-    Holds everything about the active sketch session.
+    Live sketch session.  Created on double-click, discarded on ESC/commit.
 
-    Created when the user double-clicks a planar face.
-    Discarded on ESC or when the sketch is committed.
-
-    Parameters
-    ----------
-    b3d_plane : build123d.Plane   — the face plane in world mm
-    body_id   : str               — which body this sketch is on
-    face_idx  : int               — face index within that body
+    The active tool is a BaseTool instance (from cad/sketch_tools/).
+    set_tool() creates a fresh instance; the old one is discarded.
     """
 
     def __init__(self, b3d_plane: Plane, body_id: str, face_idx: int):
@@ -148,81 +135,65 @@ class SketchMode:
         self.body_id  = body_id
         self.face_idx = face_idx
         self.entities: list = []
+
+        # Active tool enum value (for status bar / overlay checks)
         self.tool = SketchTool.NONE
-
-        self._line_start: np.ndarray | None = None
-        self._cursor_2d:  np.ndarray | None = None
+        # Active tool instance — None when no tool selected
+        self._active_tool = None
 
     # ------------------------------------------------------------------
-    # Tool helpers
+    # Tool management
     # ------------------------------------------------------------------
 
-    def set_tool(self, tool: SketchTool):
-        self.tool        = tool
-        self._line_start = None
-        self._cursor_2d  = None
+    def set_tool(self, tool_enum: SketchTool):
+        """Activate a tool by enum value.  Creates a fresh tool instance."""
+        from cad.sketch_tools import TOOLS
+        self.tool = tool_enum
+        cls = TOOLS.get(tool_enum)
+        self._active_tool = cls() if cls is not None else None
+
+    def cancel_tool(self):
+        """ESC within a tool — reset in-progress state, stay in the tool."""
+        if self._active_tool is not None:
+            self._active_tool.cancel()
+
+    # ------------------------------------------------------------------
+    # Input forwarding — viewport calls these every frame
+    # ------------------------------------------------------------------
 
     def handle_mouse_move(self, ray_origin: np.ndarray, ray_dir: np.ndarray):
         _, pt2d = self.plane.ray_intersect(ray_origin, ray_dir)
-        self._cursor_2d = pt2d
+        if self._active_tool is not None:
+            self._active_tool.handle_mouse_move(pt2d, self)
 
     def handle_click(self, ray_origin: np.ndarray, ray_dir: np.ndarray) -> bool:
         _, pt2d = self.plane.ray_intersect(ray_origin, ray_dir)
-        if pt2d is None:
+        if pt2d is None or self._active_tool is None:
             return False
-        if self.tool == SketchTool.LINE:
-            if self._line_start is None:
-                self._line_start = pt2d.copy()
-            else:
-                self.entities.append(LineEntity(self._line_start, pt2d))
-                self._line_start = pt2d.copy()
-            return True
-        return False
+        return self._active_tool.handle_click(pt2d, self)
+
+    # ------------------------------------------------------------------
+    # Overlay helpers — read by sketch_overlay.py
+    # ------------------------------------------------------------------
+
+    @property
+    def _cursor_2d(self) -> np.ndarray | None:
+        """Current cursor position for the overlay."""
+        if self._active_tool is not None:
+            return self._active_tool.cursor_2d
+        return None
+
+    @property
+    def _line_start(self) -> np.ndarray | None:
+        """Line preview start point — only valid when LINE tool is active."""
+        from cad.sketch_tools.line import LineTool
+        if isinstance(self._active_tool, LineTool):
+            return self._active_tool.line_start
+        return None
 
     @property
     def is_empty(self) -> bool:
         return len(self.entities) == 0
-
-    # ------------------------------------------------------------------
-    # Include (reference geometry projection)
-    # ------------------------------------------------------------------
-
-    def include_selection(self, selection, meshes: dict) -> int:
-        """
-        Project all selected edges and vertices onto the sketch plane as
-        ReferenceEntity instances and append them to self.entities.
-
-        Parameters
-        ----------
-        selection : SelectionSet
-        meshes    : dict[body_id, Mesh]
-
-        Returns the number of reference entities added.
-        """
-        added = 0
-
-        # Selected edges → project each polyline point
-        for es in selection.edges:
-            mesh = meshes.get(es.body_id)
-            if mesh is None or es.edge_idx >= len(mesh.topo_edges):
-                continue
-            world_pts = mesh.topo_edges[es.edge_idx]   # (N, 3) float32
-            uv_pts = [self.plane.project_point(p) for p in world_pts]
-            if len(uv_pts) >= 2:
-                self.entities.append(ReferenceEntity(uv_pts, source_type='edge'))
-                added += 1
-
-        # Selected vertices → each becomes a single-point reference
-        for vs in selection.vertices:
-            mesh = meshes.get(vs.body_id)
-            if mesh is None or vs.vertex_idx >= len(mesh.topo_verts):
-                continue
-            world_pt = mesh.topo_verts[vs.vertex_idx]
-            uv_pt    = self.plane.project_point(world_pt)
-            self.entities.append(ReferenceEntity([uv_pt], source_type='vertex'))
-            added += 1
-
-        return added
 
 
 # ---------------------------------------------------------------------------
@@ -231,20 +202,8 @@ class SketchMode:
 
 class SketchEntry:
     """
-    Immutable record of a committed sketch.  Stored on HistoryEntry.params
-    under the key "sketch_entry".  shape_before == shape_after on the
-    HistoryEntry (sketches don't mutate geometry).
-
-    Attributes
-    ----------
-    plane_origin  : (3,) float64   — world-space plane origin
-    plane_x_axis  : (3,) float64   — world-space X axis of sketch plane
-    plane_y_axis  : (3,) float64   — world-space Y axis of sketch plane
-    plane_normal  : (3,) float64   — world-space normal
-    entities      : list           — deep copy of LineEntity / ReferenceEntity
-    body_id       : str
-    face_idx      : int
-    visible       : bool           — overlay visibility toggle
+    Immutable record of a committed sketch stored on a HistoryEntry.
+    shape_before == shape_after (sketches don't mutate geometry).
     """
 
     def __init__(self, plane_origin, plane_x_axis, plane_y_axis, plane_normal,
@@ -257,10 +216,6 @@ class SketchEntry:
         self.body_id      = body_id
         self.face_idx     = face_idx
         self.visible      = visible
-
-    # ------------------------------------------------------------------
-    # Factory
-    # ------------------------------------------------------------------
 
     @classmethod
     def from_sketch_mode(cls, sketch: SketchMode) -> SketchEntry:
@@ -279,72 +234,159 @@ class SketchEntry:
     # ------------------------------------------------------------------
 
     def line_segments(self) -> list[tuple[np.ndarray, np.ndarray]]:
-        """
-        Return all segments (p0_uv, p1_uv) from LineEntity instances.
-        Coordinates are 2-D sketch (u, v) in world mm.
-        """
-        segs = []
-        for e in self.entities:
-            if isinstance(e, LineEntity):
-                segs.append((e.p0.copy(), e.p1.copy()))
-        return segs
+        return [(e.p0.copy(), e.p1.copy())
+                for e in self.entities if isinstance(e, LineEntity)]
 
-    def build_wire(self, tol: float = 1e-3):
-        """
-        Convert all LineEntity segments into a build123d Wire.
-
-        Chains connected segments into polylines, then builds each as a
-        build123d Polyline on the sketch plane.  Returns a Wire (single
-        chain) or a Compound of wires if the sketch has multiple loops.
-
-        Raises ValueError if there are no line segments.
-        """
-        from build123d import Wire, Polyline, Vector, Compound
-
-        segs = self.line_segments()
-        if not segs:
-            raise ValueError("Sketch has no line segments to build a wire from.")
-
-        chains = _chain_segments(segs, tol=tol)
-
-        wires = []
-        for chain in chains:
-            pts_3d = [
-                Vector(*(
-                    self.plane_origin
-                    + u * self.plane_x_axis
-                    + v * self.plane_y_axis
-                ).tolist())
-                for u, v in chain
-            ]
-            if len(pts_3d) < 2:
-                continue
-            wire = Polyline(*pts_3d)
-            wires.append(wire)
-
-        if not wires:
-            raise ValueError("Could not build any wires from sketch segments.")
-        if len(wires) == 1:
-            return wires[0]
-        return Compound(children=wires)
+    def reference_chains(self) -> list[list[tuple[float, float]]]:
+        return [[(float(p[0]), float(p[1])) for p in e.points]
+                for e in self.entities
+                if isinstance(e, ReferenceEntity) and len(e.points) >= 2]
 
     def closed_loops(self, tol: float = 1e-3) -> list[list[tuple[float, float]]]:
-        """
-        Return only chains whose first and last point are within *tol* of
-        each other — i.e. closed loops suitable for extrusion.
-        """
-        segs = self.line_segments()
-        chains = _chain_segments(segs, tol=tol)
+        """All closed chains from LineEntity segments and ReferenceEntity polylines."""
         closed = []
-        for chain in chains:
-            p0 = np.array(chain[0])
-            p1 = np.array(chain[-1])
-            if np.linalg.norm(p1 - p0) < tol:
+        segs = self.line_segments()
+        if segs:
+            for chain in _chain_segments(segs, tol=tol):
+                if np.linalg.norm(np.array(chain[-1]) - np.array(chain[0])) < tol:
+                    closed.append(chain)
+        for chain in self.reference_chains():
+            if np.linalg.norm(np.array(chain[-1]) - np.array(chain[0])) < tol:
                 closed.append(chain)
         return closed
 
     def has_closed_loop(self, tol: float = 1e-3) -> bool:
         return len(self.closed_loops(tol=tol)) > 0
+
+    def build_wire(self, tol: float = 1e-3):
+        """Convert LineEntity segments into a build123d Wire (for DXF export etc.)."""
+        from build123d import Polyline, Vector, Compound
+        segs = self.line_segments()
+        if not segs:
+            raise ValueError("Sketch has no line segments to build a wire from.")
+        wires = []
+        for chain in _chain_segments(segs, tol=tol):
+            pts = [Vector(*(self.plane_origin
+                            + u * self.plane_x_axis
+                            + v * self.plane_y_axis).tolist())
+                   for u, v in chain]
+            if len(pts) >= 2:
+                wires.append(Polyline(*pts))
+        if not wires:
+            raise ValueError("Could not build any wires.")
+        return wires[0] if len(wires) == 1 else Compound(children=wires)
+
+    def build_faces(self, tol: float = 1e-3) -> list:
+        """
+        Build a planar Face for each closed loop.
+
+        Reference loops: projects original OCCT edges onto the sketch plane
+        using GeomProjLib.ProjectOnPlane (preserves curve type — circle stays
+        a circle regardless of offset distance).
+        Line loops: built from (u,v) points which are already on the plane.
+        Falls back to tessellated polyline if projection fails.
+        """
+        from build123d import Face, Polyline, Vector
+        from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakeFace,
+                                        BRepBuilderAPI_MakeWire,
+                                        BRepBuilderAPI_MakeEdge)
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GeomProjLib import GeomProjLib
+        from OCP.Geom import Geom_Plane
+        from OCP.gp import gp_Ax3, gp_Pnt, gp_Dir
+
+        try:
+            ax3 = gp_Ax3(
+                gp_Pnt(float(self.plane_origin[0]),
+                       float(self.plane_origin[1]),
+                       float(self.plane_origin[2])),
+                gp_Dir(float(self.plane_normal[0]),
+                       float(self.plane_normal[1]),
+                       float(self.plane_normal[2])),
+            )
+            geom_plane = Geom_Plane(ax3)
+            proj_dir   = gp_Dir(float(self.plane_normal[0]),
+                                float(self.plane_normal[1]),
+                                float(self.plane_normal[2]))
+        except Exception as ex:
+            print(f"[Sketch] build_faces: could not build plane — {ex}")
+            geom_plane = None
+            proj_dir   = None
+
+        faces = []
+
+        # --- Reference entity loops ---
+        for ref in self.entities:
+            if not isinstance(ref, ReferenceEntity):
+                continue
+            if len(ref.points) < 2:
+                continue
+            if np.linalg.norm(ref.points[-1] - ref.points[0]) > tol:
+                continue
+
+            built = False
+            if ref.occ_edges and geom_plane is not None:
+                try:
+                    wm = BRepBuilderAPI_MakeWire()
+                    for occ_edge in ref.occ_edges:
+                        adaptor    = BRepAdaptor_Curve(occ_edge)
+                        u0         = adaptor.FirstParameter()
+                        u1         = adaptor.LastParameter()
+                        proj_curve = GeomProjLib.ProjectOnPlane_s(
+                            adaptor.Curve().Curve(), geom_plane, proj_dir, True)
+                        wm.Add(BRepBuilderAPI_MakeEdge(proj_curve, u0, u1).Edge())
+                    if wm.IsDone():
+                        fm = BRepBuilderAPI_MakeFace(wm.Wire(), True)
+                        if fm.IsDone():
+                            faces.append(Face(fm.Face()))
+                            built = True
+                        else:
+                            print(f"[Sketch] build_faces: MakeFace error {fm.Error()}")
+                    else:
+                        print("[Sketch] build_faces: MakeWire failed")
+                except Exception as ex:
+                    print(f"[Sketch] build_faces: projection failed — {ex}")
+
+            if not built:
+                pts = [Vector(*(self.plane_origin
+                                + float(p[0]) * self.plane_x_axis
+                                + float(p[1]) * self.plane_y_axis).tolist())
+                       for p in ref.points]
+                if len(pts) >= 3:
+                    try:
+                        fm = BRepBuilderAPI_MakeFace(
+                            Polyline(*pts).wrapped, True)
+                        if fm.IsDone():
+                            faces.append(Face(fm.Face()))
+                            print("[Sketch] build_faces: used polyline fallback")
+                        else:
+                            print(f"[Sketch] build_faces: polyline fallback "
+                                  f"error {fm.Error()}")
+                    except Exception as ex:
+                        print(f"[Sketch] build_faces: polyline fallback — {ex}")
+
+        # --- Line segment loops ---
+        segs = self.line_segments()
+        if segs:
+            for loop in _chain_segments(segs, tol=tol):
+                if np.linalg.norm(np.array(loop[-1]) - np.array(loop[0])) > tol:
+                    continue
+                pts = [Vector(*(self.plane_origin
+                                + u * self.plane_x_axis
+                                + v * self.plane_y_axis).tolist())
+                       for u, v in loop]
+                if len(pts) < 3:
+                    continue
+                try:
+                    fm = BRepBuilderAPI_MakeFace(Polyline(*pts).wrapped, True)
+                    if fm.IsDone():
+                        faces.append(Face(fm.Face()))
+                    else:
+                        print(f"[Sketch] build_faces: line loop error {fm.Error()}")
+                except Exception as ex:
+                    print(f"[Sketch] build_faces: line loop failed — {ex}")
+
+        return faces
 
 
 # ---------------------------------------------------------------------------
@@ -355,10 +397,7 @@ def _chain_segments(
     segs: list[tuple[np.ndarray, np.ndarray]],
     tol: float = 1e-3,
 ) -> list[list[tuple[float, float]]]:
-    """
-    Greedily chain (p0, p1) segments into ordered polylines.
-    Returns a list of point chains, each as [(u, v), …].
-    """
+    """Greedily chain (p0, p1) segments into ordered polylines."""
     remaining = [(p0.copy(), p1.copy()) for p0, p1 in segs]
     chains: list[list[tuple[float, float]]] = []
 

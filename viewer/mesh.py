@@ -44,12 +44,12 @@ class Mesh:
         self.bbox_max = self.verts.max(axis=0)
 
         # True topological vertices — actual CAD corners where edges meet.
-        # A box has 8, a cylinder has 2, etc.
         self.topo_verts = _extract_topo_verts(shape)
 
         # True topological edges — each is a (N,3) polyline in world mm.
-        # Straight edges have 2 points; curves are discretised to ~0.05mm.
-        self.topo_edges = _extract_topo_edges(shape)
+        # topo_edges_occ is the parallel list of raw TopoDS_Edge objects,
+        # used when projecting reference geometry to preserve true curve type.
+        self.topo_edges, self.topo_edges_occ = _extract_topo_edges(shape)
 
         # Legacy compatibility
         self.center = np.array([0.0, 0.0, 0.0])
@@ -116,11 +116,6 @@ class Mesh:
 # ---------------------------------------------------------------------------
 
 def _extract_topo_verts(shape) -> np.ndarray:
-    """
-    Extract the true topological vertices from a build123d shape via OCCT.
-    These are the actual CAD corners (where edges meet), not tessellation pts.
-    Returns a (N, 3) float32 array in world millimetre coordinates.
-    """
     from OCP.BRep import BRep_Tool
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_VERTEX
@@ -144,15 +139,14 @@ def _extract_topo_verts(shape) -> np.ndarray:
     return np.array(pts, dtype=np.float32)
 
 
-def _extract_topo_edges(shape) -> list[np.ndarray]:
+def _extract_topo_edges(shape) -> tuple[list[np.ndarray], list]:
     """
     Extract topological edges from a build123d shape via OCCT.
 
-    Each edge is returned as a (N, 3) float32 array of world-space points
-    forming a polyline along the edge.  Straight edges have 2 points; arcs
-    and curves are discretised so hover highlighting looks correct.
-
-    Returns a list of arrays, one per unique edge.
+    Returns
+    -------
+    topo_edges     : list of (N, 3) float32 arrays — discretised polylines
+    topo_edges_occ : list of TopoDS_Edge — the raw OCCT edge, parallel to above
     """
     from OCP.BRep import BRep_Tool
     from OCP.TopExp import TopExp_Explorer
@@ -161,8 +155,9 @@ def _extract_topo_edges(shape) -> list[np.ndarray]:
     from OCP.GCPnts import GCPnts_UniformAbscissa
     from OCP.BRepAdaptor import BRepAdaptor_Curve
 
-    edges = []
-    seen  = set()
+    edges     = []
+    edges_occ = []
+    seen      = set()
 
     explorer = TopExp_Explorer(shape.wrapped, TopAbs_EDGE)
     while explorer.More():
@@ -201,10 +196,11 @@ def _extract_topo_edges(shape) -> list[np.ndarray]:
             if key not in seen:
                 seen.add(key)
                 edges.append(arr)
+                edges_occ.append(edge)
 
         except Exception:
-            pass  # skip degenerate edges
+            pass
 
         explorer.Next()
 
-    return edges
+    return edges, edges_occ
