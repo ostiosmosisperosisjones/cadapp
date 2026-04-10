@@ -1,11 +1,11 @@
 """
 cad/sketch_tools/line.py
 
-LineTool — click to place connected line segments.
+LineTool — single-shot line segment (click start, click end).
 
-First click  : sets the start point.
-Each subsequent click : completes one segment and starts the next.
-ESC (cancel) : abandons the in-progress segment, start point cleared.
+For a continuous polyline chain, see continuous_line.py (future tool).
+Each click pair produces one LineEntity.  The pending start point is
+held until the second click; ESC clears it without leaving sketch mode.
 """
 
 from __future__ import annotations
@@ -16,8 +16,8 @@ from cad.sketch_tools.base import BaseTool
 class LineTool(BaseTool):
 
     def __init__(self):
-        self._start:     np.ndarray | None = None
-        self._cursor_2d: np.ndarray | None = None
+        self._start:      np.ndarray | None = None
+        self._cursor_2d:  np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # BaseTool interface
@@ -27,18 +27,20 @@ class LineTool(BaseTool):
     def cursor_2d(self) -> np.ndarray | None:
         return self._cursor_2d
 
-    def handle_mouse_move(self, pt2d: np.ndarray, sketch) -> None:
-        self._cursor_2d = pt2d.copy() if pt2d is not None else None
+    def handle_mouse_move(self, snap_result, sketch) -> None:
+        self._cursor_2d = snap_result.point.copy() \
+            if snap_result.point is not None else None
 
-    def handle_click(self, pt2d: np.ndarray, sketch) -> bool:
+    def handle_click(self, snap_result, sketch) -> bool:
         from cad.sketch import LineEntity
-        if pt2d is None:
+        pt = snap_result.point
+        if pt is None:
             return False
         if self._start is None:
-            self._start = pt2d.copy()
+            self._start = pt.copy()
         else:
-            sketch.entities.append(LineEntity(self._start, pt2d))
-            self._start = pt2d.copy()
+            sketch.entities.append(LineEntity(self._start, pt))
+            self._start = pt.copy()   # chain: end of this becomes start of next
         return True
 
     def cancel(self) -> None:
@@ -47,7 +49,7 @@ class LineTool(BaseTool):
         self._cursor_2d = None
 
     # ------------------------------------------------------------------
-    # Line-tool-specific state (read by sketch_overlay for preview)
+    # Read by sketch_overlay for the preview line
     # ------------------------------------------------------------------
 
     @property

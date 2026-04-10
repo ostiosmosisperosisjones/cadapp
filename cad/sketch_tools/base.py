@@ -9,22 +9,22 @@ the first point of a line, the center of an arc) lives on the instance.
 
 Methods
 -------
-handle_click(pt2d, sketch)
+handle_click(snap_result, sketch)
     Called on every left-click while this tool is active.
-    pt2d  : np.ndarray shape (2,) — cursor position in sketch (u,v) coords
-    sketch: SketchMode            — the active sketch (append entities here)
+    snap_result : SnapResult  — resolved cursor (already snapped)
+    sketch      : SketchMode  — append entities here
     Returns True if the click was consumed.
 
-handle_mouse_move(pt2d, sketch)
-    Called on every mouse-move while this tool is active.
-    Update any preview state here (e.g. _cursor_2d on the sketch).
+handle_mouse_move(snap_result, sketch)
+    Called on every mouse-move.  Update preview state here.
 
 cancel()
-    Called when the user presses ESC to cancel the current tool action
-    without switching tools (e.g. abandon a half-drawn line).
+    Called when ESC is pressed within the tool.  Reset in-progress state
+    (e.g. drop the pending line start) but do NOT switch tools — the
+    tool stays active.  A second ESC at SketchMode level switches to NONE.
 
 cursor_2d
-    Property — current cursor position for the overlay to read, or None.
+    Property — current snapped cursor position for the overlay, or None.
 """
 
 from __future__ import annotations
@@ -38,12 +38,11 @@ class BaseTool:
     def cursor_2d(self) -> np.ndarray | None:
         return None
 
-    def handle_click(self, pt2d: np.ndarray, sketch) -> bool:
+    def handle_click(self, snap_result, sketch) -> bool:
         raise NotImplementedError
 
-    def handle_mouse_move(self, pt2d: np.ndarray, sketch) -> None:
+    def handle_mouse_move(self, snap_result, sketch) -> None:
         pass
 
     def cancel(self) -> None:
-        """Reset any in-progress state (called on ESC within the tool)."""
         pass

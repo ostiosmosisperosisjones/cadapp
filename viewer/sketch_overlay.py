@@ -57,6 +57,7 @@ class SketchOverlay:
         self._draw_entities(sketch)
         self._draw_preview(sketch)
         self._draw_cursor(sketch, camera_distance)
+        self._draw_snap_indicator(sketch, camera_distance)
 
         glPopAttrib()
 
@@ -218,6 +219,89 @@ class SketchOverlay:
         glVertex3f(*self._pt(sketch.plane, u,      v + cr))
         glEnd()
         glLineWidth(1.0)
+
+    def _draw_snap_indicator(self, sketch: SketchMode, camera_distance: float):
+        """
+        Draw a snap type indicator at the current snap point.
+        Each snap type gets a distinct symbol so you always know what's active:
+          ENDPOINT    — square
+          MIDPOINT    — triangle
+          CENTER      — circle (octagon approximation)
+          NEAREST     — X mark
+          GRID        — small diamond
+          FREE        — nothing (cursor crosshair is enough)
+        """
+        snap = getattr(sketch, 'last_snap', None)
+        if snap is None or snap.type.name == 'FREE':
+            return
+
+        from cad.sketch_tools.snap import SnapType
+        u, v = float(snap.point[0]), float(snap.point[1])
+        s    = camera_distance * 0.012   # symbol half-size
+
+        # Color per snap type
+        colors = {
+            SnapType.ENDPOINT:  (1.00, 0.55, 0.10),   # orange
+            SnapType.MIDPOINT:  (0.20, 0.85, 0.40),   # green
+            SnapType.CENTER:    (0.30, 0.70, 1.00),   # blue
+            SnapType.NEAREST:   (0.85, 0.85, 0.20),   # yellow
+            SnapType.GRID:      (0.55, 0.55, 0.55),   # grey
+        }
+        r, g, b = colors.get(snap.type, (1.0, 1.0, 1.0))
+
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glColor4f(r, g, b, 0.9)
+        glLineWidth(1.5)
+
+        if snap.type == SnapType.ENDPOINT:
+            # Square
+            glBegin(GL_LINE_LOOP)
+            glVertex3f(*self._pt(sketch.plane, u - s, v - s))
+            glVertex3f(*self._pt(sketch.plane, u + s, v - s))
+            glVertex3f(*self._pt(sketch.plane, u + s, v + s))
+            glVertex3f(*self._pt(sketch.plane, u - s, v + s))
+            glEnd()
+
+        elif snap.type == SnapType.MIDPOINT:
+            # Triangle (pointing up)
+            glBegin(GL_LINE_LOOP)
+            glVertex3f(*self._pt(sketch.plane, u,       v + s * 1.2))
+            glVertex3f(*self._pt(sketch.plane, u - s,   v - s * 0.7))
+            glVertex3f(*self._pt(sketch.plane, u + s,   v - s * 0.7))
+            glEnd()
+
+        elif snap.type == SnapType.CENTER:
+            # Octagon (circle approximation)
+            import math
+            glBegin(GL_LINE_LOOP)
+            for i in range(8):
+                a = math.pi * 2 * i / 8
+                glVertex3f(*self._pt(sketch.plane,
+                                     u + s * math.cos(a),
+                                     v + s * math.sin(a)))
+            glEnd()
+
+        elif snap.type == SnapType.NEAREST:
+            # X mark
+            glBegin(GL_LINES)
+            glVertex3f(*self._pt(sketch.plane, u - s, v - s))
+            glVertex3f(*self._pt(sketch.plane, u + s, v + s))
+            glVertex3f(*self._pt(sketch.plane, u + s, v - s))
+            glVertex3f(*self._pt(sketch.plane, u - s, v + s))
+            glEnd()
+
+        elif snap.type == SnapType.GRID:
+            # Diamond
+            glBegin(GL_LINE_LOOP)
+            glVertex3f(*self._pt(sketch.plane, u,     v + s))
+            glVertex3f(*self._pt(sketch.plane, u + s, v))
+            glVertex3f(*self._pt(sketch.plane, u,     v - s))
+            glVertex3f(*self._pt(sketch.plane, u - s, v))
+            glEnd()
+
+        glLineWidth(1.0)
+        glDisable(GL_BLEND)
 
     # ------------------------------------------------------------------
     # Committed sketch rendering (SketchEntry)

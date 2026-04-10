@@ -1,8 +1,7 @@
 """
 cad/prefs.py
 
-User preferences — colors, display settings, and anything else the user
-might want to persist across sessions.
+User preferences — colors, display settings, keybindings.
 
 Stored as JSON in the platform config directory:
   Linux/Mac : ~/.config/cadapp/prefs.json
@@ -16,6 +15,7 @@ Usage
     prefs.save()                         # persist to disk
 
 All color values are (R, G, B) tuples with components in [0.0, 1.0].
+Keybind values are key strings like "L", "Ctrl+Z", "Return", "Escape".
 """
 
 from __future__ import annotations
@@ -31,6 +31,42 @@ Color3 = Tuple[float, float, float]
 def _p(r, g, b) -> Color3:
     return (float(r), float(g), float(b))
 
+
+# ---------------------------------------------------------------------------
+# Keybind metadata — consumed by prefs_dialog.py to build the UI
+# ---------------------------------------------------------------------------
+
+# Default key string for each action
+KEYBIND_DEFAULTS: dict[str, str] = {
+    # 3D mode
+    "extrude":           "E",
+    "undo":              "Ctrl+Z",
+    "redo":              "Ctrl+Y",
+    "projection_toggle": "",
+    # Sketch mode — tools
+    "sketch_line":       "L",
+    "sketch_include":    "I",
+    "sketch_commit":     "Return",
+    # Sketch mode — navigation
+    "sketch_projection_toggle": "",
+}
+
+# Human-readable labels: action → (section, label)
+KEYBIND_LABELS: dict[str, tuple[str, str]] = {
+    "extrude":                  ("3D Mode",    "Extrude selected face"),
+    "undo":                     ("3D Mode",    "Undo"),
+    "redo":                     ("3D Mode",    "Redo"),
+    "projection_toggle":        ("3D Mode",    "Toggle ortho/perspective"),
+    "sketch_line":              ("Sketch",     "Line tool"),
+    "sketch_include":           ("Sketch",     "Include geometry"),
+    "sketch_commit":            ("Sketch",     "Commit sketch"),
+    "sketch_projection_toggle": ("Sketch",     "Toggle ortho/perspective"),
+}
+
+
+# ---------------------------------------------------------------------------
+# Prefs dataclass
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Prefs:
@@ -80,9 +116,52 @@ class Prefs:
     # ------------------------------------------------------------------
     camera_rotate_speed:    float  = 1.0
     camera_pan_speed:       float  = 1.0
-    camera_mode:            str    = 'trackball'  # 'trackball' | 'arcball'
+    camera_mode:            str    = 'trackball'
     camera_invert_yaw:      bool   = False
     camera_invert_pitch:    bool   = False
+
+    # ------------------------------------------------------------------
+    # Keybindings  — action_name → key string
+    # ------------------------------------------------------------------
+    keybinds: dict = field(
+        default_factory=lambda: dict(KEYBIND_DEFAULTS))
+
+    # ------------------------------------------------------------------
+    # Keybind helpers
+    # ------------------------------------------------------------------
+
+    def key(self, action: str) -> str:
+        """Return the current key string for an action, falling back to default."""
+        return self.keybinds.get(action, KEYBIND_DEFAULTS.get(action, ""))
+
+    def matches(self, action: str, qt_key_event) -> bool:
+        """
+        Return True if a QKeyEvent matches the bound key for action.
+
+        Handles plain keys ("L", "E", "Return") and modified keys ("Ctrl+Z").
+        """
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QKeySequence
+
+        bound = self.key(action)
+        if not bound:
+            return False
+
+        seq     = QKeySequence(bound)
+        if seq.isEmpty():
+            return False
+
+        # Reconstruct a QKeySequence from the event for comparison
+        mods = qt_key_event.modifiers()
+        k    = qt_key_event.key()
+
+        # Strip modifier-only keypresses
+        if k in (Qt.Key.Key_Control, Qt.Key.Key_Shift,
+                 Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+            return False
+
+        event_seq = QKeySequence(int(mods.value) | k)
+        return seq == event_seq
 
     # ------------------------------------------------------------------
     # Persistence
@@ -100,8 +179,9 @@ class Prefs:
     def save(self):
         path = self._config_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        d = asdict(self)
         with open(path, 'w') as f:
-            json.dump(asdict(self), f, indent=2)
+            json.dump(d, f, indent=2)
 
     def load(self):
         path = self._config_path()
@@ -111,11 +191,17 @@ class Prefs:
             with open(path) as f:
                 data = json.load(f)
             for key, val in data.items():
-                if hasattr(self, key):
-                    # Colors are stored as lists in JSON, convert back to tuple
-                    if isinstance(val, list):
-                        val = tuple(val)
-                    setattr(self, key, val)
+                if not hasattr(self, key):
+                    continue
+                if isinstance(val, list):
+                    val = tuple(val)
+                # Merge keybinds: start from defaults, then apply saved values.
+                # Explicitly saved "" means intentionally unbound — preserve it.
+                if key == 'keybinds' and isinstance(val, dict):
+                    merged = dict(KEYBIND_DEFAULTS)
+                    merged.update(val)   # saved "" overwrites default correctly
+                    val = merged
+                setattr(self, key, val)
         except Exception as e:
             print(f"[Prefs] Could not load preferences: {e}")
 
@@ -125,9 +211,13 @@ class Prefs:
         for key in asdict(self):
             setattr(self, key, getattr(defaults, key))
 
+    def reset_keybinds(self):
+        """Reset only keybindings to defaults."""
+        self.keybinds = dict(KEYBIND_DEFAULTS)
+
 
 # ---------------------------------------------------------------------------
-# Singleton — import this everywhere
+# Singleton
 # ---------------------------------------------------------------------------
 
 prefs = Prefs()

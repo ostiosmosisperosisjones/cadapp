@@ -1,11 +1,16 @@
 """
 viewer/viewport.py
 
-Thin Qt widget: GL lifecycle, input events, mesh management, operations.
-Drawing logic lives in viewer/renderer.py.
-Hover/pick logic lives in viewer/hover.py.
+Viewport — the main GL widget.  Thin coordinator; logic lives in:
+
+  viewer/renderer.py      — draw_opaque, draw_overlays
+  viewer/hover.py         — HoverState
+  viewer/sketch_overlay.py— SketchOverlay
+  viewer/sketch_pick.py   — SketchPickMixin  (sketch face rebuild/pick/draw)
+  viewer/vp_operations.py — OperationsMixin  (extrude, undo/redo, replay)
 """
 
+from __future__ import annotations
 import numpy as np
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -17,12 +22,14 @@ from viewer.mesh import Mesh
 from viewer.renderer import draw_opaque, draw_overlays
 from viewer.hover import HoverState
 from viewer.view_cube import ViewCube
+from viewer.sketch_pick import SketchPickMixin
+from viewer.vp_operations import OperationsMixin
 from cad.workspace import Workspace
 from cad.history import History
 from cad.selection import SelectionSet
 
 
-class Viewport(QOpenGLWidget):
+class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
     history_changed     = pyqtSignal()
     selection_changed   = pyqtSignal()
     sketch_mode_changed = pyqtSignal(bool)
@@ -36,7 +43,7 @@ class Viewport(QOpenGLWidget):
         self._view_cube = ViewCube()
 
         self._meshes: dict[str, Mesh] = {}
-        self._body_visible: dict[str, bool] = {}  # True = visible (default)
+        self._body_visible: dict[str, bool] = {}
 
         self._modelview  = None
         self._projection = None
@@ -48,14 +55,8 @@ class Viewport(QOpenGLWidget):
         self._hovered_vertex: tuple[str | None, int | None] = (None, None)
         self._hovered_edge:   tuple[str | None, int | None] = (None, None)
 
-        # Sketch modal state — None when not in sketch mode
-        self._sketch = None   # SketchMode | None
-
-        # Committed sketch faces — built on demand from history entries.
-        # Maps history_index → list of build123d Face objects (one per closed loop).
-        self._sketch_faces: dict[int, list] = {}
-
-        # Currently selected sketch entry index (for extrude-from-sketch)
+        self._sketch = None                         # SketchMode | None
+        self._sketch_faces: dict[int, list] = {}   # history_idx → [Face]
         self._selected_sketch_entry: int | None = None
 
         self.camera_projection_changed = None
@@ -105,8 +106,6 @@ class Viewport(QOpenGLWidget):
         self.update()
 
     def set_active_body(self, body_id: str | None):
-        """Driven externally (e.g. parts panel click) — sets active body
-        and clears selection without re-emitting body_selected."""
         self.selection.clear()
         if body_id is not None:
             self.workspace.set_active_body(body_id)
@@ -114,7 +113,6 @@ class Viewport(QOpenGLWidget):
         self.update()
 
     def _visible_meshes(self) -> dict:
-        """Return only meshes whose body is currently visible."""
         return {bid: m for bid, m in self._meshes.items()
                 if self._body_visible.get(bid, True)}
 
@@ -135,6 +133,7 @@ class Viewport(QOpenGLWidget):
             for buf in (old.vbo_verts, old.vbo_normals, old.vbo_edges, old.ebo):
                 if buf is not None:
                     glDeleteBuffers(1, [buf])
+        self._body_visible.setdefault(body_id, True)   # new bodies are visible
         shape = self.workspace.current_shape(body_id)
         if shape is not None:
             mesh = Mesh(shape)
@@ -169,155 +168,6 @@ class Viewport(QOpenGLWidget):
         self._rebuild_sketch_faces()
         self.selection_changed.emit()
         self.update()
-
-    # ------------------------------------------------------------------
-    # Sketch face management
-    # ------------------------------------------------------------------
-
-    def _rebuild_sketch_faces(self):
-        """
-        Rebuild the dict of pickable/renderable faces from all committed
-        sketch entries up to the current history cursor.
-        Called after any history mutation.
-        """
-        self._sketch_faces.clear()
-        cursor = self.history.cursor
-        for i, entry in enumerate(self.history.entries):
-            if i > cursor:
-                break
-            if entry.operation != "sketch":
-                continue
-            se = entry.params.get("sketch_entry")
-            if se is None:
-                continue
-            try:
-                segs   = se.line_segments()
-                loops  = se.closed_loops()
-                faces  = se.build_faces()
-                print(f"[Sketch] Entry {i}: {len(segs)} segments, "
-                      f"{len(loops)} closed loops, {len(faces)} faces built")
-                if faces:
-                    self._sketch_faces[i] = faces
-            except Exception as ex:
-                print(f"[Sketch] Could not build faces for entry {i}: {ex}")
-
-    def _pick_sketch_face(self, ray_origin: np.ndarray, ray_dir: np.ndarray
-                          ) -> tuple[int | None, int | None]:
-        """
-        Ray-test all sketch faces.
-        Returns (history_index, face_index_within_entry) for the closest hit,
-        or (None, None).
-        """
-        from OCP.BRepIntCurveSurface import BRepIntCurveSurface_Inter
-        from OCP.gp import gp_Lin, gp_Pnt, gp_Dir
-
-        best_t    = np.inf
-        best_hidx = None
-        best_fidx = None
-
-        o = ray_origin
-        d = ray_dir
-        try:
-            gp_dir = gp_Dir(float(d[0]), float(d[1]), float(d[2]))
-            gp_pnt = gp_Pnt(float(o[0]), float(o[1]), float(o[2]))
-            line   = gp_Lin(gp_pnt, gp_dir)
-        except Exception:
-            return None, None
-
-        for hidx, faces in self._sketch_faces.items():
-            for fidx, face in enumerate(faces):
-                try:
-                    inter = BRepIntCurveSurface_Inter()
-                    inter.Init(face.wrapped, line, 1e-6)
-                    while inter.More():
-                        t = inter.W()
-                        if 0 < t < best_t:
-                            best_t    = t
-                            best_hidx = hidx
-                            best_fidx = fidx
-                        inter.Next()
-                except Exception:
-                    pass
-
-        return best_hidx, best_fidx
-
-    def _draw_sketch_faces(self):
-        """
-        Draw all pickable sketch faces as semi-transparent filled polygons.
-        Called from paintGL after opaque geometry.
-        """
-        if not self._sketch_faces:
-            return
-
-        from OCP.BRep import BRep_Tool
-        from OCP.BRepMesh import BRepMesh_IncrementalMesh
-        from OCP.TopExp import TopExp_Explorer
-        from OCP.TopAbs import TopAbs_EDGE
-        from OCP.BRepAdaptor import BRepAdaptor_Curve
-        from OCP.GCPnts import GCPnts_UniformAbscissa
-
-        glDisable(GL_LIGHTING)
-        glDisable(GL_DEPTH_TEST)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-
-        for hidx, faces in self._sketch_faces.items():
-            is_selected = (hidx == self._selected_sketch_entry)
-            for face in faces:
-                try:
-                    BRepMesh_IncrementalMesh(face.wrapped, 0.1)
-                    location = face.wrapped.Location()
-                    facing   = BRep_Tool.Triangulation_s(face.wrapped, location)
-                    if facing is None:
-                        continue
-
-                    # Filled polygon
-                    if is_selected:
-                        glColor4f(0.29, 0.43, 0.54, 0.45)
-                    else:
-                        glColor4f(0.29, 0.43, 0.54, 0.20)
-
-                    glBegin(GL_TRIANGLES)
-                    for tri_idx in range(1, facing.NbTriangles() + 1):
-                        tri = facing.Triangle(tri_idx)
-                        n1, n2, n3 = tri.Get()
-                        for ni in (n1, n2, n3):
-                            node = facing.Node(ni)
-                            glVertex3f(node.X(), node.Y(), node.Z())
-                    glEnd()
-
-                    # Boundary outline
-                    if is_selected:
-                        glColor4f(0.48, 0.70, 0.84, 0.90)
-                        glLineWidth(1.8)
-                    else:
-                        glColor4f(0.29, 0.43, 0.54, 0.50)
-                        glLineWidth(1.2)
-
-                    exp = TopExp_Explorer(face.wrapped, TopAbs_EDGE)
-                    while exp.More():
-                        edge = exp.Current()
-                        try:
-                            adaptor = BRepAdaptor_Curve(edge)
-                            disc    = GCPnts_UniformAbscissa()
-                            disc.Initialize(adaptor, 32)
-                            if disc.IsDone() and disc.NbPoints() >= 2:
-                                glBegin(GL_LINE_STRIP)
-                                for pi in range(1, disc.NbPoints() + 1):
-                                    p = adaptor.Value(disc.Parameter(pi))
-                                    glVertex3f(p.X(), p.Y(), p.Z())
-                                glEnd()
-                        except Exception:
-                            pass
-                        exp.Next()
-                    glLineWidth(1.0)
-
-                except Exception as ex:
-                    print(f"[Sketch] draw_sketch_faces error: {ex}")
-
-        glDisable(GL_BLEND)
-        glEnable(GL_DEPTH_TEST)
-        glEnable(GL_LIGHTING)
 
     # ------------------------------------------------------------------
     # GL lifecycle
@@ -369,8 +219,6 @@ class Viewport(QOpenGLWidget):
         visible = self._visible_meshes()
         draw_opaque(visible, self.workspace, self.selection)
 
-        # Capture matrices and rebuild hover cache while depth buffer
-        # contains only opaque geometry — gives correct occlusion results.
         self._modelview  = glGetDoublev(GL_MODELVIEW_MATRIX)
         self._projection = glGetDoublev(GL_PROJECTION_MATRIX)
         self._viewport   = glGetIntegerv(GL_VIEWPORT)
@@ -379,7 +227,6 @@ class Viewport(QOpenGLWidget):
                            self._viewport, self.devicePixelRatio(),
                            camera_eye=self.camera.get_eye())
 
-        # Sketch faces — filled transparent polygons for committed sketches
         self._draw_sketch_faces()
 
         draw_overlays(visible, self.selection,
@@ -390,7 +237,8 @@ class Viewport(QOpenGLWidget):
 
         from viewer.camera import _quat_to_matrix
         R = _quat_to_matrix(self.camera.rotation)
-        self._view_cube.draw(R, self.width(), self.height(), self.devicePixelRatio())
+        self._view_cube.draw(R, self.width(), self.height(),
+                             self.devicePixelRatio())
 
     # ------------------------------------------------------------------
     # Ray casting
@@ -430,14 +278,12 @@ class Viewport(QOpenGLWidget):
     # ------------------------------------------------------------------
 
     def keyPressEvent(self, e):
-        key  = e.key()
-        mods = e.modifiers()
+        from cad.prefs import prefs
+        from cad.sketch import SketchTool
 
-        if key == Qt.Key.Key_Escape:
+        if e.key() == Qt.Key.Key_Escape:
             if self._sketch is not None:
-                from cad.sketch import SketchTool
                 if self._sketch.tool != SketchTool.NONE:
-                    # First ESC: cancel in-progress action, stay in tool
                     self._sketch.cancel_tool()
                     self.sketch_mode_changed.emit(True)
                 else:
@@ -450,16 +296,15 @@ class Viewport(QOpenGLWidget):
             self.update()
             return
 
-        # Keys active inside sketch mode
         if self._sketch is not None:
-            from cad.sketch import SketchTool
-            if key == Qt.Key.Key_L:
+            if prefs.matches("sketch_line", e):
                 self._sketch.set_tool(SketchTool.LINE)
                 self.sketch_mode_changed.emit(True)
                 self.update()
-            elif key == Qt.Key.Key_I:
+            elif prefs.matches("sketch_include", e):
                 from cad.sketch_tools.include import IncludeTool
-                n = IncludeTool.apply(self._sketch, self.selection, self._meshes)
+                n = IncludeTool.apply(self._sketch, self.selection,
+                                      self._meshes)
                 if n:
                     print(f"[Sketch] Included {n} reference "
                           f"{'entity' if n == 1 else 'entities'}")
@@ -469,21 +314,21 @@ class Viewport(QOpenGLWidget):
                 else:
                     print("[Sketch] Nothing selected to include — "
                           "select edges or vertices first.")
-            elif key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
+            elif prefs.matches("sketch_commit", e):
                 self._complete_sketch()
-            elif key == Qt.Key.Key_5:
+            elif prefs.matches("sketch_projection_toggle", e):
                 self.toggle_projection()
             else:
                 super().keyPressEvent(e)
             return
 
-        # Normal 3D mode keys
-        if mods & Qt.KeyboardModifier.ControlModifier:
-            if key == Qt.Key.Key_Z:  self._do_undo(); return
-            if key == Qt.Key.Key_Y:  self._do_redo(); return
-        if key == Qt.Key.Key_5:
+        if prefs.matches("undo", e):
+            self._do_undo()
+        elif prefs.matches("redo", e):
+            self._do_redo()
+        elif prefs.matches("projection_toggle", e):
             self.toggle_projection()
-        elif key == Qt.Key.Key_E:
+        elif prefs.matches("extrude", e):
             self._try_extrude()
         else:
             super().keyPressEvent(e)
@@ -495,168 +340,10 @@ class Viewport(QOpenGLWidget):
         self.update()
 
     # ------------------------------------------------------------------
-    # Undo / Redo / Seek / Replay
-    # ------------------------------------------------------------------
-
-    def _do_undo(self):
-        entry = self.history.undo()
-        if entry is None:
-            print("[Undo] Nothing to undo."); return
-        print(f"[Undo] Reverting: {entry.label}")
-        self._rebuild_all_meshes()
-        self.history_changed.emit()
-
-    def _do_redo(self):
-        entry = self.history.redo()
-        if entry is None:
-            print("[Redo] Nothing to redo."); return
-        print(f"[Redo] Restoring: {entry.label}")
-        self._rebuild_all_meshes()
-        self.history_changed.emit()
-
-    def seek_history(self, index: int):
-        if self.history.seek(index):
-            self._rebuild_all_meshes()
-            self.history_changed.emit()
-
-    def do_replay(self, from_index: int):
-        print(f"[Replay] Replaying from entry {from_index}…")
-        ok, err = self.history.replay_from(from_index)
-        if not ok:
-            print(f"[Replay] FAILED: {err}")
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "Replay failed", err)
-            return
-        self._rebuild_all_meshes()
-        self.history_changed.emit()
-        print("[Replay] Done.")
-
-    # ------------------------------------------------------------------
-    # Extrude
-    # ------------------------------------------------------------------
-
-    def _try_extrude(self):
-        # Sketch face selected — extrude from sketch profile
-        if self._selected_sketch_entry is not None:
-            self._do_sketch_extrude_dialog(self._selected_sketch_entry)
-            return
-
-        # Normal face selected
-        if self.selection.face_count == 0:
-            print("[Extrude] No face or sketch selected."); return
-        sf = self.selection.single_face or self.selection.faces[0]
-        cb = self.request_extrude_distance
-        if cb:
-            cb(sf.body_id, sf.face_idx)
-        else:
-            self._do_extrude_dialog(sf.body_id, sf.face_idx)
-
-    def _do_extrude_dialog(self, body_id, face_idx):
-        from PyQt6.QtWidgets import QInputDialog
-        dist, ok = QInputDialog.getDouble(
-            self, "Extrude",
-            "Distance (positive = add material, negative = cut):",
-            value=5.0, min=-1000.0, max=1000.0, decimals=3)
-        if ok:
-            self.do_extrude(body_id, face_idx, dist)
-
-    def _do_sketch_extrude_dialog(self, history_idx: int):
-        from PyQt6.QtWidgets import QInputDialog
-        dist, ok = QInputDialog.getDouble(
-            self, "Extrude Sketch",
-            "Distance (positive = add material, negative = cut):",
-            value=5.0, min=-1000.0, max=1000.0, decimals=3)
-        if ok:
-            self.do_extrude_sketch(history_idx, dist)
-
-    def do_extrude(self, body_id: str, face_idx: int, distance: float):
-        from cad.operations import extrude_face
-        from cad.face_ref import FaceRef
-        mesh = self._meshes.get(body_id)
-        if mesh is None:
-            print(f"[Extrude] No mesh for body {body_id}"); return
-        shape_before = self.workspace.current_shape(body_id)
-        face_ref     = FaceRef.from_b3d_face(mesh.occt_faces[face_idx])
-        if face_ref is None:
-            print(f"[Extrude] Face {face_idx} is not planar."); return
-        try:
-            shape_after = extrude_face(shape_before, face_idx, distance)
-        except Exception as ex:
-            print(f"[Extrude] FAILED: {ex}"); return
-        op    = "cut" if distance < 0 else "extrude"
-        label = (f"Cut  -{abs(distance):.3f}mm" if distance < 0
-                 else f"Extrude  +{distance:.3f}mm")
-        self.history.push(
-            label=label, operation=op, params={"distance": abs(distance)},
-            body_id=body_id, face_ref=face_ref,
-            shape_before=shape_before, shape_after=shape_after)
-        print(f"[Extrude] body={self.workspace.bodies[body_id].name} "
-              f"face={face_idx}  distance={distance:+.3f}  OK")
-        self._rebuild_body_mesh(body_id)
-        self.history_changed.emit()
-
-    def do_extrude_sketch(self, history_idx: int, distance: float):
-        """
-        Extrude all closed-loop faces from a committed SketchEntry.
-        Each closed loop is fused into / cut from the body.
-        """
-        from cad.operations import extrude_face_direct
-        from cad.face_ref import FaceRef
-
-        entries = self.history.entries
-        if history_idx >= len(entries):
-            print("[Extrude] Invalid sketch history index."); return
-
-        entry = entries[history_idx]
-        se    = entry.params.get("sketch_entry")
-        if se is None:
-            print("[Extrude] No sketch entry found."); return
-
-        faces = self._sketch_faces.get(history_idx, [])
-        if not faces:
-            print("[Extrude] Sketch has no closed loops to extrude."); return
-
-        body_id      = se.body_id
-        shape_before = self.workspace.current_shape(body_id)
-        shape_after  = shape_before
-
-        for face in faces:
-            try:
-                shape_after = extrude_face_direct(shape_after, face, distance)
-            except Exception as ex:
-                print(f"[Extrude] Sketch extrude FAILED: {ex}"); return
-
-        op    = "cut" if distance < 0 else "extrude"
-        label = (f"Cut  -{abs(distance):.3f}mm" if distance < 0
-                 else f"Extrude  +{distance:.3f}mm")
-
-        mesh     = self._meshes.get(body_id)
-        face_ref = (FaceRef.from_b3d_face(mesh.occt_faces[se.face_idx])
-                    if mesh else None)
-
-        self.history.push(
-            label        = label,
-            operation    = op,
-            params       = {"distance": abs(distance),
-                            "from_sketch_idx": history_idx},
-            body_id      = body_id,
-            face_ref     = face_ref,
-            shape_before = shape_before,
-            shape_after  = shape_after,
-        )
-
-        self._selected_sketch_entry = None
-        print(f"[Extrude] Sketch → body={self.workspace.bodies[body_id].name} "
-              f"distance={distance:+.3f}  OK")
-        self._rebuild_body_mesh(body_id)
-        self.history_changed.emit()
-
-    # ------------------------------------------------------------------
     # Sketch modal
     # ------------------------------------------------------------------
 
     def _enter_sketch(self, body_id: str, face_idx: int):
-        """Enter sketch mode on a planar face."""
         from cad.sketch import SketchMode
         from build123d import Plane
         mesh = self._meshes.get(body_id)
@@ -680,7 +367,6 @@ class Viewport(QOpenGLWidget):
               f"{self.workspace.bodies[body_id].name}")
 
     def _exit_sketch(self):
-        """Exit sketch mode, discarding the current sketch."""
         if self._sketch is None:
             return
         self._sketch = None
@@ -689,11 +375,9 @@ class Viewport(QOpenGLWidget):
         print("[Sketch] Exited sketch mode.")
 
     def _complete_sketch(self):
-        """Commit the current sketch to history as a 'sketch' operation."""
         if self._sketch is None:
             return
         sketch = self._sketch
-
         from cad.sketch import LineEntity, ReferenceEntity, SketchEntry
         lines = [e for e in sketch.entities if isinstance(e, LineEntity)]
         refs  = [e for e in sketch.entities if isinstance(e, ReferenceEntity)]
@@ -701,15 +385,12 @@ class Viewport(QOpenGLWidget):
             print("[Sketch] Nothing to commit — draw lines or include geometry first.")
             return
         entity_count = len(lines) + len(refs)
-
         from cad.face_ref import FaceRef
         mesh = self._meshes.get(sketch.body_id)
         face_ref = (FaceRef.from_b3d_face(mesh.occt_faces[sketch.face_idx])
                     if mesh else None)
-
         current_shape = self.workspace.current_shape(sketch.body_id)
         entry = SketchEntry.from_sketch_mode(sketch)
-
         self.history.push(
             label        = f"Sketch  ({entity_count} entities)",
             operation    = "sketch",
@@ -719,13 +400,16 @@ class Viewport(QOpenGLWidget):
             shape_before = current_shape,
             shape_after  = current_shape,
         )
-
         self._sketch = None
         self.sketch_mode_changed.emit(False)
         self._rebuild_sketch_faces()
         self.history_changed.emit()
         self.update()
         print(f"[Sketch] Committed {entity_count} entities to history.")
+
+    # ------------------------------------------------------------------
+    # Mouse
+    # ------------------------------------------------------------------
 
     def mouseDoubleClickEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
@@ -756,7 +440,12 @@ class Viewport(QOpenGLWidget):
                     origin, direction = self.get_ray(e.position().x(),
                                                      e.position().y())
                     if origin is not None:
-                        self._sketch.handle_click(origin, direction)
+                        shift = bool(e.modifiers() &
+                                     Qt.KeyboardModifier.ShiftModifier)
+                        self._sketch.snap.set_grid_snap(shift)
+                        self._sketch.snap.snap_radius_mm = self._snap_radius_mm()
+                        self._sketch.handle_click(
+                            origin, direction, self.camera.distance)
                         self.update()
                     return
 
@@ -785,7 +474,6 @@ class Viewport(QOpenGLWidget):
             else:
                 origin, direction = self.get_ray(e.position().x(),
                                                  e.position().y())
-                # Try sketch face first — they sit on top of geometry
                 if origin is not None and self._sketch_faces:
                     hidx, _ = self._pick_sketch_face(origin, direction)
                     if hidx is not None:
@@ -794,10 +482,10 @@ class Viewport(QOpenGLWidget):
                         self.body_selected.emit(None)
                         self.selection_changed.emit()
                         self.update()
-                        print(f"[Sketch] Selected sketch entry {hidx} — press E to extrude")
+                        print(f"[Sketch] Selected sketch entry {hidx}"
+                              f" — press E to extrude")
                         return
 
-                # Regular face pick
                 body_id, idx = self._pick_at(e.position())
                 if idx is not None:
                     self._selected_sketch_entry = None
@@ -853,7 +541,8 @@ class Viewport(QOpenGLWidget):
         from viewer.camera import _quat_to_matrix
         R = _quat_to_matrix(self.camera.rotation)
         cube_changed = self._view_cube.handle_mouse_move(
-            int(x), int(y), self.width(), self.height(), R, self.devicePixelRatio())
+            int(x), int(y), self.width(), self.height(), R,
+            self.devicePixelRatio())
         if cube_changed:
             self.update()
 
@@ -871,7 +560,12 @@ class Viewport(QOpenGLWidget):
             if self._sketch.tool != SketchTool.NONE:
                 origin, direction = self.get_ray(x, y)
                 if origin is not None:
-                    self._sketch.handle_mouse_move(origin, direction)
+                    shift = bool(e.modifiers() &
+                                 Qt.KeyboardModifier.ShiftModifier)
+                    self._sketch.snap.set_grid_snap(shift)
+                    self._sketch.snap.snap_radius_mm = self._snap_radius_mm()
+                    self._sketch.handle_mouse_move(
+                        origin, direction, self.camera.distance)
                     sketch_changed = True
 
         if hover_changed or sketch_changed:

@@ -126,8 +126,8 @@ class SketchMode:
     """
     Live sketch session.  Created on double-click, discarded on ESC/commit.
 
-    The active tool is a BaseTool instance (from cad/sketch_tools/).
-    set_tool() creates a fresh instance; the old one is discarded.
+    Owns a SnapEngine — snap resolution happens here so every tool gets
+    it automatically.  Tools receive SnapResult, never raw pt2d.
     """
 
     def __init__(self, b3d_plane: Plane, body_id: str, face_idx: int):
@@ -141,6 +141,13 @@ class SketchMode:
         # Active tool instance — None when no tool selected
         self._active_tool = None
 
+        # Snap engine — shared across all tools in this session
+        from cad.sketch_tools.snap import SnapEngine
+        self.snap = SnapEngine()
+
+        # Last resolved snap result — read by overlay for indicator drawing
+        self.last_snap: object = None   # SnapResult | None
+
     # ------------------------------------------------------------------
     # Tool management
     # ------------------------------------------------------------------
@@ -153,24 +160,43 @@ class SketchMode:
         self._active_tool = cls() if cls is not None else None
 
     def cancel_tool(self):
-        """ESC within a tool — reset in-progress state, stay in the tool."""
+        """ESC within a tool — discard in-progress state and return to NONE.
+        Stays in sketch mode so the user can select geometry, measure, etc."""
         if self._active_tool is not None:
             self._active_tool.cancel()
+        self.tool = SketchTool.NONE
+        self._active_tool = None
+        self.last_snap = None
 
     # ------------------------------------------------------------------
     # Input forwarding — viewport calls these every frame
     # ------------------------------------------------------------------
 
-    def handle_mouse_move(self, ray_origin: np.ndarray, ray_dir: np.ndarray):
+    def handle_mouse_move(self, ray_origin: np.ndarray, ray_dir: np.ndarray,
+                          camera_distance: float = 100.0):
         _, pt2d = self.plane.ray_intersect(ray_origin, ray_dir)
+        if pt2d is None:
+            self.last_snap = None
+            return
+        snap_result = self.snap.resolve(pt2d, self.entities,
+                                        self.plane, camera_distance)
+        self.last_snap = snap_result
         if self._active_tool is not None:
-            self._active_tool.handle_mouse_move(pt2d, self)
+            self._active_tool.handle_mouse_move(snap_result, self)
 
-    def handle_click(self, ray_origin: np.ndarray, ray_dir: np.ndarray) -> bool:
+    def handle_click(self, ray_origin: np.ndarray, ray_dir: np.ndarray,
+                     camera_distance: float = 100.0) -> bool:
         _, pt2d = self.plane.ray_intersect(ray_origin, ray_dir)
         if pt2d is None or self._active_tool is None:
             return False
-        return self._active_tool.handle_click(pt2d, self)
+        if (self.last_snap is not None and
+                np.linalg.norm(self.last_snap.cursor_raw - pt2d) < 1e-6):
+            snap_result = self.last_snap
+        else:
+            snap_result = self.snap.resolve(pt2d, self.entities,
+                                            self.plane, camera_distance)
+            self.last_snap = snap_result
+        return self._active_tool.handle_click(snap_result, self)
 
     # ------------------------------------------------------------------
     # Overlay helpers — read by sketch_overlay.py
@@ -178,7 +204,7 @@ class SketchMode:
 
     @property
     def _cursor_2d(self) -> np.ndarray | None:
-        """Current cursor position for the overlay."""
+        """Snapped cursor position for the overlay."""
         if self._active_tool is not None:
             return self._active_tool.cursor_2d
         return None

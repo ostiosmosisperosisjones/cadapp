@@ -39,13 +39,11 @@ class MainWindow(QMainWindow):
             QStatusBar::item { border: none; }
         """)
         from PyQt6.QtWidgets import QLabel
-        # Left side — sketch mode indicator
         self._sketch_label = QLabel("")
         self._sketch_label.setStyleSheet(
             "color: #4fc3f7; font-weight: bold; padding-left: 8px;")
         sb.addWidget(self._sketch_label)
 
-        # Right side — selection count
         self._sel_label = QLabel("")
         self._sel_label.setStyleSheet("color: #888; padding-right: 8px;")
         sb.addPermanentWidget(self._sel_label)
@@ -54,17 +52,36 @@ class MainWindow(QMainWindow):
         if not in_sketch:
             self._sketch_label.setText("")
             return
-        # Show which tool is active
         sketch = self._viewport._sketch if self._viewport else None
         if sketch is None:
             self._sketch_label.setText("")
             return
+
         from cad.sketch import SketchTool
+        from cad.prefs import prefs
+
+        # Build hint strings from current keybinds so they stay in sync
+        k_line    = prefs.key("sketch_line")
+        k_include = prefs.key("sketch_include")
+        k_commit  = prefs.key("sketch_commit")
+
         tool_hints = {
-            SketchTool.NONE:   "✏  SKETCH MODE  —  L = line  |  I = include geometry  |  ESC = exit",
-            SketchTool.LINE:   "✏  LINE TOOL  —  click to draw  |  ESC = cancel tool",
-            SketchTool.CIRCLE: "✏  CIRCLE TOOL  —  click to draw  |  ESC = cancel tool",
-            SketchTool.ARC:    "✏  ARC TOOL  —  click to draw  |  ESC = cancel tool",
+            SketchTool.NONE: (
+                f"✏  SKETCH MODE  —  "
+                f"{k_line} = line  |  "
+                f"{k_include} = include geometry  |  "
+                f"{k_commit} = commit  |  ESC = exit"
+            ),
+            SketchTool.LINE: (
+                f"✏  LINE TOOL  —  click to draw  |  "
+                f"{k_commit} = commit  |  ESC = cancel"
+            ),
+            SketchTool.CIRCLE: (
+                f"✏  CIRCLE TOOL  —  click to draw  |  ESC = cancel"
+            ),
+            SketchTool.ARC: (
+                f"✏  ARC TOOL  —  click to draw  |  ESC = cancel"
+            ),
         }
         self._sketch_label.setText(
             tool_hints.get(sketch.tool, "✏  SKETCH MODE"))
@@ -77,6 +94,7 @@ class MainWindow(QMainWindow):
         self._sel_label.setText(text)
 
     def _build_menu(self):
+        from cad.prefs import prefs
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("File")
@@ -87,7 +105,7 @@ class MainWindow(QMainWindow):
         view_menu = menubar.addMenu("View")
         self._proj_action = QAction("Orthographic", self)
         self._proj_action.setCheckable(True)
-        self._proj_action.setShortcut("5")
+        self._proj_action.setShortcut(prefs.key("projection_toggle"))
         self._proj_action.triggered.connect(self._toggle_projection)
         view_menu.addAction(self._proj_action)
 
@@ -98,7 +116,8 @@ class MainWindow(QMainWindow):
 
         ops_menu = menubar.addMenu("Operations")
 
-        extrude_act = QAction("Extrude face…  (E)", self)
+        extrude_act = QAction(
+            f"Extrude face…  ({prefs.key('extrude')})", self)
         extrude_act.triggered.connect(self._menu_extrude)
         ops_menu.addAction(extrude_act)
 
@@ -106,21 +125,23 @@ class MainWindow(QMainWindow):
 
         undo_act = QAction("Undo", self)
         undo_act.setShortcut(QKeySequence.StandardKey.Undo)
-        undo_act.triggered.connect(lambda: self._viewport and self._viewport._do_undo())
+        undo_act.triggered.connect(
+            lambda: self._viewport and self._viewport._do_undo())
         ops_menu.addAction(undo_act)
 
         redo_act = QAction("Redo", self)
         redo_act.setShortcut(QKeySequence.StandardKey.Redo)
-        redo_act.triggered.connect(lambda: self._viewport and self._viewport._do_redo())
+        redo_act.triggered.connect(
+            lambda: self._viewport and self._viewport._do_redo())
         ops_menu.addAction(redo_act)
 
     def _open_prefs(self):
         from gui.prefs_dialog import PrefsDialog
         dlg = PrefsDialog(self)
         if dlg.exec() and self._viewport:
-            # Re-apply background color immediately
             from OpenGL.GL import glClearColor
-            r, g, b = __import__('cad.prefs', fromlist=['prefs']).prefs.background_color
+            from cad.prefs import prefs
+            r, g, b = prefs.background_color
             self._viewport.makeCurrent()
             glClearColor(r, g, b, 1.0)
             self._viewport.doneCurrent()
@@ -209,9 +230,10 @@ class MainWindow(QMainWindow):
         vp.body_selected.connect(sidebar.parts_panel.set_selected_body)
         vp.body_selected.connect(sidebar.history_panel.set_selected_body)
         sidebar.parts_panel.body_selected.connect(vp.set_active_body)
-        sidebar.parts_panel.body_selected.connect(sidebar.history_panel.set_selected_body)
+        sidebar.parts_panel.body_selected.connect(
+            sidebar.history_panel.set_selected_body)
+        sidebar.history_panel.sketch_vis_changed.connect(vp.update)
 
-        # Wire selection + sketch → status bar
         vp.selection_changed.connect(self._update_selection_label)
         vp.sketch_mode_changed.connect(self._update_sketch_label)
 
