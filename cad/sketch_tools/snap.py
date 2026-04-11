@@ -235,9 +235,16 @@ class SnapEngine:
                 candidates = [ent.p0, ent.p1]
             elif isinstance(ent, ReferenceEntity):
                 if ent.occ_edges:
+                    # Skip endpoints of closed curves (circles, closed splines)
+                    # — center snap handles those more usefully.
+                    if _all_edges_closed(ent.occ_edges):
+                        continue
                     candidates = self._curve_endpoints_uv(ent, plane)
                 elif len(ent.points) >= 2:
-                    candidates = [ent.points[0], ent.points[-1]]
+                    # Polyline fallback — skip if first==last (closed loop)
+                    p0, p1 = ent.points[0], ent.points[-1]
+                    if np.linalg.norm(p1 - p0) > 1e-6:
+                        candidates = [p0, p1]
 
             for p in candidates:
                 d = float(np.linalg.norm(cursor - p))
@@ -354,3 +361,25 @@ def _nearest_on_segment(p: np.ndarray, a: np.ndarray,
         return np.array(a, dtype=np.float64)
     t = max(0.0, min(1.0, float(np.dot(p - a, ab)) / ab_len_sq))
     return a + t * ab
+
+
+def _all_edges_closed(occ_edges: list) -> bool:
+    """
+    Return True if all OCC edges in the list are closed curves
+    (i.e. the curve's first and last parameter meet at the same point).
+    Used to suppress endpoint snap on circles so center snap fires instead.
+    """
+    try:
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        for edge in occ_edges:
+            a = BRepAdaptor_Curve(edge)
+            p0 = a.Value(a.FirstParameter())
+            p1 = a.Value(a.LastParameter())
+            dist = ((p0.X()-p1.X())**2 +
+                    (p0.Y()-p1.Y())**2 +
+                    (p0.Z()-p1.Z())**2) ** 0.5
+            if dist > 1e-4:
+                return False
+        return True
+    except Exception:
+        return False

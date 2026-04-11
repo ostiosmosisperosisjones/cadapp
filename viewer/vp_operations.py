@@ -15,6 +15,33 @@ from __future__ import annotations
 class OperationsMixin:
 
     # ------------------------------------------------------------------
+    # Post-push cascade
+    # ------------------------------------------------------------------
+
+    def _post_push_cascade(self, primary_body_id: str | None = None):
+        """
+        Called after every history.push().
+
+        If the push inserted into mid-history (diverged entries exist after
+        cursor), replay the affected body forward so diverged entries get
+        correct shapes or error flags, then rebuild all meshes.
+
+        If we're at the tip of history (normal append), just rebuild the
+        primary body mesh — cheaper and no replay needed.
+        """
+        if self.history.is_mid_history:
+            cursor = self.history.cursor
+            ok, err = self.history.replay_from(cursor)
+            if not ok:
+                print(f"[Cascade] Replay after insert: {err}")
+            self._rebuild_all_meshes()
+        else:
+            if primary_body_id is not None:
+                self._rebuild_body_mesh(primary_body_id)
+            else:
+                self._rebuild_all_meshes()
+
+    # ------------------------------------------------------------------
     # Undo / Redo / Seek / Replay
     # ------------------------------------------------------------------
 
@@ -33,6 +60,27 @@ class OperationsMixin:
         print(f"[Redo] Restoring: {entry.label}")
         self._rebuild_all_meshes()
         self.history_changed.emit()
+
+    def handle_undo(self):
+        """
+        Context-aware undo: per-sketch entity undo while in sketch mode,
+        global history undo otherwise.  Route QAction shortcuts here so the
+        menu-level Ctrl+Z doesn't bypass sketch-mode handling.
+        """
+        if self._sketch is not None:
+            if self._sketch.undo_entity():
+                print("[Sketch] Undo last entity")
+                self.update()
+            else:
+                print("[Sketch] Nothing to undo in sketch")
+        else:
+            self._do_undo()
+
+    def handle_redo(self):
+        """Context-aware redo — no-op inside a sketch session."""
+        if self._sketch is not None:
+            return
+        self._do_redo()
 
     def seek_history(self, index: int):
         if self.history.seek(index):
@@ -113,7 +161,7 @@ class OperationsMixin:
             shape_before=shape_before, shape_after=shape_after)
         print(f"[Extrude] body={self.workspace.bodies[body_id].name} "
               f"face={face_idx}  distance={distance:+.3f}  OK")
-        self._rebuild_body_mesh(body_id)
+        self._post_push_cascade(body_id)
         self.history_changed.emit()
 
     # ------------------------------------------------------------------
@@ -170,7 +218,11 @@ class OperationsMixin:
         original_solid_count = len(list(shape_before.solids()))
 
         if len(solids) > 1 and len(solids) > original_solid_count:
-            # First solid stays on the original body
+            # First solid stays on the original body.
+            # Record the index this push will occupy so split entries can
+            # reference it by source_entry_idx for parametric replay.
+            # With non-destructive history, push inserts at cursor+1.
+            parent_entry_idx = self.history.cursor + 1
             primary_solid = solids[0]
             self.history.push(
                 label        = label,
@@ -182,25 +234,26 @@ class OperationsMixin:
                 shape_before = shape_before,
                 shape_after  = primary_solid,
             )
-            self._rebuild_body_mesh(body_id)
-
-            # Remaining solids become new bodies
+            # Remaining solids become new bodies.
+            # source_shape=None so current_shape() only returns data once the
+            # import entry is at or before the history cursor (prevents the
+            # body appearing prematurely when seeking backward).
             orig_name = self.workspace.bodies[body_id].name
             for i, solid in enumerate(solids[1:], start=1):
                 new_name = f"{orig_name}  [{i+1}]"
-                new_body = self.workspace.add_body(new_name, solid)
+                new_body = self.workspace.add_body(new_name, None)
                 self.history.push(
                     label        = f"Extrude (new body)  {new_name}",
                     operation    = "import",
                     params       = {"from_sketch_idx": history_idx,
-                                    "split_from": body_id},
+                                    "split_from":      body_id,
+                                    "source_entry_idx": parent_entry_idx,
+                                    "solid_index":      i},
                     body_id      = new_body.id,
                     face_ref     = None,
                     shape_before = None,
                     shape_after  = solid,
                 )
-                # Build mesh for the new body
-                self._rebuild_body_mesh(new_body.id)
                 print(f"[Extrude] New body '{new_name}' "
                       f"({len(list(solid.faces()))} faces)")
         else:
@@ -215,8 +268,8 @@ class OperationsMixin:
                 shape_before = shape_before,
                 shape_after  = shape_after,
             )
-            self._rebuild_body_mesh(body_id)
 
+        self._post_push_cascade(body_id)
         self._selected_sketch_entry = None
         print(f"[Extrude] Sketch → body={self.workspace.bodies[body_id].name} "
               f"distance={distance:+.3f}  OK  ({len(solids)} solid(s))")

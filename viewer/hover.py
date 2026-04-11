@@ -8,6 +8,11 @@ picking) rather than depth buffer sampling.  The depth buffer approach
 fails when the far clip plane is very large (all depths compress to ~0.999),
 making the per-pixel tolerance meaningless.  Ray casting is exact regardless
 of clip plane range.
+
+Committed sketch line entities are projected alongside mesh edges so they
+participate in hover and selection naturally.  Their body_id key has the
+form  "__sketch__{history_idx}__{entity_idx}"  which the viewport parses
+to produce a SketchEdgeSel.
 """
 
 from __future__ import annotations
@@ -18,17 +23,36 @@ from OpenGL.GL import *
 VERTEX_HOVER_RADIUS = 12   # screen pixels
 EDGE_HOVER_RADIUS   = 6    # screen pixels
 
+# Prefix used for synthetic sketch-edge keys in the hover cache
+_SKETCH_KEY_PREFIX = "__sketch__"
+
+
+def _sketch_key(history_idx: int, entity_idx: int) -> str:
+    return f"{_SKETCH_KEY_PREFIX}{history_idx}__{entity_idx}"
+
+
+def parse_sketch_key(key: str) -> tuple[int, int] | None:
+    """
+    If key is a sketch edge hover key, return (history_idx, entity_idx).
+    Otherwise return None.
+    """
+    if not key.startswith(_SKETCH_KEY_PREFIX):
+        return None
+    rest = key[len(_SKETCH_KEY_PREFIX):]
+    parts = rest.split("__")
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
 
 def _ray_hits_anything(eye: np.ndarray, target: np.ndarray,
                         meshes: dict, workspace) -> bool:
     """
     Return True if any mesh triangle blocks the line of sight from eye
     to target.
-
-    Ray is cast FROM target TOWARD eye so the origin is near the surface
-    being tested.  We offset the origin a tiny bit along the ray to avoid
-    the surface immediately self-intersecting.  Any hit with t < (dist - epsilon)
-    means something is in the way.
     """
     from cad.picker import pick_face
 
@@ -38,7 +62,6 @@ def _ray_hits_anything(eye: np.ndarray, target: np.ndarray,
         return False
     ray_dir = direction / dist
 
-    # Offset origin slightly toward eye so we don't hit the surface itself
     origin = target + ray_dir * 0.05
 
     for body_id, mesh in meshes.items():
@@ -49,7 +72,6 @@ def _ray_hits_anything(eye: np.ndarray, target: np.ndarray,
         if result is None:
             continue
         _, t = result
-        # If hit is before we reach the eye, something is occluding
         if t < dist - 0.05:
             return True
     return False
@@ -62,30 +84,39 @@ class HoverState:
     Usage
     -----
     After paintGL (geometry drawn, matrices captured):
-        hover.rebuild(meshes, workspace, modelview, projection, viewport, dpr)
+        hover.rebuild(meshes, workspace, modelview, projection, viewport, dpr,
+                      history=history)   ← pass history for sketch edges
 
     On mouseMoveEvent:
         body_id, vert_idx = hover.vertex_at(x, y)
         body_id, edge_idx = hover.edge_at(x, y)
+            body_id may be a sketch key — use parse_sketch_key() to detect.
     """
 
     def __init__(self):
-        self._sv:    dict[str, np.ndarray]       = {}  # screen verts  (N,2)
-        self._sv3d:  dict[str, np.ndarray]       = {}  # world verts   (N,3)
-        self._se:    dict[str, list[np.ndarray]] = {}  # screen edges  list(M,2)
-        self._se3d:  dict[str, list[np.ndarray]] = {}  # world edges   list(M,3)
+        self._sv:    dict[str, np.ndarray]       = {}
+        self._sv3d:  dict[str, np.ndarray]       = {}
+        self._se:    dict[str, list[np.ndarray]] = {}
+        self._se3d:  dict[str, list[np.ndarray]] = {}
         self._eye:   np.ndarray | None           = None
-        self._meshes  = None
+        self._meshes    = None
         self._workspace = None
-        self._ready   = False
+        self._ready     = False
 
     # ------------------------------------------------------------------
     # Build
     # ------------------------------------------------------------------
 
     def rebuild(self, meshes, workspace, modelview, projection, viewport, dpr,
-                camera_eye: np.ndarray = None):
-        """Project all topo verts/edges to screen space.  Call once per paintGL."""
+                camera_eye: np.ndarray = None, history=None,
+                active_sketch=None):
+        """
+        Project all topo verts/edges, committed sketch line entities,
+        and active sketch line entities to screen space.
+
+        history       : History | None
+        active_sketch : SketchMode | None — the live sketch session if any
+        """
         self._ready = False
         if modelview is None:
             return
@@ -119,6 +150,9 @@ class HoverState:
         self._sv.clear();   self._sv3d.clear()
         self._se.clear();   self._se3d.clear()
 
+        # ------------------------------------------------------------------
+        # Mesh topo verts and edges
+        # ------------------------------------------------------------------
         for body_id, mesh in meshes.items():
             body = workspace.bodies.get(body_id)
             if body and not body.visible:
@@ -136,14 +170,68 @@ class HoverState:
             self._se[body_id]   = se_list
             self._se3d[body_id] = se3d_list
 
+        # ------------------------------------------------------------------
+        # Committed sketch line entities
+        # Each LineEntity becomes a 2-point edge in the hover cache,
+        # keyed by the synthetic sketch key so the viewport can identify it.
+        # ------------------------------------------------------------------
+        if history is not None:
+            self._add_sketch_edges(history, _project)
+
+        if active_sketch is not None:
+            self._add_active_sketch_edges(active_sketch, _project)
+
         self._ready = True
+
+    def _add_sketch_edges(self, history, project_fn):
+        """Project committed sketch LineEntity objects into the hover cache."""
+        from cad.sketch import LineEntity, SketchEntry
+        cursor = history.cursor
+        for i, entry in enumerate(history.entries):
+            if i > cursor:
+                break
+            if entry.operation != "sketch":
+                continue
+            se = entry.params.get("sketch_entry")
+            if se is None or not se.visible:
+                continue
+            for j, ent in enumerate(se.entities):
+                if not isinstance(ent, LineEntity):
+                    continue
+                p0_world = (se.plane_origin
+                            + float(ent.p0[0]) * se.plane_x_axis
+                            + float(ent.p0[1]) * se.plane_y_axis)
+                p1_world = (se.plane_origin
+                            + float(ent.p1[0]) * se.plane_x_axis
+                            + float(ent.p1[1]) * se.plane_y_axis)
+                pts3d = np.array([p0_world, p1_world], dtype=np.float32)
+                key   = _sketch_key(i, j)
+                self._se[key]   = [project_fn(pts3d)]
+                self._se3d[key] = [pts3d]
+
+    def _add_active_sketch_edges(self, sketch, project_fn):
+        """
+        Project LineEntity objects from the active (uncommitted) sketch
+        into the hover cache.  Uses history_idx = -1 as a sentinel so
+        parse_sketch_key returns (-1, entity_idx) and the viewport can
+        distinguish active vs committed sketch edges.
+        """
+        from cad.sketch import LineEntity
+        for j, ent in enumerate(sketch.entities):
+            if not isinstance(ent, LineEntity):
+                continue
+            p0_world = sketch.plane.to_3d(float(ent.p0[0]), float(ent.p0[1]))
+            p1_world = sketch.plane.to_3d(float(ent.p1[0]), float(ent.p1[1]))
+            pts3d = np.array([p0_world, p1_world], dtype=np.float32)
+            key   = _sketch_key(-1, j)
+            self._se[key]   = [project_fn(pts3d)]
+            self._se3d[key] = [pts3d]
 
     # ------------------------------------------------------------------
     # Occlusion
     # ------------------------------------------------------------------
 
     def _visible(self, world_pt: np.ndarray) -> bool:
-        """True if world_pt has clear line-of-sight from the camera eye."""
         if self._eye is None or self._meshes is None:
             return True
         return not _ray_hits_anything(self._eye, world_pt,
@@ -158,7 +246,6 @@ class HoverState:
         if not self._ready:
             return None, None
 
-        # First pass: find candidates within screen radius (cheap)
         candidates: list[tuple[float, str, int]] = []
         for body_id, sv in self._sv.items():
             if len(sv) == 0:
@@ -171,7 +258,6 @@ class HoverState:
         if not candidates:
             return None, None
 
-        # Second pass: ray-cast only the candidates, closest screen first
         candidates.sort()
         for dist, body_id, i in candidates:
             wp = self._sv3d[body_id][i].astype(np.float64)
@@ -181,11 +267,16 @@ class HoverState:
         return None, None
 
     def edge_at(self, x: float, y: float) -> tuple[str | None, int | None]:
-        """Closest visible topo edge within EDGE_HOVER_RADIUS pixels."""
+        """
+        Closest visible edge within EDGE_HOVER_RADIUS pixels.
+
+        The returned body_id may be a sketch key — use parse_sketch_key()
+        to detect and decode it.  The edge_idx is always 0 for sketch edges
+        (each sketch edge has its own key with a single segment).
+        """
         if not self._ready:
             return None, None
 
-        # First pass: screen-space distance to each edge polyline
         candidates: list[tuple[float, str, int, np.ndarray]] = []
 
         for body_id, sedges in self._se.items():
@@ -203,10 +294,8 @@ class HoverState:
                 dists   = np.hypot(closest[:, 0] - x, closest[:, 1] - y)
                 d       = float(dists.min())
                 if d < EDGE_HOVER_RADIUS:
-                    # Store the 3D point at the closest location on the edge
                     best_seg = int(np.argmin(dists))
                     pts3d    = self._se3d[body_id][ei]
-                    # Interpolate world-space point at parameter t
                     t_val = float(t[best_seg])
                     if best_seg + 1 < len(pts3d):
                         wp3d = (pts3d[best_seg].astype(np.float64) * (1 - t_val) +
@@ -218,7 +307,6 @@ class HoverState:
         if not candidates:
             return None, None
 
-        # Second pass: ray-cast candidates, closest screen dist first
         candidates.sort(key=lambda c: c[0])
         for d, body_id, ei, wp3d in candidates:
             if self._visible(wp3d):
@@ -229,7 +317,7 @@ class HoverState:
     def clear(self):
         self._sv.clear();   self._sv3d.clear()
         self._se.clear();   self._se3d.clear()
-        self._eye     = None
-        self._meshes  = None
+        self._eye       = None
+        self._meshes    = None
         self._workspace = None
-        self._ready   = False
+        self._ready     = False

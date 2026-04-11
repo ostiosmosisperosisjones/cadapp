@@ -26,14 +26,20 @@ _BG_CURRENT    = "#2f3f52"
 _BG_FUTURE     = "#212121"
 _BG_DIM        = "#1e1e1e"
 _BG_HIDDEN     = "#191919"
+_BG_DIVERGED   = "#252018"
+_BG_ERROR      = "#2a1515"
 _TEXT          = "#d4d4d4"
 _TEXT_DIM      = "#404040"
 _TEXT_HIDDEN   = "#2e2e2e"
 _TEXT_FUTURE   = "#383838"
+_TEXT_DIVERGED = "#7a6e3a"
+_TEXT_ERROR    = "#c05050"
 _BORDER_SEL    = "#4a90d9"
 _BORDER_PAST   = "#404040"
 _BORDER_DIM    = "#282828"
 _BORDER_FUTURE = "#2a2a2a"
+_BORDER_DIVERGED = "#6e5a20"
+_BORDER_ERROR  = "#8a2020"
 
 _OP_ACCENT = {
     "import":  "#505050",
@@ -123,6 +129,10 @@ class _EntryWidget(QFrame):
 
         if is_hidden_body:
             bg, text_color, border = _BG_HIDDEN, _TEXT_HIDDEN, _BORDER_DIM
+        elif entry.error:
+            bg, text_color, border = _BG_ERROR, _TEXT_ERROR, _BORDER_ERROR
+        elif is_future and entry.diverged:
+            bg, text_color, border = _BG_DIVERGED, _TEXT_DIVERGED, _BORDER_DIVERGED
         elif is_future:
             bg, text_color, border = _BG_FUTURE, _TEXT_FUTURE, _BORDER_FUTURE
         elif is_current:
@@ -167,12 +177,17 @@ class _EntryWidget(QFrame):
             "border: none; background: transparent;")
         row.addWidget(tag)
 
-        lbl = QLabel(entry.label)
+        lbl_text = entry.label
+        if entry.error:
+            lbl_text = "⚠ " + lbl_text
+        lbl = QLabel(lbl_text)
         lbl.setStyleSheet(
             f"color: {text_color}; font-size: 12px; "
             "border: none; background: transparent;")
         lbl.setSizePolicy(QSizePolicy.Policy.Expanding,
                           QSizePolicy.Policy.Preferred)
+        if entry.error and entry.error_msg:
+            lbl.setToolTip(entry.error_msg)
         row.addWidget(lbl)
 
         if editable:
@@ -221,9 +236,10 @@ class _EntryWidget(QFrame):
 # ---------------------------------------------------------------------------
 
 class HistoryPanel(QWidget):
-    seek_requested        = pyqtSignal(int)
-    replay_requested      = pyqtSignal(int)
-    sketch_vis_changed    = pyqtSignal()      # viewport should repaint
+    seek_requested           = pyqtSignal(int)
+    replay_requested         = pyqtSignal(int)
+    sketch_vis_changed       = pyqtSignal()      # viewport should repaint
+    reenter_sketch_requested = pyqtSignal(int)   # history_idx to re-open
 
     def __init__(self, workspace: Workspace, history: History, parent=None):
         super().__init__(parent)
@@ -354,6 +370,17 @@ class HistoryPanel(QWidget):
         if index >= len(entries):
             return
         entry = entries[index]
+
+        # Sketch entry: seek to it, then re-open for editing
+        if entry.operation == "sketch":
+            se = entry.params.get("sketch_entry")
+            if se is None:
+                return
+            # Seek to this entry so it is the current position
+            self.seek_requested.emit(index)
+            self.reenter_sketch_requested.emit(index)
+            return
+
         if entry.operation not in EDIT_SCHEMA:
             return
         if index > self._history.cursor:

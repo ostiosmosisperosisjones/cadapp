@@ -49,15 +49,20 @@ class ReferenceEntity:
     A projected reference polyline — created by the Include tool.
 
     points      : list of (u, v) np.ndarray — projected onto sketch plane
-    source_type : 'edge' | 'vertex'
+                  This is a baked cache; updated during parametric replay.
+    source_type : 'edge' | 'vertex' | 'sketch_edge'
     occ_edges   : list of TopoDS_Edge | None
                   Original OCCT edges preserved for exact face construction.
+    source      : EdgeSource | None
+                  Stable parametric reference used to re-derive points and
+                  occ_edges during replay.  None for vertices and legacy data.
     """
     def __init__(self, points: list[np.ndarray], source_type: str = 'edge',
-                 occ_edges=None):
+                 occ_edges=None, source=None):
         self.points      = [np.array(p, dtype=np.float64) for p in points]
         self.source_type = source_type
         self.occ_edges   = occ_edges
+        self.source      = source          # EdgeSource | None
 
 
 # ---------------------------------------------------------------------------
@@ -130,11 +135,17 @@ class SketchMode:
     it automatically.  Tools receive SnapResult, never raw pt2d.
     """
 
-    def __init__(self, b3d_plane: Plane, body_id: str, face_idx: int):
-        self.plane    = SketchPlane(b3d_plane)
-        self.body_id  = body_id
-        self.face_idx = face_idx
+    def __init__(self, b3d_plane: Plane, body_id: str, face_idx: int,
+                 plane_source=None):
+        self.plane        = SketchPlane(b3d_plane)
+        self.body_id      = body_id
+        self.face_idx     = face_idx
+        self.plane_source = plane_source   # SketchPlaneSource | None
         self.entities: list = []
+
+        # Per-sketch undo stack — each entry is a deep-copy of self.entities
+        # taken before an entity is committed.  Ctrl+Z pops and restores.
+        self._entity_snapshots: list = []
 
         # Active tool enum value (for status bar / overlay checks)
         self.tool = SketchTool.NONE
@@ -167,6 +178,32 @@ class SketchMode:
         self.tool = SketchTool.NONE
         self._active_tool = None
         self.last_snap = None
+
+    # ------------------------------------------------------------------
+    # Per-sketch undo
+    # ------------------------------------------------------------------
+
+    def push_undo_snapshot(self):
+        """
+        Save the current entity list before a commit.
+        Call this immediately before appending or removing entities so
+        Ctrl+Z can restore the previous state.
+        """
+        import copy
+        self._entity_snapshots.append(copy.deepcopy(self.entities))
+
+    def undo_entity(self) -> bool:
+        """
+        Restore the most recent entity snapshot.
+        Returns True if anything was undone, False if the stack is empty.
+        """
+        if not self._entity_snapshots:
+            return False
+        self.entities = self._entity_snapshots.pop()
+        # Cancel any in-progress tool state so it doesn't reference removed pts
+        if self._active_tool is not None:
+            self._active_tool.cancel()
+        return True
 
     # ------------------------------------------------------------------
     # Input forwarding — viewport calls these every frame
@@ -233,7 +270,7 @@ class SketchEntry:
     """
 
     def __init__(self, plane_origin, plane_x_axis, plane_y_axis, plane_normal,
-                 entities, body_id, face_idx, visible=True):
+                 entities, body_id, face_idx, visible=True, plane_source=None):
         self.plane_origin = np.array(plane_origin, dtype=np.float64)
         self.plane_x_axis = np.array(plane_x_axis, dtype=np.float64)
         self.plane_y_axis = np.array(plane_y_axis, dtype=np.float64)
@@ -242,6 +279,7 @@ class SketchEntry:
         self.body_id      = body_id
         self.face_idx     = face_idx
         self.visible      = visible
+        self.plane_source = plane_source   # SketchPlaneSource | None
 
     @classmethod
     def from_sketch_mode(cls, sketch: SketchMode) -> SketchEntry:
@@ -253,6 +291,7 @@ class SketchEntry:
             entities     = copy.deepcopy(sketch.entities),
             body_id      = sketch.body_id,
             face_idx     = sketch.face_idx,
+            plane_source = sketch.plane_source,
         )
 
     # ------------------------------------------------------------------

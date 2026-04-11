@@ -126,13 +126,13 @@ class MainWindow(QMainWindow):
         undo_act = QAction("Undo", self)
         undo_act.setShortcut(QKeySequence.StandardKey.Undo)
         undo_act.triggered.connect(
-            lambda: self._viewport and self._viewport._do_undo())
+            lambda: self._viewport and self._viewport.handle_undo())
         ops_menu.addAction(undo_act)
 
         redo_act = QAction("Redo", self)
         redo_act.setShortcut(QKeySequence.StandardKey.Redo)
         redo_act.triggered.connect(
-            lambda: self._viewport and self._viewport._do_redo())
+            lambda: self._viewport and self._viewport.handle_redo())
         ops_menu.addAction(redo_act)
 
     def _open_prefs(self):
@@ -233,6 +233,7 @@ class MainWindow(QMainWindow):
         sidebar.parts_panel.body_selected.connect(
             sidebar.history_panel.set_selected_body)
         sidebar.history_panel.sketch_vis_changed.connect(vp.update)
+        sidebar.history_panel.reenter_sketch_requested.connect(vp._reenter_sketch)
 
         vp.selection_changed.connect(self._update_selection_label)
         vp.sketch_mode_changed.connect(self._update_sketch_label)

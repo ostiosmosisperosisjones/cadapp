@@ -1,11 +1,12 @@
 """
 cad/selection.py
 
-SelectionSet — tracks which faces and vertices are currently selected.
+SelectionSet — tracks which faces, edges, vertices, and sketch edges
+are currently selected.
 
 Designed to be the single source of truth for selection state.
 Viewport holds one instance and mutates it on click; anything that
-needs to read selection (extrude, status bar, future sketch) reads
+needs to read selection (extrude, status bar, sketch include) reads
 from here.
 """
 
@@ -34,9 +35,21 @@ class EdgeSel:
     edge_idx: int
 
 
+@dataclass(frozen=True, eq=True)
+class SketchEdgeSel:
+    """
+    A selected edge from a committed sketch entity.
+
+    history_idx  : index of the sketch HistoryEntry
+    entity_idx   : index within SketchEntry.entities
+    """
+    history_idx: int
+    entity_idx:  int
+
+
 class SelectionSet:
     """
-    Mutable set of selected faces, edges, and vertices.
+    Mutable set of selected faces, edges, vertices, and sketch edges.
 
     Supports:
       - Single-click replace (the default)
@@ -45,25 +58,22 @@ class SelectionSet:
     """
 
     def __init__(self):
-        self._faces:    set[FaceSel]   = set()
-        self._edges:    set[EdgeSel]   = set()
-        self._vertices: set[VertexSel] = set()
+        self._faces:         set[FaceSel]        = set()
+        self._edges:         set[EdgeSel]         = set()
+        self._vertices:      set[VertexSel]       = set()
+        self._sketch_edges:  set[SketchEdgeSel]   = set()
 
     # ------------------------------------------------------------------
     # Mutation
     # ------------------------------------------------------------------
 
     def select_face(self, body_id: str, face_idx: int, additive: bool = False):
-        """
-        Select a face.
-        additive=False  → clear everything else first (normal click)
-        additive=True   → toggle this face, keep others (Shift-click)
-        """
         item = FaceSel(body_id, face_idx)
         if not additive:
             self._faces.clear()
             self._edges.clear()
             self._vertices.clear()
+            self._sketch_edges.clear()
             self._faces.add(item)
         else:
             if item in self._faces:
@@ -72,12 +82,12 @@ class SelectionSet:
                 self._faces.add(item)
 
     def select_edge(self, body_id: str, edge_idx: int, additive: bool = False):
-        """Select an edge, same additive logic as select_face."""
         item = EdgeSel(body_id, edge_idx)
         if not additive:
             self._faces.clear()
             self._edges.clear()
             self._vertices.clear()
+            self._sketch_edges.clear()
             self._edges.add(item)
         else:
             if item in self._edges:
@@ -85,13 +95,14 @@ class SelectionSet:
             else:
                 self._edges.add(item)
 
-    def select_vertex(self, body_id: str, vertex_idx: int, additive: bool = False):
-        """Select a vertex, same additive logic as select_face."""
+    def select_vertex(self, body_id: str, vertex_idx: int,
+                      additive: bool = False):
         item = VertexSel(body_id, vertex_idx)
         if not additive:
             self._faces.clear()
             self._edges.clear()
             self._vertices.clear()
+            self._sketch_edges.clear()
             self._vertices.add(item)
         else:
             if item in self._vertices:
@@ -99,16 +110,33 @@ class SelectionSet:
             else:
                 self._vertices.add(item)
 
+    def select_sketch_edge(self, history_idx: int, entity_idx: int,
+                           additive: bool = False):
+        """Select an edge from a committed sketch entity."""
+        item = SketchEdgeSel(history_idx, entity_idx)
+        if not additive:
+            self._faces.clear()
+            self._edges.clear()
+            self._vertices.clear()
+            self._sketch_edges.clear()
+            self._sketch_edges.add(item)
+        else:
+            if item in self._sketch_edges:
+                self._sketch_edges.discard(item)
+            else:
+                self._sketch_edges.add(item)
+
     def clear(self):
         self._faces.clear()
         self._edges.clear()
         self._vertices.clear()
+        self._sketch_edges.clear()
 
     def clear_for_body(self, body_id: str):
-        """Remove all selections belonging to a specific body (called after rebuild)."""
         self._faces    = {f for f in self._faces    if f.body_id != body_id}
         self._edges    = {e for e in self._edges    if e.body_id != body_id}
         self._vertices = {v for v in self._vertices if v.body_id != body_id}
+        # sketch edges are not keyed by body_id so no change needed
 
     # ------------------------------------------------------------------
     # Queries
@@ -127,6 +155,10 @@ class SelectionSet:
         return list(self._vertices)
 
     @property
+    def sketch_edges(self) -> list[SketchEdgeSel]:
+        return list(self._sketch_edges)
+
+    @property
     def face_count(self) -> int:
         return len(self._faces)
 
@@ -139,8 +171,13 @@ class SelectionSet:
         return len(self._vertices)
 
     @property
+    def sketch_edge_count(self) -> int:
+        return len(self._sketch_edges)
+
+    @property
     def is_empty(self) -> bool:
-        return not self._faces and not self._edges and not self._vertices
+        return not (self._faces or self._edges or
+                    self._vertices or self._sketch_edges)
 
     def has_face(self, body_id: str, face_idx: int) -> bool:
         return FaceSel(body_id, face_idx) in self._faces
@@ -151,21 +188,11 @@ class SelectionSet:
     def has_vertex(self, body_id: str, vertex_idx: int) -> bool:
         return VertexSel(body_id, vertex_idx) in self._vertices
 
-    # ------------------------------------------------------------------
-    # Convenience — for code that only cares about "the" selected face
-    # (single-select path, e.g. current extrude logic)
-    # ------------------------------------------------------------------
-
     @property
     def single_face(self) -> FaceSel | None:
-        """Return the sole selected face, or None if 0 or 2+ are selected."""
         if len(self._faces) == 1:
             return next(iter(self._faces))
         return None
-
-    # ------------------------------------------------------------------
-    # Status string
-    # ------------------------------------------------------------------
 
     def status_text(self) -> str:
         parts = []
@@ -178,4 +205,7 @@ class SelectionSet:
         if self._vertices:
             n = len(self._vertices)
             parts.append(f"{n} vertex" if n == 1 else f"{n} vertices")
+        if self._sketch_edges:
+            n = len(self._sketch_edges)
+            parts.append(f"{n} sketch edge{'s' if n != 1 else ''}")
         return ",  ".join(parts) + "  selected" if parts else ""

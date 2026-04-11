@@ -39,6 +39,7 @@ class LineTool(BaseTool):
         if self._start is None:
             self._start = pt.copy()
         else:
+            sketch.push_undo_snapshot()
             sketch.entities.append(LineEntity(self._start, pt))
             self._start = pt.copy()   # chain: end of this becomes start of next
         return True

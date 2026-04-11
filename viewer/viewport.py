@@ -29,6 +29,16 @@ from cad.history import History
 from cad.selection import SelectionSet
 
 
+def _plane_from_sketch_entry(se):
+    """Reconstruct a build123d Plane from a SketchEntry's baked plane cache."""
+    from build123d import Plane
+    return Plane(
+        origin = tuple(se.plane_origin.tolist()),
+        x_dir  = tuple(se.plane_x_axis.tolist()),
+        z_dir  = tuple(se.plane_normal.tolist()),
+    )
+
+
 class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
     history_changed     = pyqtSignal()
     selection_changed   = pyqtSignal()
@@ -55,9 +65,10 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
         self._hovered_vertex: tuple[str | None, int | None] = (None, None)
         self._hovered_edge:   tuple[str | None, int | None] = (None, None)
 
-        self._sketch = None                         # SketchMode | None
-        self._sketch_faces: dict[int, list] = {}   # history_idx → [Face]
+        self._sketch = None                              # SketchMode | None
+        self._sketch_faces: dict[int, list] = {}        # history_idx → [Face]
         self._selected_sketch_entry: int | None = None
+        self._editing_sketch_history_idx: int | None = None  # set during re-entry
 
         self.camera_projection_changed = None
         self.request_extrude_distance  = None
@@ -136,9 +147,12 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
         self._body_visible.setdefault(body_id, True)   # new bodies are visible
         shape = self.workspace.current_shape(body_id)
         if shape is not None:
-            mesh = Mesh(shape)
-            mesh.upload()
-            self._meshes[body_id] = mesh
+            try:
+                mesh = Mesh(shape)
+                mesh.upload()
+                self._meshes[body_id] = mesh
+            except Exception as ex:
+                print(f"[Mesh] Could not tessellate body {body_id}: {ex}")
         self.selection.clear_for_body(body_id)
         if self._hovered_vertex[0] == body_id:
             self._hovered_vertex = (None, None)
@@ -157,9 +171,12 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
                     glDeleteBuffers(1, [buf])
         self._meshes.clear()
         for body_id, shape in self.workspace.all_current_shapes():
-            mesh = Mesh(shape)
-            mesh.upload()
-            self._meshes[body_id] = mesh
+            try:
+                mesh = Mesh(shape)
+                mesh.upload()
+                self._meshes[body_id] = mesh
+            except Exception as ex:
+                print(f"[Mesh] Could not tessellate body {body_id}: {ex}")
         self.selection.clear()
         self._hovered_vertex = (None, None)
         self._hovered_edge   = (None, None)
@@ -225,7 +242,9 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
         self.hover.rebuild(visible, self.workspace,
                            self._modelview, self._projection,
                            self._viewport, self.devicePixelRatio(),
-                           camera_eye=self.camera.get_eye())
+                           camera_eye=self.camera.get_eye(),
+                           history=self.history,
+                           active_sketch=self._sketch)
 
         self._draw_sketch_faces()
 
@@ -233,7 +252,8 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
                       self._hovered_vertex, self._hovered_edge,
                       sketch=self._sketch,
                       camera_distance=self.camera.distance,
-                      history=self.history)
+                      history=self.history,
+                      editing_sketch_idx=self._editing_sketch_history_idx)
 
         from viewer.camera import _quat_to_matrix
         R = _quat_to_matrix(self.camera.rotation)
@@ -303,8 +323,9 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
                 self.update()
             elif prefs.matches("sketch_include", e):
                 from cad.sketch_tools.include import IncludeTool
-                n = IncludeTool.apply(self._sketch, self.selection,
-                                      self._meshes)
+                self._sketch.push_undo_snapshot()
+                n = IncludeTool.apply_with_history(
+                    self._sketch, self.selection, self._meshes, self.history)
                 if n:
                     print(f"[Sketch] Included {n} reference "
                           f"{'entity' if n == 1 else 'entities'}")
@@ -312,8 +333,10 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
                     self.selection_changed.emit()
                     self.update()
                 else:
+                    # Nothing was included — discard the snapshot we just pushed
+                    self._sketch._entity_snapshots.pop()
                     print("[Sketch] Nothing selected to include — "
-                          "select edges or vertices first.")
+                          "select edges, vertices, or sketch lines first.")
             elif prefs.matches("sketch_commit", e):
                 self._complete_sketch()
             elif prefs.matches("sketch_projection_toggle", e):
@@ -345,6 +368,8 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
 
     def _enter_sketch(self, body_id: str, face_idx: int):
         from cad.sketch import SketchMode
+        from cad.face_ref import FaceRef
+        from cad.plane_ref import FacePlaneSource
         from build123d import Plane
         mesh = self._meshes.get(body_id)
         if mesh is None:
@@ -356,7 +381,10 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
             return
         n, wo = b3d_plane.z_dir, b3d_plane.origin
         self.camera.snap_to_normal(n.X, n.Y, n.Z, origin=(wo.X, wo.Y, wo.Z))
-        self._sketch = SketchMode(b3d_plane, body_id, face_idx)
+        face_ref     = FaceRef.from_b3d_face(mesh.occt_faces[face_idx])
+        plane_source = FacePlaneSource(body_id, face_ref) if face_ref else None
+        self._sketch = SketchMode(b3d_plane, body_id, face_idx,
+                                  plane_source=plane_source)
         self._selected_sketch_entry = None
         self.selection.clear()
         self.hover.clear()
@@ -366,10 +394,43 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
         print(f"[Sketch] Entered sketch on face {face_idx} of "
               f"{self.workspace.bodies[body_id].name}")
 
+    def _reenter_sketch(self, history_idx: int):
+        """Re-open a committed SketchEntry for editing."""
+        import copy
+        from cad.sketch import SketchMode
+        entries = self.history.entries
+        if history_idx >= len(entries):
+            return
+        entry = entries[history_idx]
+        se = entry.params.get("sketch_entry")
+        if se is None:
+            return
+        b3d_plane = _plane_from_sketch_entry(se)
+        n, wo = b3d_plane.z_dir, b3d_plane.origin
+        self.camera.snap_to_normal(n.X, n.Y, n.Z, origin=(wo.X, wo.Y, wo.Z))
+        mode = SketchMode(b3d_plane, se.body_id, se.face_idx,
+                          plane_source=se.plane_source)
+        existing = copy.deepcopy(se.entities)
+        # Pre-populate the undo stack so every existing entity is individually
+        # undoable: snapshots[0]=[], snapshots[1]=[e0], ..., snapshots[n-1]=[e0..e_{n-2}]
+        mode._entity_snapshots = [existing[:i] for i in range(len(existing))]
+        mode.entities = existing
+        self._sketch = mode
+        self._editing_sketch_history_idx = history_idx
+        self._selected_sketch_entry = None
+        self.selection.clear()
+        self.hover.clear()
+        self.selection_changed.emit()
+        self.sketch_mode_changed.emit(True)
+        self.update()
+        print(f"[Sketch] Re-entered sketch entry {history_idx} "
+              f"({len(mode.entities)} entities)")
+
     def _exit_sketch(self):
         if self._sketch is None:
             return
         self._sketch = None
+        self._editing_sketch_history_idx = None
         self.sketch_mode_changed.emit(False)
         self.update()
         print("[Sketch] Exited sketch mode.")
@@ -385,24 +446,49 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
             print("[Sketch] Nothing to commit — draw lines or include geometry first.")
             return
         entity_count = len(lines) + len(refs)
+        new_se = SketchEntry.from_sketch_mode(sketch)
+
+        editing_idx = self._editing_sketch_history_idx
+        if editing_idx is not None:
+            # Re-entry: update the existing history entry in place, then replay
+            # all downstream ops so extrudes and split bodies stay consistent.
+            entries = self.history.entries
+            if editing_idx < len(entries):
+                entries[editing_idx].params["sketch_entry"] = new_se
+                self._sketch = None
+                self._editing_sketch_history_idx = None
+                self.sketch_mode_changed.emit(False)
+                self._rebuild_sketch_faces()
+                ok, err = self.history.replay_from(editing_idx)
+                if not ok:
+                    print(f"[Sketch] Replay after re-entry failed: {err}")
+                self._rebuild_all_meshes()
+                self.history_changed.emit()
+                self.update()
+                print(f"[Sketch] Updated sketch entry {editing_idx}, "
+                      f"replayed downstream.")
+                return
+
+        # Normal first-time commit
         from cad.face_ref import FaceRef
         mesh = self._meshes.get(sketch.body_id)
         face_ref = (FaceRef.from_b3d_face(mesh.occt_faces[sketch.face_idx])
                     if mesh else None)
         current_shape = self.workspace.current_shape(sketch.body_id)
-        entry = SketchEntry.from_sketch_mode(sketch)
         self.history.push(
             label        = f"Sketch  ({entity_count} entities)",
             operation    = "sketch",
-            params       = {"sketch_entry": entry},
+            params       = {"sketch_entry": new_se},
             body_id      = sketch.body_id,
             face_ref     = face_ref,
             shape_before = current_shape,
             shape_after  = current_shape,
         )
         self._sketch = None
+        self._editing_sketch_history_idx = None
         self.sketch_mode_changed.emit(False)
         self._rebuild_sketch_faces()
+        self._post_push_cascade(sketch.body_id)
         self.history_changed.emit()
         self.update()
         print(f"[Sketch] Committed {entity_count} entities to history.")
@@ -416,10 +502,17 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
             return
         if self._sketch is not None:
             return
+        # Try solid face first — opens a fresh sketch
         body_id, idx = self._pick_at(e.position())
-        if idx is None:
+        if idx is not None:
+            self._enter_sketch(body_id, idx)
             return
-        self._enter_sketch(body_id, idx)
+        # Try sketch face — re-opens the committed sketch for editing
+        origin, direction = self.get_ray(e.position().x(), e.position().y())
+        if origin is not None and self._sketch_faces:
+            hidx, _ = self._pick_sketch_face(origin, direction)
+            if hidx is not None:
+                self._reenter_sketch(hidx)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -464,12 +557,24 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
                       f"pos=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})")
 
             elif hov_ebody is not None:
-                self.selection.select_edge(hov_ebody, hov_eidx,
-                                           additive=additive)
-                self.workspace.set_active_body(hov_ebody)
-                self.body_selected.emit(hov_ebody)
-                print(f"Picked edge {hov_eidx} | "
-                      f"{self.workspace.bodies[hov_ebody].name}")
+                from viewer.hover import parse_sketch_key
+                sk = parse_sketch_key(hov_ebody)
+                if sk is not None:
+                    history_idx, entity_idx = sk
+                    self.selection.select_sketch_edge(
+                        history_idx, entity_idx, additive=additive)
+                    if history_idx == -1:
+                        print(f"Picked active sketch line entity {entity_idx}")
+                    else:
+                        print(f"Picked sketch edge | entry {history_idx} "
+                              f"entity {entity_idx}")
+                else:
+                    self.selection.select_edge(hov_ebody, hov_eidx,
+                                               additive=additive)
+                    self.workspace.set_active_body(hov_ebody)
+                    self.body_selected.emit(hov_ebody)
+                    print(f"Picked edge {hov_eidx} | "
+                          f"{self.workspace.bodies[hov_ebody].name}")
 
             else:
                 origin, direction = self.get_ray(e.position().x(),
