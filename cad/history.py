@@ -254,6 +254,21 @@ class History:
             current_shape      = new_shape
             entry.label        = _make_label(entry.operation, entry.params)
 
+            # Propagate / nullify split-body shapes.
+            # Always scan — if the op no longer produces a split, orphaned
+            # split-body entries are nullified so they stop appearing.
+            new_solids = list(new_shape.solids())
+            for j in range(i + 1, len(self._entries)):
+                e = self._entries[j]
+                if (e.operation == "import" and
+                        e.params.get("source_entry_idx") == i):
+                    solid_idx = e.params.get("solid_index", 1)
+                    if solid_idx < len(new_solids):
+                        e.shape_after = new_solids[solid_idx]
+                    else:
+                        # Split no longer produces this piece — nullify it
+                        e.shape_after = None
+
         return (not first_error), first_error
 
     # ------------------------------------------------------------------

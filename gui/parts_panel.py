@@ -1,14 +1,18 @@
 """
 gui/parts_panel.py
 
-PartsPanel — lists every body in the workspace with a visibility toggle.
+PartsPanel — pinned world-planes section + per-body visibility list.
 
 Signals
 -------
 body_selected(body_id: str | None)
     Emitted when the user clicks a body row. None if deselected.
 body_visibility_changed(body_id: str, visible: bool)
-    Emitted when the eye toggle is clicked.
+    Emitted when a body eye toggle is clicked.
+plane_visibility_changed(axis: str, visible: bool)
+    Emitted when a world-plane eye toggle is clicked.
+sketch_on_plane_requested(axis: str)
+    Emitted when the user double-clicks a world-plane row.
 """
 
 from __future__ import annotations
@@ -27,10 +31,180 @@ _TEXT       = "#d4d4d4"
 _TEXT_DIM   = "#555"
 _BORDER_SEL = "#4a90d9"
 _BORDER_ROW = "#333"
+_BG_PLANES  = "#1a1e22"
 
 _EYE_ON  = "👁"
 _EYE_OFF = "◌"
 _BODY_ICON = "⬡"
+
+# Per-axis accent colours (match GL rendering)
+_PLANE_COLOR = {"XY": "#4a7eb5", "XZ": "#4ab57e", "YZ": "#b54a4a"}
+_PLANE_LABEL = {"XY": "XY  Plane", "XZ": "XZ  Plane", "YZ": "YZ  Plane"}
+
+
+# ---------------------------------------------------------------------------
+# World-plane row
+# ---------------------------------------------------------------------------
+
+class _PlaneRow(QFrame):
+    visibility_toggled  = pyqtSignal(str, bool)   # axis, visible
+    double_clicked      = pyqtSignal(str)          # axis
+
+    def __init__(self, axis: str, visible: bool):
+        super().__init__()
+        self._axis    = axis
+        self._visible = visible
+        self._build()
+
+    def _build(self):
+        color = _PLANE_COLOR[self._axis]
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {_BG_PLANES};
+                border-left: 3px solid {color};
+                border-radius: 2px;
+                margin: 1px 4px 1px 12px;
+            }}
+        """)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(6, 3, 6, 3)
+        row.setSpacing(6)
+
+        self._eye = QPushButton(_EYE_ON if self._visible else _EYE_OFF)
+        self._eye.setFixedSize(20, 20)
+        self._eye.setStyleSheet("""
+            QPushButton { background: transparent; border: none;
+                          color: #666; font-size: 13px; padding: 0; }
+            QPushButton:hover { color: #aaa; }
+        """)
+        self._eye.clicked.connect(self._toggle)
+        row.addWidget(self._eye)
+
+        lbl = QLabel(_PLANE_LABEL[self._axis])
+        lbl.setStyleSheet(
+            f"color: {_PLANE_COLOR[self._axis]}; font-size: 11px; "
+            "background: transparent; border: none;")
+        lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        row.addWidget(lbl)
+
+        hint = QLabel("✏")
+        hint.setStyleSheet("color: #333; font-size: 10px; background: transparent; border: none;")
+        hint.setToolTip("Double-click to sketch on this plane")
+        row.addWidget(hint)
+
+    def _toggle(self):
+        self._visible = not self._visible
+        self._eye.setText(_EYE_ON if self._visible else _EYE_OFF)
+        self.visibility_toggled.emit(self._axis, self._visible)
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.double_clicked.emit(self._axis)
+        super().mouseDoubleClickEvent(e)
+
+
+# ---------------------------------------------------------------------------
+# World-planes section (pinned at top)
+# ---------------------------------------------------------------------------
+
+class _WorldPlanesSection(QWidget):
+    visibility_toggled    = pyqtSignal(str, bool)
+    sketch_requested      = pyqtSignal(str)
+
+    _AXES = ("XY", "XZ", "YZ")
+
+    def __init__(self, workspace: Workspace):
+        super().__init__()
+        self._workspace = workspace
+        self._collapsed = False
+        self._rows: dict[str, _PlaneRow] = {}
+        self._build()
+
+    def _build(self):
+        self.setStyleSheet(f"background: {_BG_PLANES};")
+        self._root = QVBoxLayout(self)
+        self._root.setContentsMargins(0, 0, 0, 4)
+        self._root.setSpacing(0)
+
+        # Header row
+        hdr = QFrame()
+        hdr.setStyleSheet(f"""
+            QFrame {{
+                background: #161e24;
+                border-bottom: 1px solid #2a2a2a;
+            }}
+        """)
+        hdr_row = QHBoxLayout(hdr)
+        hdr_row.setContentsMargins(8, 5, 8, 5)
+        hdr_row.setSpacing(4)
+
+        self._toggle_btn = QPushButton("▾")
+        self._toggle_btn.setFixedSize(16, 16)
+        self._toggle_btn.setStyleSheet("""
+            QPushButton { background: transparent; border: none;
+                          color: #666; font-size: 10px; padding: 0; }
+            QPushButton:hover { color: #aaa; }
+        """)
+        self._toggle_btn.clicked.connect(self._toggle_collapse)
+        hdr_row.addWidget(self._toggle_btn)
+
+        # Parent visibility toggle — hides/shows all planes at once
+        self._all_visible = True
+        self._eye_all = QPushButton(_EYE_ON)
+        self._eye_all.setFixedSize(20, 20)
+        self._eye_all.setStyleSheet("""
+            QPushButton { background: transparent; border: none;
+                          color: #666; font-size: 13px; padding: 0; }
+            QPushButton:hover { color: #aaa; }
+        """)
+        self._eye_all.clicked.connect(self._toggle_all_visibility)
+        hdr_row.addWidget(self._eye_all)
+
+        title = QLabel("World Planes")
+        title.setStyleSheet(
+            "color: #555; font-size: 11px; font-weight: bold; "
+            "letter-spacing: 1px; background: transparent; border: none;")
+        hdr_row.addWidget(title)
+        hdr_row.addStretch()
+        self._root.addWidget(hdr)
+
+        # Plane rows container
+        self._rows_widget = QWidget()
+        self._rows_widget.setStyleSheet(f"background: {_BG_PLANES};")
+        rows_layout = QVBoxLayout(self._rows_widget)
+        rows_layout.setContentsMargins(0, 2, 0, 2)
+        rows_layout.setSpacing(0)
+
+        for axis in self._AXES:
+            visible = self._workspace.world_plane_visible.get(axis, False)
+            row = _PlaneRow(axis, visible)
+            row.visibility_toggled.connect(self._on_vis)
+            row.double_clicked.connect(self.sketch_requested)
+            rows_layout.addWidget(row)
+            self._rows[axis] = row
+
+        self._root.addWidget(self._rows_widget)
+
+    def _toggle_collapse(self):
+        self._collapsed = not self._collapsed
+        self._rows_widget.setVisible(not self._collapsed)
+        self._toggle_btn.setText("▸" if self._collapsed else "▾")
+
+    def _toggle_all_visibility(self):
+        # If any plane is visible, hide all. Otherwise show all.
+        any_on = any(self._workspace.world_plane_visible.values())
+        self._all_visible = not any_on
+        self._eye_all.setText(_EYE_ON if self._all_visible else _EYE_OFF)
+        for axis in self._AXES:
+            self._workspace.world_plane_visible[axis] = self._all_visible
+            self.visibility_toggled.emit(axis, self._all_visible)
+
+    def _on_vis(self, axis: str, visible: bool):
+        self._workspace.world_plane_visible[axis] = visible
+        self.visibility_toggled.emit(axis, visible)
+        # Keep parent eye in sync
+        any_on = any(self._workspace.world_plane_visible.values())
+        self._eye_all.setText(_EYE_ON if any_on else _EYE_OFF)
 
 
 class _BodyRow(QFrame):
@@ -112,8 +286,10 @@ class _BodyRow(QFrame):
 
 
 class PartsPanel(QWidget):
-    body_selected           = pyqtSignal(object)   # str | None
-    body_visibility_changed = pyqtSignal(str, bool)
+    body_selected            = pyqtSignal(object)   # str | None
+    body_visibility_changed  = pyqtSignal(str, bool)
+    plane_visibility_changed = pyqtSignal(str, bool) # axis, visible
+    sketch_on_plane_requested = pyqtSignal(str)      # axis
 
     def __init__(self, workspace: Workspace, parent=None):
         super().__init__(parent)
@@ -142,6 +318,18 @@ class PartsPanel(QWidget):
         """)
         root.addWidget(header)
 
+        # Pinned world-planes section
+        self._planes_section = _WorldPlanesSection(self._workspace)
+        self._planes_section.visibility_toggled.connect(self.plane_visibility_changed)
+        self._planes_section.sketch_requested.connect(self.sketch_on_plane_requested)
+        root.addWidget(self._planes_section)
+
+        # Divider
+        div = QFrame()
+        div.setFixedHeight(1)
+        div.setStyleSheet("background: #2a2a2a;")
+        root.addWidget(div)
+
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setHorizontalScrollBarPolicy(
@@ -166,6 +354,9 @@ class PartsPanel(QWidget):
         self._rows.clear()
 
         for body_id, body in self._workspace.bodies.items():
+            # Only show bodies that exist at the current history cursor
+            if self._workspace.current_shape(body_id) is None:
+                continue
             visible = self._visible.get(body_id, True)
             selected = (body_id == self._selected_id)
             row = _BodyRow(body_id, body.name, visible, selected)

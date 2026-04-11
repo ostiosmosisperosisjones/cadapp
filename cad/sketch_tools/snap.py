@@ -50,8 +50,8 @@ class SnapResult:
 class SnapEngine:
 
     def __init__(self, snap_radius_mm: float = 2.0, grid_size: float = 1.0):
-        self.snap_radius_mm = snap_radius_mm
-        self.grid_size      = grid_size
+        self.snap_radius_mm  = snap_radius_mm
+        self.grid_size       = grid_size
         self.forced_type: SnapType | None = None
         self.enabled: set[SnapType] = {
             SnapType.ENDPOINT,
@@ -59,6 +59,8 @@ class SnapEngine:
             SnapType.CENTER,
             SnapType.NEAREST,
         }
+        # Extra fixed UV snap points (e.g. world origin on a world-plane sketch)
+        self.extra_points: list[np.ndarray] = []
 
     def set_grid_snap(self, active: bool):
         if active:
@@ -228,6 +230,13 @@ class SnapEngine:
         from cad.sketch import LineEntity, ReferenceEntity
         best_d = radius
         best_p = None
+
+        # Extra fixed points (world origin etc.)
+        for ep in self.extra_points:
+            d = float(np.linalg.norm(cursor - ep))
+            if d < best_d:
+                best_d = d
+                best_p = np.array(ep, dtype=np.float64)
 
         for ent in entities:
             candidates = []

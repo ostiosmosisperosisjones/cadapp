@@ -335,6 +335,12 @@ class HistoryPanel(QWidget):
         cursor  = self._history.cursor
 
         for i, entry in enumerate(entries):
+            # Hide split-body import entries whose solid was nullified by replay
+            if (entry.operation == "import"
+                    and "split_from" in entry.params
+                    and entry.shape_after is None):
+                continue
+
             body      = self._workspace.bodies.get(entry.body_id)
             body_name = body.name if body else "?"
 

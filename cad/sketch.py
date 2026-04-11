@@ -154,7 +154,12 @@ class SketchMode:
 
         # Snap engine — shared across all tools in this session
         from cad.sketch_tools.snap import SnapEngine
+        import numpy as np
         self.snap = SnapEngine()
+        # World-plane sketches: origin (0,0) in UV space is always snappable
+        if isinstance(plane_source, __import__('cad.plane_ref',
+                fromlist=['WorldPlaneSource']).WorldPlaneSource):
+            self.snap.extra_points = [np.array([0.0, 0.0])]
 
         # Last resolved snap result — read by overlay for indicator drawing
         self.last_snap: object = None   # SnapResult | None

@@ -41,12 +41,21 @@ def extrude_face_direct(body_shape, face: Face, distance: float):
     Positive distance  → fuse (adds material).
     Negative distance  → cut  (removes material).
 
+    If body_shape is None (first operation on a new body, e.g. from a
+    world-plane sketch), the extrusion is returned as-is with no boolean.
+
     Returns the resulting build123d Compound/Solid, or raises on failure.
     """
     if distance == 0:
         return body_shape
 
     Plane(face)  # raises if not planar
+
+    if body_shape is None:
+        # No existing solid — pure extrusion, no boolean needed
+        from build123d import extrude as b3d_extrude
+        extruded = b3d_extrude(face, amount=abs(distance))
+        return Compound(extruded.wrapped)
 
     return _do_extrude_boolean(body_shape, face, distance)
 

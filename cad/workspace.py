@@ -41,6 +41,12 @@ class Workspace:
         self.history: "History | None" = None   # set after History is constructed
         # The active body — operations target this one
         self._active_body_id: str | None = None
+        # World-plane visibility — toggled from the parts panel
+        self.world_plane_visible: dict[str, bool] = {
+            "XY": True,
+            "XZ": False,
+            "YZ": False,
+        }
 
     # ------------------------------------------------------------------
     # Body management

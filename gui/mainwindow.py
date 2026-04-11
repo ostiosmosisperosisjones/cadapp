@@ -234,6 +234,8 @@ class MainWindow(QMainWindow):
             sidebar.history_panel.set_selected_body)
         sidebar.history_panel.sketch_vis_changed.connect(vp.update)
         sidebar.history_panel.reenter_sketch_requested.connect(vp._reenter_sketch)
+        sidebar.plane_visibility_changed.connect(vp.set_world_plane_visible)
+        sidebar.sketch_on_plane_requested.connect(vp._enter_sketch_on_plane)
 
         vp.selection_changed.connect(self._update_selection_label)
         vp.sketch_mode_changed.connect(self._update_sketch_label)

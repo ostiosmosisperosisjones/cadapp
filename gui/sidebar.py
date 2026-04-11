@@ -17,9 +17,11 @@ from cad.history import History
 
 
 class Sidebar(QSplitter):
-    seek_requested          = pyqtSignal(int)
-    replay_requested        = pyqtSignal(int)
-    body_visibility_changed = pyqtSignal(str, bool)
+    seek_requested            = pyqtSignal(int)
+    replay_requested          = pyqtSignal(int)
+    body_visibility_changed   = pyqtSignal(str, bool)
+    plane_visibility_changed  = pyqtSignal(str, bool)
+    sketch_on_plane_requested = pyqtSignal(str)
 
     def __init__(self, workspace: Workspace, history: History, parent=None):
         super().__init__(Qt.Orientation.Vertical, parent)
@@ -39,9 +41,15 @@ class Sidebar(QSplitter):
         self.parts_panel.body_selected.connect(
             self.history_panel.set_selected_body)
 
-        # Visibility: update history dimming + forward to viewport
+        # Body visibility: update history dimming + forward to viewport
         self.parts_panel.body_visibility_changed.connect(
             self._on_visibility_changed)
+
+        # World-plane signals — forward straight up to mainwindow
+        self.parts_panel.plane_visibility_changed.connect(
+            self.plane_visibility_changed)
+        self.parts_panel.sketch_on_plane_requested.connect(
+            self.sketch_on_plane_requested)
 
         # Forward history signals upward to mainwindow
         self.history_panel.seek_requested.connect(self.seek_requested)

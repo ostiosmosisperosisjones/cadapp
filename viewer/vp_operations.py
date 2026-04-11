@@ -155,13 +155,59 @@ class OperationsMixin:
         op    = "cut" if distance < 0 else "extrude"
         label = (f"Cut  -{abs(distance):.3f}mm" if distance < 0
                  else f"Extrude  +{distance:.3f}mm")
-        self.history.push(
-            label=label, operation=op, params={"distance": abs(distance)},
-            body_id=body_id, face_ref=face_ref,
-            shape_before=shape_before, shape_after=shape_after)
+
+        solids = list(shape_after.solids())
+        original_solid_count = len(list(shape_before.solids())) if shape_before is not None else 0
+        did_split = len(solids) > 1 and len(solids) > original_solid_count
+
+        if did_split:
+            # Operation produced disconnected pieces — each becomes its own body
+            parent_entry_idx = self.history.cursor + 1
+            self.history.push(
+                label=label, operation=op,
+                params={"distance": abs(distance)},
+                body_id=body_id, face_ref=face_ref,
+                shape_before=shape_before, shape_after=solids[0])
+            root_name = _strip_split_suffix(self.workspace.bodies[body_id].name)
+            for i, solid in enumerate(solids[1:], start=1):
+                new_name = _next_split_name(root_name, self.workspace)
+                new_body = self.workspace.add_body(new_name, None)
+                self.history.push(
+                    label=f"Split  {new_name}",
+                    operation="import",
+                    params={"split_from":       body_id,
+                            "source_entry_idx": parent_entry_idx,
+                            "solid_index":      i},
+                    body_id=new_body.id,
+                    face_ref=None,
+                    shape_before=None,
+                    shape_after=solid,
+                )
+                print(f"[Extrude] Split body '{new_name}' "
+                      f"({len(list(solid.faces()))} faces)")
+        else:
+            self.history.push(
+                label=label, operation=op,
+                params={"distance": abs(distance)},
+                body_id=body_id, face_ref=face_ref,
+                shape_before=shape_before, shape_after=shape_after)
+
         print(f"[Extrude] body={self.workspace.bodies[body_id].name} "
-              f"face={face_idx}  distance={distance:+.3f}  OK")
-        self._post_push_cascade(body_id)
+              f"face={face_idx}  distance={distance:+.3f}  OK  "
+              f"({len(solids)} solid(s))")
+
+        if did_split:
+            # Rebuild all bodies so new split bodies get meshes immediately
+            if not self.history.is_mid_history:
+                self._rebuild_all_meshes()
+            else:
+                ok, err = self.history.replay_from(self.history.cursor - len(solids) + 1)
+                if not ok:
+                    print(f"[Cascade] {err}")
+                self._rebuild_all_meshes()
+        else:
+            self._post_push_cascade(body_id)
+
         self.history_changed.emit()
 
     # ------------------------------------------------------------------
@@ -215,7 +261,7 @@ class OperationsMixin:
         # Detect disconnected solids — split into separate bodies if needed
         # ------------------------------------------------------------------
         solids = list(shape_after.solids())
-        original_solid_count = len(list(shape_before.solids()))
+        original_solid_count = len(list(shape_before.solids())) if shape_before is not None else 0
 
         if len(solids) > 1 and len(solids) > original_solid_count:
             # First solid stays on the original body.
@@ -238,9 +284,9 @@ class OperationsMixin:
             # source_shape=None so current_shape() only returns data once the
             # import entry is at or before the history cursor (prevents the
             # body appearing prematurely when seeking backward).
-            orig_name = self.workspace.bodies[body_id].name
+            root_name = _strip_split_suffix(self.workspace.bodies[body_id].name)
             for i, solid in enumerate(solids[1:], start=1):
-                new_name = f"{orig_name}  [{i+1}]"
+                new_name = _next_split_name(root_name, self.workspace)
                 new_body = self.workspace.add_body(new_name, None)
                 self.history.push(
                     label        = f"Extrude (new body)  {new_name}",
@@ -274,3 +320,28 @@ class OperationsMixin:
         print(f"[Extrude] Sketch → body={self.workspace.bodies[body_id].name} "
               f"distance={distance:+.3f}  OK  ({len(solids)} solid(s))")
         self.history_changed.emit()
+
+
+# ---------------------------------------------------------------------------
+# Naming helpers for split bodies
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+def _strip_split_suffix(name: str) -> str:
+    """Remove trailing '  [N]' split suffix to get the root body name."""
+    return _re.sub(r'\s*\[\d+\]\s*$', '', name).strip()
+
+
+def _next_split_name(root_name: str, workspace) -> str:
+    """
+    Return the next available '  [N]' name for a split of *root_name*,
+    based on names already present in the workspace.
+    """
+    existing = {body.name for body in workspace.bodies.values()}
+    n = 2
+    while True:
+        candidate = f"{root_name}  [{n}]"
+        if candidate not in existing:
+            return candidate
+        n += 1

@@ -39,6 +39,17 @@ def _plane_from_sketch_entry(se):
     )
 
 
+def _next_body_name(workspace) -> str:
+    """Return 'Body N' where N is the lowest unused integer."""
+    existing = {body.name for body in workspace.bodies.values()}
+    n = 1
+    while True:
+        name = f"Body {n}"
+        if name not in existing:
+            return name
+        n += 1
+
+
 class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
     history_changed     = pyqtSignal()
     selection_changed   = pyqtSignal()
@@ -115,6 +126,35 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
         if body is not None:
             body.visible = visible
         self.update()
+
+    def set_world_plane_visible(self, axis: str, visible: bool):
+        self.workspace.world_plane_visible[axis] = visible
+        self.update()
+
+    def _enter_sketch_on_plane(self, axis: str):
+        """Enter sketch mode on one of the three world planes."""
+        from cad.sketch import SketchMode
+        from cad.plane_ref import WorldPlaneSource
+        from build123d import Plane
+        if self._sketch is not None:
+            return   # already in sketch mode
+        plane_map = {"XY": Plane.XY, "XZ": Plane.XZ, "YZ": Plane.YZ}
+        b3d_plane = plane_map.get(axis)
+        if b3d_plane is None:
+            return
+        n, wo = b3d_plane.z_dir, b3d_plane.origin
+        self.camera.snap_to_normal(n.X, n.Y, n.Z, origin=(wo.X, wo.Y, wo.Z))
+        plane_source = WorldPlaneSource(axis)
+        # body_id=None — a new body is created when the sketch is committed
+        self._sketch = SketchMode(b3d_plane, None, -1,
+                                  plane_source=plane_source)
+        self._selected_sketch_entry = None
+        self.selection.clear()
+        self.hover.clear()
+        self.selection_changed.emit()
+        self.sketch_mode_changed.emit(True)
+        self.update()
+        print(f"[Sketch] Entered sketch on world plane {axis}")
 
     def set_active_body(self, body_id: str | None):
         self.selection.clear()
@@ -235,6 +275,20 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
 
         visible = self._visible_meshes()
         draw_opaque(visible, self.workspace, self.selection)
+
+        # World planes drawn after opaque geometry so they never occlude it
+        if any(self.workspace.world_plane_visible.values()):
+            from viewer.renderer import draw_world_planes
+            import numpy as np
+            if visible:
+                all_mins = np.vstack([m.bbox_min for m in visible.values()])
+                all_maxs = np.vstack([m.bbox_max for m in visible.values()])
+                scene_r = float(np.linalg.norm(
+                    all_maxs.max(axis=0) - all_mins.min(axis=0))) * 0.75
+            else:
+                scene_r = 100.0
+            draw_world_planes(self.workspace.world_plane_visible,
+                              scene_radius=max(20.0, scene_r))
 
         self._modelview  = glGetDoublev(GL_MODELVIEW_MATRIX)
         self._projection = glGetDoublev(GL_PROJECTION_MATRIX)
@@ -470,16 +524,25 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
                 return
 
         # Normal first-time commit
+        body_id = sketch.body_id
+        if body_id is None:
+            # World-plane sketch — create a new body now
+            body = self.workspace.add_body(
+                _next_body_name(self.workspace), None)
+            body_id = body.id
+            sketch.body_id = body_id   # back-fill so SketchEntry gets it
+            new_se.body_id  = body_id
+
         from cad.face_ref import FaceRef
-        mesh = self._meshes.get(sketch.body_id)
+        mesh = self._meshes.get(body_id)
         face_ref = (FaceRef.from_b3d_face(mesh.occt_faces[sketch.face_idx])
-                    if mesh else None)
-        current_shape = self.workspace.current_shape(sketch.body_id)
+                    if mesh and sketch.face_idx >= 0 else None)
+        current_shape = self.workspace.current_shape(body_id)
         self.history.push(
             label        = f"Sketch  ({entity_count} entities)",
             operation    = "sketch",
             params       = {"sketch_entry": new_se},
-            body_id      = sketch.body_id,
+            body_id      = body_id,
             face_ref     = face_ref,
             shape_before = current_shape,
             shape_after  = current_shape,
@@ -488,7 +551,7 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
         self._editing_sketch_history_idx = None
         self.sketch_mode_changed.emit(False)
         self._rebuild_sketch_faces()
-        self._post_push_cascade(sketch.body_id)
+        self._post_push_cascade(body_id)
         self.history_changed.emit()
         self.update()
         print(f"[Sketch] Committed {entity_count} entities to history.")
@@ -507,12 +570,46 @@ class Viewport(SketchPickMixin, OperationsMixin, QOpenGLWidget):
         if idx is not None:
             self._enter_sketch(body_id, idx)
             return
-        # Try sketch face — re-opens the committed sketch for editing
         origin, direction = self.get_ray(e.position().x(), e.position().y())
-        if origin is not None and self._sketch_faces:
+        if origin is None:
+            return
+        # Try committed sketch face — re-opens for editing
+        if self._sketch_faces:
             hidx, _ = self._pick_sketch_face(origin, direction)
             if hidx is not None:
                 self._reenter_sketch(hidx)
+                return
+        # Try visible world planes
+        axis = self._pick_world_plane(origin, direction)
+        if axis is not None:
+            self._enter_sketch_on_plane(axis)
+
+    def _pick_world_plane(self, ray_origin, ray_dir) -> str | None:
+        """
+        Return the axis ('XY','XZ','YZ') of the closest visible world plane
+        hit by the ray, or None.  Only considers planes whose visibility is on.
+        """
+        import numpy as np
+        # Plane normals and the component index of the plane equation (val=0)
+        planes = {
+            "XY": (np.array([0., 0., 1.]), 2),
+            "XZ": (np.array([0., 1., 0.]), 1),
+            "YZ": (np.array([1., 0., 0.]), 0),
+        }
+        best_t, best_axis = np.inf, None
+        for axis, (normal, _) in planes.items():
+            if not self.workspace.world_plane_visible.get(axis, False):
+                continue
+            denom = float(np.dot(normal, ray_dir))
+            if abs(denom) < 1e-8:
+                continue   # ray parallel to plane
+            t = -float(np.dot(normal, ray_origin)) / denom
+            if t < 0:
+                continue   # plane behind camera
+            if t < best_t:
+                best_t = t
+                best_axis = axis
+        return best_axis
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:

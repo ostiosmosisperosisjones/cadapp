@@ -238,6 +238,91 @@ def draw_overlays(meshes, selection, hovered_vertex, hovered_edge,
         overlay.draw(sketch, camera_distance)
 
 
+def draw_world_planes(world_plane_visible: dict, scene_radius: float = 100.0):
+    """
+    Draw semi-transparent world-plane quads for any axis marked visible.
+    Call before draw_overlays (while depth test is still on).
+    """
+    if not any(world_plane_visible.values()):
+        return
+
+    r = scene_radius
+    # (normal_axis, quad_corners, line_color)
+    _PLANES = {
+        "XY": ([(- r, -r, 0), ( r, -r, 0), ( r,  r, 0), (-r,  r, 0)],
+               (0.29, 0.49, 0.71)),   # blue
+        "XZ": ([(-r, 0, -r), ( r, 0, -r), ( r, 0,  r), (-r, 0,  r)],
+               (0.29, 0.71, 0.49)),   # green
+        "YZ": ([(0, -r, -r), (0,  r, -r), (0,  r,  r), (0, -r,  r)],
+               (0.71, 0.29, 0.29)),   # red
+    }
+
+    glDisable(GL_LIGHTING)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glDisable(GL_CULL_FACE)
+    glDepthMask(GL_FALSE)   # read depth (stay behind solids) but never write it
+
+    for axis, (corners, color) in _PLANES.items():
+        if not world_plane_visible.get(axis, False):
+            continue
+
+        # Filled quad — very faint
+        glColor4f(color[0], color[1], color[2], 0.07)
+        glBegin(GL_QUADS)
+        for c in corners:
+            glVertex3f(*c)
+        glEnd()
+
+        # Border / grid lines
+        glColor4f(color[0], color[1], color[2], 0.35)
+        glLineWidth(1.0)
+
+        # Outline
+        glBegin(GL_LINE_LOOP)
+        for c in corners:
+            glVertex3f(*c)
+        glEnd()
+
+        # Grid lines at 1/4 intervals
+        steps = 4
+        glBegin(GL_LINES)
+        for i in range(1, steps):
+            t = -r + (2 * r * i / steps)
+            # Determine which two axes the plane spans
+            if axis == "XY":
+                glVertex3f(t, -r, 0); glVertex3f(t,  r, 0)
+                glVertex3f(-r, t, 0); glVertex3f( r, t, 0)
+            elif axis == "XZ":
+                glVertex3f(t, 0, -r); glVertex3f(t, 0,  r)
+                glVertex3f(-r, 0, t); glVertex3f( r, 0, t)
+            elif axis == "YZ":
+                glVertex3f(0, t, -r); glVertex3f(0, t,  r)
+                glVertex3f(0, -r, t); glVertex3f(0,  r, t)
+        glEnd()
+
+    # Origin marker — three short axis lines + dot
+    arm = scene_radius * 0.06
+    glLineWidth(2.0)
+    glBegin(GL_LINES)
+    glColor4f(0.85, 0.25, 0.25, 0.9); glVertex3f(0, 0, 0); glVertex3f(arm, 0, 0)
+    glColor4f(0.25, 0.75, 0.25, 0.9); glVertex3f(0, 0, 0); glVertex3f(0, arm, 0)
+    glColor4f(0.30, 0.55, 0.90, 0.9); glVertex3f(0, 0, 0); glVertex3f(0, 0, arm)
+    glEnd()
+    glLineWidth(1.0)
+    glPointSize(6.0)
+    glColor4f(1.0, 1.0, 1.0, 0.9)
+    glBegin(GL_POINTS)
+    glVertex3f(0, 0, 0)
+    glEnd()
+    glPointSize(1.0)
+
+    glDepthMask(GL_TRUE)
+    glEnable(GL_CULL_FACE)
+    glDisable(GL_BLEND)
+    glEnable(GL_LIGHTING)
+
+
 def _draw_polyline(pts):
     glBegin(GL_LINE_STRIP)
     for p in pts:
