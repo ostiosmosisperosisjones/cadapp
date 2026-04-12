@@ -19,7 +19,7 @@ from cad.prefs import prefs
 
 _SIZE_PX  = 140   # logical pixels
 _PADDING  = 16    # logical pixels from window edge
-_CAM_Z    = 6.5   # camera pullback distance
+_CAM_Z    = 8.0   # camera pullback distance
 
 _FACES = [
     ('right',  ( 1, 0, 0), [( 1,-1,-1),( 1, 1,-1),( 1, 1, 1),( 1,-1, 1)]),

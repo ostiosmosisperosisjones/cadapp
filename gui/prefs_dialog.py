@@ -12,7 +12,7 @@ the prefs singleton immediately and saved to disk on OK.
 from __future__ import annotations
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QWidget, QCheckBox, QDoubleSpinBox, QComboBox,
+    QScrollArea, QWidget, QCheckBox, QDoubleSpinBox, QSpinBox, QComboBox,
     QDialogButtonBox, QFrame, QSizePolicy, QKeySequenceEdit,
     QTabWidget,
 )
@@ -36,6 +36,8 @@ class ClearableKeySequenceEdit(QKeySequenceEdit):
 
 # Human-readable labels for each pref key
 _LABELS = {
+    'default_unit':            ('Units',     'Default unit'),
+    'display_decimals':        ('Units',     'Decimal places'),
     'background_color':        ('Viewport',  'Background color'),
     'body_color':              ('Bodies',    'Body color'),
     'body_color_active':       ('Bodies',    'Active body color'),
@@ -65,7 +67,8 @@ _LABELS = {
 }
 
 _STR_OPTIONS = {
-    'camera_mode': ['trackball', 'arcball'],
+    'camera_mode':    ['trackball', 'arcball'],
+    'default_unit':   ['mm', 'cm', 'm', 'in', 'ft'],
 }
 
 
@@ -177,6 +180,16 @@ class PrefsDialog(QDialog):
                 cb.setProperty('pref_key', key)
                 self._widgets[key] = cb
                 row.addWidget(cb)
+
+            elif isinstance(val, int):
+                sp = QSpinBox()
+                sp.setMinimum(0)
+                sp.setMaximum(6)
+                sp.setValue(val)
+                sp.setFixedWidth(60)
+                sp.setProperty('pref_key', key)
+                self._widgets[key] = sp
+                row.addWidget(sp)
 
             elif isinstance(val, float):
                 sp = QDoubleSpinBox()
@@ -342,6 +355,8 @@ class PrefsDialog(QDialog):
                     setattr(prefs, key, tuple(c))
             elif isinstance(widget, QCheckBox):
                 setattr(prefs, key, widget.isChecked())
+            elif isinstance(widget, QSpinBox):
+                setattr(prefs, key, widget.value())
             elif isinstance(widget, QDoubleSpinBox):
                 setattr(prefs, key, widget.value())
             elif isinstance(widget, QComboBox):

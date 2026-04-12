@@ -10,6 +10,7 @@ history_changed signal.
 """
 
 from __future__ import annotations
+from cad.units import format_op_label as _make_label
 
 
 class OperationsMixin:
@@ -92,12 +93,66 @@ class OperationsMixin:
         ok, err = self.history.replay_from(from_index)
         if not ok:
             print(f"[Replay] FAILED: {err}")
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "Replay failed", err)
-            return
         self._rebuild_all_meshes()
         self.history_changed.emit()
         print("[Replay] Done.")
+
+    def do_delete(self, index: int):
+        entries = self.history.entries
+        if index < 0 or index >= len(entries):
+            return
+        body_id = entries[index].body_id
+        print(f"[History] Deleting entry {index}: '{entries[index].label}'")
+
+        # Collect split-body import entries that were produced by this entry.
+        # Must snapshot before any deletions renumber indices.
+        split_body_ids = [
+            e.body_id for e in entries
+            if e.operation == "import" and e.params.get("source_entry_idx") == index
+        ]
+        split_indices = sorted(
+            [i for i, e in enumerate(entries)
+             if e.operation == "import" and e.params.get("source_entry_idx") == index],
+            reverse=True  # delete back-to-front so earlier indices stay valid
+        )
+
+        # Delete split-body import entries first (all come after the parent)
+        for i in split_indices:
+            self.history.delete(i)
+
+        # Remove split bodies from workspace
+        for bid in split_body_ids:
+            self.workspace.remove_body(bid)
+
+        # Splits are always pushed after their parent, so deleting them
+        # (reverse order, all indices > index) never shifts `index` itself.
+        self.history.delete(index)
+
+        # Replay from the first remaining entry for this body, if any
+        remaining = [(i, e) for i, e in enumerate(self.history.entries)
+                     if e.body_id == body_id]
+        if remaining:
+            self.history.replay_from(remaining[0][0])
+        self._rebuild_all_meshes()
+        self.history_changed.emit()
+
+    def do_reorder(self, src: int, dst: int):
+        entries = self.history.entries
+        if src == dst or src < 0 or src >= len(entries):
+            return
+        print(f"[History] Reordering entry {src} → {dst}")
+        self.history.reorder(src, dst)
+        # Replay from the earliest affected position for every body touched
+        lo = min(src, dst)
+        replayed_bodies: set[str] = set()
+        for i, e in enumerate(self.history.entries):
+            if i < lo:
+                continue
+            if e.body_id not in replayed_bodies:
+                self.history.replay_from(i)
+                replayed_bodies.add(e.body_id)
+        self._rebuild_all_meshes()
+        self.history_changed.emit()
 
     # ------------------------------------------------------------------
     # Extrude dispatch
@@ -117,21 +172,13 @@ class OperationsMixin:
             self._do_extrude_dialog(sf.body_id, sf.face_idx)
 
     def _do_extrude_dialog(self, body_id, face_idx):
-        from PyQt6.QtWidgets import QInputDialog
-        dist, ok = QInputDialog.getDouble(
-            self, "Extrude",
-            "Distance (positive = add material, negative = cut):",
-            value=5.0, min=-1000.0, max=1000.0, decimals=3)
-        if ok:
+        dist = _extrude_distance_dialog(self)
+        if dist is not None:
             self.do_extrude(body_id, face_idx, dist)
 
     def _do_sketch_extrude_dialog(self, history_idx: int):
-        from PyQt6.QtWidgets import QInputDialog
-        dist, ok = QInputDialog.getDouble(
-            self, "Extrude Sketch",
-            "Distance (positive = add material, negative = cut):",
-            value=5.0, min=-1000.0, max=1000.0, decimals=3)
-        if ok:
+        dist = _extrude_distance_dialog(self)
+        if dist is not None and dist != 0:
             self.do_extrude_sketch(history_idx, dist)
 
     # ------------------------------------------------------------------
@@ -153,8 +200,8 @@ class OperationsMixin:
         except Exception as ex:
             print(f"[Extrude] FAILED: {ex}"); return
         op    = "cut" if distance < 0 else "extrude"
-        label = (f"Cut  -{abs(distance):.3f}mm" if distance < 0
-                 else f"Extrude  +{distance:.3f}mm")
+        params_for_label = {"distance": abs(distance)}
+        label = _make_label(op, params_for_label)
 
         solids = list(shape_after.solids())
         original_solid_count = len(list(shape_before.solids())) if shape_before is not None else 0
@@ -250,8 +297,8 @@ class OperationsMixin:
                 print(f"[Extrude] Sketch extrude FAILED: {ex}"); return
 
         op    = "cut" if distance < 0 else "extrude"
-        label = (f"Cut  -{abs(distance):.3f}mm" if distance < 0
-                 else f"Extrude  +{distance:.3f}mm")
+        params_for_label = {"distance": abs(distance)}
+        label = _make_label(op, params_for_label)
 
         mesh     = self._meshes.get(body_id)
         face_ref = (FaceRef.from_b3d_face(mesh.occt_faces[se.face_idx])
@@ -320,6 +367,71 @@ class OperationsMixin:
         print(f"[Extrude] Sketch → body={self.workspace.bodies[body_id].name} "
               f"distance={distance:+.3f}  OK  ({len(solids)} solid(s))")
         self.history_changed.emit()
+
+
+# ---------------------------------------------------------------------------
+# Extrude distance dialog
+# ---------------------------------------------------------------------------
+
+def _extrude_distance_dialog(parent) -> float | None:
+    """
+    Modal dialog with an ExprSpinBox for entering an extrude/cut distance.
+
+    Returns the distance in mm (positive = extrude, negative = cut),
+    or None if the user cancelled.  Accepts math expressions and unit
+    suffixes (e.g. "1in", "2.5cm + 3mm").
+    """
+    from PyQt6.QtWidgets import (
+        QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+        QDialogButtonBox, QPushButton,
+    )
+    from PyQt6.QtCore import Qt
+    from gui.expr_spinbox import ExprSpinBox
+    from cad.prefs import prefs
+
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Extrude / Cut")
+    dlg.setMinimumWidth(280)
+    dlg.setStyleSheet("background: #1e1e1e; color: #d4d4d4;")
+
+    layout = QVBoxLayout(dlg)
+    layout.setSpacing(10)
+    layout.setContentsMargins(16, 14, 16, 12)
+
+    lbl = QLabel("Distance  <span style='color:#666; font-size:11px;'>"
+                 "(positive = extrude, negative = cut)</span>")
+    lbl.setTextFormat(Qt.TextFormat.RichText)
+    layout.addWidget(lbl)
+
+    spinbox = ExprSpinBox(unit=prefs.default_unit)
+    layout.addWidget(spinbox)
+
+    buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok |
+        QDialogButtonBox.StandardButton.Cancel)
+    buttons.setStyleSheet("""
+        QPushButton {
+            background: #2a2a2a; color: #d4d4d4;
+            border: 1px solid #444; border-radius: 3px;
+            padding: 4px 14px;
+        }
+        QPushButton:hover { background: #333; }
+        QPushButton:default { border-color: #4a90d9; }
+    """)
+    def _accept():
+        spinbox._on_commit()   # flush any un-committed text before closing
+        dlg.accept()
+
+    buttons.accepted.connect(_accept)
+    buttons.rejected.connect(dlg.reject)
+    layout.addWidget(buttons)
+
+    spinbox.setFocus()
+
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return None
+
+    return spinbox.mm_value()  # None if expression was invalid
 
 
 # ---------------------------------------------------------------------------

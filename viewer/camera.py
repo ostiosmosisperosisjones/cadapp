@@ -86,7 +86,7 @@ class Camera:
         self._scene_extent = 1.0   # updated by fit_scene()
         self.distance    = 3.0
         self.ortho_scale = 1.5
-        self.ortho       = False
+        self.ortho       = True
         # Rotation stored as a quaternion (w, x, y, z)
         # Default: slight elevation and azimuth so the initial view is isometric-ish
         q_el  = _quat_from_axis_angle(np.array([1,0,0], dtype=float), radians(20))
@@ -249,6 +249,7 @@ class Camera:
     # ------------------------------------------------------------------
 
     def scroll(self, delta):
+        """Zoom without cursor — kept for compatibility."""
         factor = 0.9 if delta > 0 else 1.1
         if self.ortho:
             self.ortho_scale *= factor
@@ -258,6 +259,59 @@ class Camera:
             self.distance *= factor
             self.distance = max(0.001 * self._scene_extent,
                                 min(10.0 * self._scene_extent, self.distance))
+
+    def scroll_at(self, delta: int, px: float, py: float, vw: int, vh: int):
+        """
+        Zoom toward/away from the world point under the cursor at (px, py).
+
+        Converts the cursor to a normalised offset from the viewport centre,
+        then shifts `target` so that world point stays fixed under the cursor
+        as the scale changes.
+        """
+        factor = 0.9 if delta > 0 else 1.1
+
+        R = _quat_to_matrix(self.rotation)
+        right = R[:, 0]
+        up    = R[:, 1]
+
+        # Cursor offset from centre in NDC [-1, 1] with y flipped
+        cx = (2.0 * px - vw) / vw
+        cy = (vh - 2.0 * py) / vh
+
+        if self.ortho:
+            # World point under cursor before zoom
+            # ortho_scale is half-width of the view in world units (matches renderer)
+            aspect = vw / vh if vh else 1.0
+            wx = cx * self.ortho_scale * aspect
+            wy = cy * self.ortho_scale
+            world_under = self.target + right * wx + up * wy
+
+            self.ortho_scale *= factor
+            self.ortho_scale = max(0.001 * self._scene_extent,
+                                   min(10.0 * self._scene_extent, self.ortho_scale))
+
+            # Where that world point would now project — shift target to compensate
+            wx_new = cx * self.ortho_scale * aspect
+            wy_new = cy * self.ortho_scale
+            world_under_new = self.target + right * wx_new + up * wy_new
+            self.target += world_under - world_under_new
+        else:
+            # Perspective: point under cursor is on the focal plane at `distance`
+            # Field of view ~45° → tan(22.5°) ≈ 0.4142
+            fov_half_tan = 0.4142
+            aspect = vw / vh if vh else 1.0
+            wx = cx * self.distance * fov_half_tan * aspect
+            wy = cy * self.distance * fov_half_tan
+            world_under = self.target + right * wx + up * wy
+
+            self.distance *= factor
+            self.distance = max(0.001 * self._scene_extent,
+                                min(10.0 * self._scene_extent, self.distance))
+
+            wx_new = cx * self.distance * fov_half_tan * aspect
+            wy_new = cy * self.distance * fov_half_tan
+            world_under_new = self.target + right * wx_new + up * wy_new
+            self.target += world_under - world_under_new
 
     # ------------------------------------------------------------------
     # Snap to face normal

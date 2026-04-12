@@ -4,7 +4,7 @@ gui/mainwindow.py
 
 import os
 from PyQt6.QtWidgets import (
-    QMainWindow, QFileDialog, QInputDialog, QSplitter
+    QMainWindow, QFileDialog, QSplitter
 )
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtCore import Qt
@@ -103,7 +103,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(open_act)
 
         view_menu = menubar.addMenu("View")
-        self._proj_action = QAction("Orthographic", self)
+        self._proj_action = QAction("Perspective", self)
         self._proj_action.setCheckable(True)
         self._proj_action.setShortcut(prefs.key("projection_toggle"))
         self._proj_action.triggered.connect(self._toggle_projection)
@@ -146,6 +146,8 @@ class MainWindow(QMainWindow):
             glClearColor(r, g, b, 1.0)
             self._viewport.doneCurrent()
             self._viewport.update()
+            # Refresh history panel so unit labels update immediately
+            self._sidebar.history_panel.refresh()
 
     def _toggle_projection(self):
         if self._viewport:
@@ -171,14 +173,10 @@ class MainWindow(QMainWindow):
         self._show_extrude_dialog(sf.body_id, sf.face_idx)
 
     def _show_extrude_dialog(self, body_id: str, face_idx: int):
-        dist, ok = QInputDialog.getDouble(
-            self, "Extrude",
-            "Distance (positive = add material, negative = cut):",
-            value=5.0, min=-1000.0, max=1000.0, decimals=3,
-        )
-        if not ok:
-            return
-        self._viewport.do_extrude(body_id, face_idx, dist)
+        from viewer.vp_operations import _extrude_distance_dialog
+        dist = _extrude_distance_dialog(self)
+        if dist is not None:
+            self._viewport.do_extrude(body_id, face_idx, dist)
 
     def open_step(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -220,6 +218,7 @@ class MainWindow(QMainWindow):
         vp.build_meshes()
         vp.fit_camera_to_scene()
         vp.camera_projection_changed = self._sync_proj_menu
+        self._sync_proj_menu(vp.camera.ortho)
         vp.request_extrude_distance  = self._show_extrude_dialog
 
         sidebar = Sidebar(workspace, history)
@@ -234,6 +233,8 @@ class MainWindow(QMainWindow):
             sidebar.history_panel.set_selected_body)
         sidebar.history_panel.sketch_vis_changed.connect(vp.update)
         sidebar.history_panel.reenter_sketch_requested.connect(vp._reenter_sketch)
+        sidebar.history_panel.delete_requested.connect(vp.do_delete)
+        sidebar.history_panel.reorder_requested.connect(vp.do_reorder)
         sidebar.plane_visibility_changed.connect(vp.set_world_plane_visible)
         sidebar.sketch_on_plane_requested.connect(vp._enter_sketch_on_plane)
 

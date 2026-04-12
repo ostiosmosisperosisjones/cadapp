@@ -7,15 +7,20 @@ HistoryPanel — flat chronological operation list.
   - Hidden body entry dimming
   - Double-click past entry to edit parameters (parametric replay)
   - Sketch entries have a visibility eye toggle
+  - Right-click context menu: Delete, Move Up, Move Down
+  - Drag-and-drop reordering within the list
 """
 
 from __future__ import annotations
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QFrame, QSizePolicy, QDialog, QFormLayout,
+    QFrame, QSizePolicy, QDialog, QFormLayout,
     QDoubleSpinBox, QDialogButtonBox, QMessageBox,
+    QListWidget, QListWidgetItem, QAbstractItemView, QMenu,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from gui.expr_spinbox import ExprSpinBox
+from PyQt6.QtCore import Qt, pyqtSignal, QSize
+from PyQt6.QtGui import QAction
 from cad.history import History, HistoryEntry
 from cad.workspace import Workspace
 from cad.operations import EDIT_SCHEMA
@@ -78,20 +83,28 @@ class _EditDialog(QDialog):
         layout.setContentsMargins(16, 16, 16, 8)
         layout.setSpacing(10)
 
-        self._spinboxes: dict[str, QDoubleSpinBox] = {}
+        self._spinboxes: dict[str, ExprSpinBox | QDoubleSpinBox] = {}
 
-        signed_val = float(entry.params.get("distance", 0))
+        signed_val_mm = float(entry.params.get("distance", 0))
         if entry.operation == "cut":
-            signed_val = -abs(signed_val)
+            signed_val_mm = -abs(signed_val_mm)
 
-        for (key, label, typ, mn, mx, decimals) in schema:
-            spin = QDoubleSpinBox()
-            spin.setDecimals(decimals)
-            spin.setMinimum(-mx)
-            spin.setMaximum(mx)
-            spin.setSuffix(" mm")
-            spin.setValue(signed_val if key == "distance"
-                          else float(entry.params.get(key, 0)))
+        for row_def in schema:
+            key, label, typ, mn, mx, decimals = row_def[:6]
+            kind = row_def[6] if len(row_def) > 6 else None
+
+            if kind == "length":
+                spin = ExprSpinBox(decimals=decimals)
+                val_mm = signed_val_mm if key == "distance" else float(entry.params.get(key, 0))
+                spin.set_mm(val_mm)
+            else:
+                spin = QDoubleSpinBox()
+                spin.setDecimals(decimals)
+                spin.setMinimum(-mx)
+                spin.setMaximum(mx)
+                spin.setValue(signed_val_mm if key == "distance"
+                              else float(entry.params.get(key, 0)))
+
             self._spinboxes[key] = spin
             layout.addRow(label + "  (±):", spin)
 
@@ -107,7 +120,16 @@ class _EditDialog(QDialog):
         layout.addRow(buttons)
 
     def _on_accept(self):
-        self.result_params = {k: s.value() for k, s in self._spinboxes.items()}
+        result = {}
+        for k, s in self._spinboxes.items():
+            if isinstance(s, ExprSpinBox):
+                val = s.mm_value()
+                if val is None:
+                    return   # invalid expression — don't accept
+                result[k] = val
+            else:
+                result[k] = s.value()
+        self.result_params = result
         self.accept()
 
 
@@ -116,9 +138,7 @@ class _EditDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 class _EntryWidget(QFrame):
-    clicked               = pyqtSignal(int)
-    double_clicked        = pyqtSignal(int)
-    sketch_vis_toggled    = pyqtSignal(int)   # emits entry index
+    sketch_vis_toggled = pyqtSignal(int)   # emits entry index
 
     def __init__(self, entry: HistoryEntry, index: int,
                  is_current: bool, is_future: bool,
@@ -177,7 +197,10 @@ class _EntryWidget(QFrame):
             "border: none; background: transparent;")
         row.addWidget(tag)
 
-        lbl_text = entry.label
+        from cad.units import format_op_label
+        lbl_text = (format_op_label(entry.operation, entry.params)
+                    if entry.operation in ("extrude", "cut")
+                    else entry.label)
         if entry.error:
             lbl_text = "⚠ " + lbl_text
         lbl = QLabel(lbl_text)
@@ -220,15 +243,109 @@ class _EntryWidget(QFrame):
 
         outer.addLayout(row)
 
+
+# ---------------------------------------------------------------------------
+# Drag-and-drop QListWidget
+# ---------------------------------------------------------------------------
+
+class _HistoryList(QListWidget):
+    reorder_requested = pyqtSignal(int, int)  # src, dst
+    delete_requested  = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+        self.setStyleSheet("""
+            QListWidget {
+                background: transparent;
+                border: none;
+                outline: none;
+            }
+            QListWidget::item {
+                background: transparent;
+                border: none;
+                padding: 0;
+            }
+            QListWidget::item:selected {
+                background: transparent;
+                border: none;
+            }
+        """)
+        self._drag_src: int | None = None
+
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self._index)
+            item = self.itemAt(e.pos())
+            self._drag_src_history_idx = (
+                item.data(Qt.ItemDataRole.UserRole) if item else None)
         super().mousePressEvent(e)
 
-    def mouseDoubleClickEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            self.double_clicked.emit(self._index)
-        super().mouseDoubleClickEvent(e)
+    def dropEvent(self, e):
+        # Snapshot history-index order before Qt moves the item
+        order_before = [self.item(i).data(Qt.ItemDataRole.UserRole)
+                        for i in range(self.count())]
+        super().dropEvent(e)
+        order_after = [self.item(i).data(Qt.ItemDataRole.UserRole)
+                       for i in range(self.count())]
+        src_hidx = self._drag_src_history_idx
+        self._drag_src_history_idx = None
+        if src_hidx is None or order_before == order_after:
+            return
+        try:
+            src_pos = order_before.index(src_hidx)
+            dst_pos = order_after.index(src_hidx)
+        except ValueError:
+            return
+        if src_pos != dst_pos:
+            # Pass history indices of src item and the item now occupying src's
+            # old slot — history.reorder maps these back to positions itself.
+            # Use order_before[dst_pos] as the "swap target" history index.
+            self.reorder_requested.emit(src_hidx, order_before[dst_pos])
+
+    def _show_context_menu(self, pos):
+        item = self.itemAt(pos)
+        if item is None:
+            return
+        hidx  = item.data(Qt.ItemDataRole.UserRole)  # real history index
+        vrow  = self.row(item)
+        n     = self.count()
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #3a3a3a;
+            }
+            QMenu::item:selected { background: #2f3f52; }
+        """)
+
+        del_act = QAction("Delete", self)
+        del_act.triggered.connect(lambda: self.delete_requested.emit(hidx))
+        menu.addAction(del_act)
+
+        menu.addSeparator()
+
+        # For Move Up/Down we need the history index of the neighbour
+        up_act = QAction("Move Up", self)
+        up_act.setEnabled(vrow > 0)
+        if vrow > 0:
+            nbr_up = self.item(vrow - 1).data(Qt.ItemDataRole.UserRole)
+            up_act.triggered.connect(lambda: self.reorder_requested.emit(hidx, nbr_up))
+        menu.addAction(up_act)
+
+        dn_act = QAction("Move Down", self)
+        dn_act.setEnabled(vrow < n - 1)
+        if vrow < n - 1:
+            nbr_dn = self.item(vrow + 1).data(Qt.ItemDataRole.UserRole)
+            dn_act.triggered.connect(lambda: self.reorder_requested.emit(hidx, nbr_dn))
+        menu.addAction(dn_act)
+
+        menu.exec(self.viewport().mapToGlobal(pos))
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +355,10 @@ class _EntryWidget(QFrame):
 class HistoryPanel(QWidget):
     seek_requested           = pyqtSignal(int)
     replay_requested         = pyqtSignal(int)
-    sketch_vis_changed       = pyqtSignal()      # viewport should repaint
-    reenter_sketch_requested = pyqtSignal(int)   # history_idx to re-open
+    sketch_vis_changed       = pyqtSignal()
+    reenter_sketch_requested = pyqtSignal(int)
+    delete_requested         = pyqtSignal(int)
+    reorder_requested        = pyqtSignal(int, int)
 
     def __init__(self, workspace: Workspace, history: History, parent=None):
         super().__init__(parent)
@@ -280,19 +399,12 @@ class HistoryPanel(QWidget):
         """)
         root.addWidget(header)
 
-        self._scroll = QScrollArea()
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._scroll.setStyleSheet("border: none; background: transparent;")
-
-        self._list_widget = QWidget()
-        self._list_layout = QVBoxLayout(self._list_widget)
-        self._list_layout.setContentsMargins(0, 4, 0, 4)
-        self._list_layout.setSpacing(0)
-        self._list_layout.addStretch()
-        self._scroll.setWidget(self._list_widget)
-        root.addWidget(self._scroll, stretch=1)
+        self._list = _HistoryList()
+        self._list.reorder_requested.connect(self.reorder_requested)
+        self._list.delete_requested.connect(self.delete_requested)
+        self._list.itemClicked.connect(self._on_item_clicked)
+        self._list.itemDoubleClicked.connect(self._on_item_double_clicked)
+        root.addWidget(self._list, stretch=1)
 
         btn_style = """
             QPushButton {
@@ -326,10 +438,9 @@ class HistoryPanel(QWidget):
         root.addWidget(bc)
 
     def refresh(self):
-        while self._list_layout.count() > 1:
-            item = self._list_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        if self._history is None:
+            return
+        self._list.clear()
 
         entries = self._history.entries
         cursor  = self._history.cursor
@@ -358,20 +469,29 @@ class HistoryPanel(QWidget):
                 is_selected_body = is_selected_body,
                 is_hidden_body   = is_hidden_body,
             )
-            w.clicked.connect(self._on_entry_clicked)
-            w.double_clicked.connect(self._on_entry_double_clicked)
             w.sketch_vis_toggled.connect(self._on_sketch_vis_toggled)
-            self._list_layout.insertWidget(i, w)
+
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, i)  # store real history index
+            item.setSizeHint(QSize(0, w.sizeHint().height() + 2))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDragEnabled)
+            self._list.addItem(item)
+            self._list.setItemWidget(item, w)
 
         self._undo_btn.setEnabled(self._history.can_undo)
         self._redo_btn.setEnabled(self._history.can_redo)
-        self._scroll.verticalScrollBar().setValue(
-            self._scroll.verticalScrollBar().maximum())
+        # Scroll to bottom (most recent entry)
+        self._list.scrollToBottom()
 
-    def _on_entry_clicked(self, index: int):
-        self.seek_requested.emit(index)
+    def _item_index(self, item: QListWidgetItem) -> int:
+        """Return the real history index stored on a list item."""
+        return item.data(Qt.ItemDataRole.UserRole)
 
-    def _on_entry_double_clicked(self, index: int):
+    def _on_item_clicked(self, item: QListWidgetItem):
+        self.seek_requested.emit(self._item_index(item))
+
+    def _on_item_double_clicked(self, item: QListWidgetItem):
+        index = self._item_index(item)
         entries = self._history.entries
         if index >= len(entries):
             return
@@ -382,7 +502,6 @@ class HistoryPanel(QWidget):
             se = entry.params.get("sketch_entry")
             if se is None:
                 return
-            # Seek to this entry so it is the current position
             self.seek_requested.emit(index)
             self.reenter_sketch_requested.emit(index)
             return
@@ -420,5 +539,5 @@ class HistoryPanel(QWidget):
         if se is None:
             return
         se.visible = not se.visible
-        self.refresh()                   # redraw the eye icon
-        self.sketch_vis_changed.emit()   # tell viewport to repaint
+        self.refresh()
+        self.sketch_vis_changed.emit()

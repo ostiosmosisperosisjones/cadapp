@@ -94,6 +94,75 @@ class History:
                 if isinstance(val, int) and val >= insert_at:
                     e.params[key] = val + 1
 
+    def _fix_index_refs_delete(self, removed_at: int):
+        """
+        After removing the entry that was at *removed_at*, decrement any
+        absolute index params that pointed at a slot >= removed_at.
+        References that pointed exactly at the removed entry are left as-is
+        (they will produce an out-of-range lookup, which replay handles as an
+        error — consistent with how missing-face errors are handled).
+        """
+        for e in self._entries:
+            for key in ("from_sketch_idx", "source_entry_idx"):
+                val = e.params.get(key)
+                if isinstance(val, int) and val > removed_at:
+                    e.params[key] = val - 1
+
+    def delete(self, index: int) -> None:
+        """
+        Remove the entry at *index*.  Adjusts all absolute index references
+        and clamps the cursor.  Caller is responsible for triggering
+        replay_from() on affected bodies and rebuilding meshes.
+        """
+        if index < 0 or index >= len(self._entries):
+            return
+        del self._entries[index]
+        self._fix_index_refs_delete(index)
+        if self._cursor >= len(self._entries):
+            self._cursor = len(self._entries) - 1
+
+    def reorder(self, src: int, dst: int) -> None:
+        """
+        Move the entry at *src* to *dst*.  Adjusts all absolute index
+        references across the affected range.  Caller is responsible for
+        triggering replay_from() and rebuilding meshes.
+        """
+        n = len(self._entries)
+        if src == dst or src < 0 or src >= n or dst < 0 or dst >= n:
+            return
+        entry = self._entries.pop(src)
+        self._entries.insert(dst, entry)
+        # Fix index refs across the affected range.
+        lo, hi = min(src, dst), max(src, dst)
+        for e in self._entries:
+            for key in ("from_sketch_idx", "source_entry_idx"):
+                val = e.params.get(key)
+                if not isinstance(val, int):
+                    continue
+                if val < lo or val > hi:
+                    continue
+                if src < dst:
+                    # Entry shifted left — refs in (src, dst] shift down by 1
+                    if val == src:
+                        e.params[key] = dst
+                    else:
+                        e.params[key] = val - 1
+                else:
+                    # Entry shifted right — refs in [dst, src) shift up by 1
+                    if val == src:
+                        e.params[key] = dst
+                    else:
+                        e.params[key] = val + 1
+        # Adjust cursor: if it pointed at src, follow it to dst.
+        # If it was in the shifted range, shift it accordingly.
+        if self._cursor == src:
+            self._cursor = dst
+        elif src < dst and src < self._cursor <= dst:
+            self._cursor -= 1
+        elif dst < src and dst <= self._cursor < src:
+            self._cursor += 1
+        self._cursor = max(0, min(self._cursor, len(self._entries) - 1))
+
     def undo(self) -> HistoryEntry | None:
         if self._cursor <= 0:
             return None
@@ -153,16 +222,15 @@ class History:
 
         target_body_id = self._entries[index].body_id
 
-        # Always derive starting shape from the live shape_after chain rather
-        # than entry.shape_before, which can be stale after a mid-history insert.
+        # Derive starting shape from the live shape_after chain.
+        # Do NOT fall back to entry.shape_before — it can be stale after a
+        # reorder. If there is genuinely no prior shape (e.g. world-plane sketch
+        # body with no import), start with None and let the loop's error paths
+        # handle each entry appropriately.
         current_shape = self._shape_for_body_at(target_body_id, index)
-        if current_shape is None and self._entries[index].operation != "import":
-            # Fall back to stored shape_before only if the chain lookup fails
-            current_shape = self._entries[index].shape_before
-        if current_shape is None and self._entries[index].operation != "import":
-            return False, f"Entry {index} has no shape_before"
 
-        first_error = ""
+        first_error  = ""
+        chain_broken = False   # once True, all subsequent ops for this body cascade-error
 
         for i in range(index, len(self._entries)):
             entry = self._entries[i]
@@ -173,6 +241,15 @@ class History:
             # Clear previous error state on re-play
             entry.error     = False
             entry.error_msg = ""
+
+            # If a prior op in this chain failed, cascade: null this entry and skip
+            if chain_broken and entry.operation not in ("import", "sketch"):
+                entry.error     = True
+                entry.error_msg = "Dependency error: a prior operation in this chain failed"
+                entry.shape_before = current_shape
+                entry.shape_after  = None
+                _null_split_dependents(self._entries, i)
+                continue
 
             # ---- import ---------------------------------------------------
             if entry.operation == "import":
@@ -199,13 +276,14 @@ class History:
                 ok, new_shape, err = _replay_sketch_extrude(
                     entry, i, current_shape, self._entries)
                 if not ok:
-                    entry.error     = True
-                    entry.error_msg = err
+                    entry.error      = True
+                    entry.error_msg  = err
+                    entry.shape_before = current_shape
+                    entry.shape_after  = None
+                    _null_split_dependents(self._entries, i)
+                    chain_broken = True
                     if not first_error:
                         first_error = err
-                    # Keep current_shape so downstream sees the last good shape
-                    entry.shape_before = current_shape
-                    entry.shape_after  = current_shape
                 else:
                     entry.shape_before = current_shape
                     entry.shape_after  = new_shape
@@ -218,14 +296,27 @@ class History:
             if executor is None:
                 err = f"No executor for operation '{entry.operation}'"
                 entry.error = True; entry.error_msg = err
-                entry.shape_before = current_shape; entry.shape_after = current_shape
+                entry.shape_before = current_shape; entry.shape_after = None
+                _null_split_dependents(self._entries, i)
+                chain_broken = True
                 if not first_error: first_error = err
                 continue
 
             if entry.face_ref is None:
                 err = f"Entry {i} '{entry.label}' has no face_ref"
                 entry.error = True; entry.error_msg = err
-                entry.shape_before = current_shape; entry.shape_after = current_shape
+                entry.shape_before = current_shape; entry.shape_after = None
+                _null_split_dependents(self._entries, i)
+                chain_broken = True
+                if not first_error: first_error = err
+                continue
+
+            if current_shape is None:
+                err = f"Entry {i} '{entry.label}': no input shape (prior operation failed)"
+                entry.error = True; entry.error_msg = err
+                entry.shape_before = None; entry.shape_after = None
+                _null_split_dependents(self._entries, i)
+                chain_broken = True
                 if not first_error: first_error = err
                 continue
 
@@ -235,7 +326,9 @@ class History:
                        f"FaceRef: normal={entry.face_ref.normal} "
                        f"area={entry.face_ref.area:.3f}")
                 entry.error = True; entry.error_msg = err
-                entry.shape_before = current_shape; entry.shape_after = current_shape
+                entry.shape_before = current_shape; entry.shape_after = None
+                _null_split_dependents(self._entries, i)
+                chain_broken = True
                 if not first_error: first_error = err
                 continue
 
@@ -245,7 +338,9 @@ class History:
             except Exception as ex:
                 err = f"Entry {i} '{entry.label}' failed: {ex}"
                 entry.error = True; entry.error_msg = err
-                entry.shape_before = current_shape; entry.shape_after = current_shape
+                entry.shape_before = current_shape; entry.shape_after = None
+                _null_split_dependents(self._entries, i)
+                chain_broken = True
                 if not first_error: first_error = err
                 continue
 
@@ -366,6 +461,10 @@ def _replay_sketch_extrude(entry, entry_index: int, current_shape,
     if sketch_idx is None or sketch_idx >= len(all_entries):
         return False, None, (
             f"sketch extrude: from_sketch_idx {sketch_idx!r} out of range")
+    if sketch_idx >= entry_index:
+        return False, None, (
+            f"sketch extrude: referenced sketch (index {sketch_idx}) is after "
+            f"this entry (index {entry_index}) — reorder is invalid")
 
     se = all_entries[sketch_idx].params.get("sketch_entry")
     if se is None:
@@ -403,9 +502,18 @@ def _replay_sketch_extrude(entry, entry_index: int, current_shape,
     return True, solids[0], ""
 
 
+def _null_split_dependents(entries: list, parent_idx: int) -> None:
+    """
+    Null the shape_after of any split-body import entries that were produced
+    by the entry at *parent_idx*.  Called whenever a parent op errors so the
+    child bodies disappear from the viewport instead of showing stale geometry.
+    """
+    for e in entries[parent_idx + 1:]:
+        if (e.operation == "import" and
+                e.params.get("source_entry_idx") == parent_idx):
+            e.shape_after = None
+
+
 def _make_label(operation: str, params: dict) -> str:
-    if operation == "extrude":
-        return f"Extrude  +{params.get('distance', 0):.3f}mm"
-    if operation == "cut":
-        return f"Cut  -{abs(params.get('distance', 0)):.3f}mm"
-    return operation.capitalize()
+    from cad.units import format_op_label
+    return format_op_label(operation, params)

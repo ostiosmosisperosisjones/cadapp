@@ -46,11 +46,15 @@ REGISTRY: dict[str, callable] = {
 
 EDIT_SCHEMA: dict[str, list[tuple]] = {
     "extrude": [
-        ("distance", "Distance (mm)", float, 0.001, 1000.0, 3),
+        ("distance", "Distance", float, 0.001, 1000.0, 3, "length"),
     ],
     "cut": [
-        ("distance", "Depth (mm)", float, 0.001, 1000.0, 3),
+        ("distance", "Depth", float, 0.001, 1000.0, 3, "length"),
     ],
 }
+# Schema tuple: (param_key, label, type, min, max, decimals, kind)
+# kind="length" -> ExprSpinBox with unit conversion
+# kind="angle"  -> ExprSpinBox (future, degrees)
+# kind=None     -> plain QDoubleSpinBox
 
 __all__ = ["extrude_face", "extrude_face_direct", "REGISTRY", "EDIT_SCHEMA"]
