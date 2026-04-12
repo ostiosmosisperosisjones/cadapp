@@ -59,7 +59,8 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
 
         self._sketch = None                              # SketchMode | None
         self._sketch_faces: dict[int, list] = {}        # history_idx → [Face]
-        self._selected_sketch_entry: int | None = None
+        self._selected_sketch_entry: int | None = None  # history_idx
+        self._selected_sketch_face: int | None = None   # face_idx within entry
         self._editing_sketch_history_idx: int | None = None  # set during re-entry
 
         self.camera_projection_changed = None
@@ -134,21 +135,27 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
         self.camera.fit_scene(all_min, all_max)
 
     def _rebuild_body_mesh(self, body_id: str):
+        shape = self.workspace.current_shape(body_id)
+        self._body_visible.setdefault(body_id, True)
+        if shape is not None:
+            try:
+                mesh = Mesh(shape)   # tessellate off-GL (pure CPU)
+            except Exception as ex:
+                print(f"[Mesh] Could not tessellate body {body_id}: {ex}")
+                mesh = None
+        else:
+            mesh = None
         self.makeCurrent()
         old = self._meshes.get(body_id)
         if old:
             for buf in (old.vbo_verts, old.vbo_normals, old.vbo_edges, old.ebo):
                 if buf is not None:
                     glDeleteBuffers(1, [buf])
-        self._body_visible.setdefault(body_id, True)   # new bodies are visible
-        shape = self.workspace.current_shape(body_id)
-        if shape is not None:
-            try:
-                mesh = Mesh(shape)
-                mesh.upload()
-                self._meshes[body_id] = mesh
-            except Exception as ex:
-                print(f"[Mesh] Could not tessellate body {body_id}: {ex}")
+        if mesh is not None:
+            mesh.upload()
+            self._meshes[body_id] = mesh
+        else:
+            self._meshes.pop(body_id, None)
         self.selection.clear_for_body(body_id)
         if self._hovered_vertex[0] == body_id:
             self._hovered_vertex = (None, None)
@@ -160,19 +167,19 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
         self.update()
 
     def _rebuild_all_meshes(self):
+        # Collect shapes first — tessellation is pure CPU and can run in parallel
+        bodies = list(self.workspace.all_current_shapes())
+        new_meshes = _tessellate_parallel(bodies)
+
         self.makeCurrent()
         for body_id, old in list(self._meshes.items()):
             for buf in (old.vbo_verts, old.vbo_normals, old.vbo_edges, old.ebo):
                 if buf is not None:
                     glDeleteBuffers(1, [buf])
         self._meshes.clear()
-        for body_id, shape in self.workspace.all_current_shapes():
-            try:
-                mesh = Mesh(shape)
-                mesh.upload()
-                self._meshes[body_id] = mesh
-            except Exception as ex:
-                print(f"[Mesh] Could not tessellate body {body_id}: {ex}")
+        for body_id, mesh in new_meshes.items():
+            mesh.upload()
+            self._meshes[body_id] = mesh
         self.selection.clear()
         self._hovered_vertex = (None, None)
         self._hovered_edge   = (None, None)
@@ -319,6 +326,7 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
                     self._exit_sketch()
             else:
                 self._selected_sketch_entry = None
+                self._selected_sketch_face  = None
                 self.selection.clear()
                 self.body_selected.emit(None)
                 self.selection_changed.emit()
@@ -491,20 +499,23 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
                 origin, direction = self.get_ray(e.position().x(),
                                                  e.position().y())
                 if origin is not None and self._sketch_faces:
-                    hidx, _ = self._pick_sketch_face(origin, direction)
+                    hidx, fidx = self._pick_sketch_face(origin, direction)
                     if hidx is not None:
                         self._selected_sketch_entry = hidx
+                        self._selected_sketch_face  = fidx
                         self.selection.clear()
                         self.body_selected.emit(None)
                         self.selection_changed.emit()
                         self.update()
-                        print(f"[Sketch] Selected sketch entry {hidx}"
-                              f" — press E to extrude")
+                        face_count = len(self._sketch_faces.get(hidx, []))
+                        print(f"[Sketch] Selected sketch face {fidx} "
+                              f"(entry {hidx}, {face_count} face(s)) — press E to extrude")
                         return
 
                 body_id, idx = self._pick_at(e.position())
                 if idx is not None:
                     self._selected_sketch_entry = None
+                    self._selected_sketch_face  = None
                     self.selection.select_face(body_id, idx, additive=additive)
                     self.workspace.set_active_body(body_id)
                     self.body_selected.emit(body_id)
@@ -521,6 +532,7 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
                               f"non-planar")
                 elif not additive:
                     self._selected_sketch_entry = None
+                    self._selected_sketch_face  = None
                     self.selection.clear()
                     self.body_selected.emit(None)
 
@@ -600,3 +612,37 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
             self.width(), self.height(),
         )
         self.update()
+
+
+# ---------------------------------------------------------------------------
+# Parallel tessellation helper
+# ---------------------------------------------------------------------------
+
+def _tessellate_one(args):
+    """Tessellate a single body — runs in a worker thread (no GL calls)."""
+    body_id, shape = args
+    try:
+        return body_id, Mesh(shape)
+    except Exception as ex:
+        print(f"[Mesh] Could not tessellate body {body_id}: {ex}")
+        return body_id, None
+
+
+def _tessellate_parallel(bodies: list) -> dict:
+    """
+    Tessellate all (body_id, shape) pairs in parallel using a thread pool.
+    Returns {body_id: Mesh} for bodies that succeeded.
+    OCCT tessellation is CPU-bound and thread-safe (no GL state involved).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    results = {}
+    if not bodies:
+        return results
+    # Use min(len(bodies), cpu_count) threads — no point spinning more than needed
+    import os
+    workers = min(len(bodies), os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for body_id, mesh in pool.map(_tessellate_one, bodies):
+            if mesh is not None:
+                results[body_id] = mesh
+    return results

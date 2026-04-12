@@ -41,13 +41,17 @@ class SketchPickMixin:
             if se is None:
                 continue
             try:
-                segs  = se.line_segments()
-                loops = se.closed_loops()
-                faces = se.build_faces()
+                segs             = se.line_segments()
+                loops            = se.closed_loops()
+                faces, regions   = se.build_faces()
                 print(f"[Sketch] Entry {i}: {len(segs)} segments, "
                       f"{len(loops)} closed loops, {len(faces)} faces built")
                 if faces:
-                    self._sketch_faces[i] = faces
+                    # Store as list of (face, outer_uvs, hole_uvs_list)
+                    self._sketch_faces[i] = [
+                        (face, reg[0], reg[1])
+                        for face, reg in zip(faces, regions)
+                    ]
             except Exception as ex:
                 print(f"[Sketch] Could not build faces for entry {i}: {ex}")
 
@@ -60,13 +64,14 @@ class SketchPickMixin:
         """
         Ray-test all committed sketch faces.
         Returns (history_index, face_index_within_entry) or (None, None).
+
+        Among all hit faces, prefer the one with the smallest area — this
+        ensures that nested faces (which are geometrically disjoint rings/
+        regions) resolve to the innermost region under the cursor rather
+        than a larger outer face that shares the same ray-parameter t.
         """
         from OCP.BRepIntCurveSurface import BRepIntCurveSurface_Inter
         from OCP.gp import gp_Lin, gp_Pnt, gp_Dir
-
-        best_t    = np.inf
-        best_hidx = None
-        best_fidx = None
 
         d = ray_dir
         o = ray_origin
@@ -78,20 +83,77 @@ class SketchPickMixin:
         except Exception:
             return None, None
 
-        for hidx, faces in self._sketch_faces.items():
-            for fidx, face in enumerate(faces):
+        # Collect all ray hits with their UV intersection point
+        from cad.sketch import _uv_point_in_loop
+
+        hits = []   # (t, hidx, fidx, outer_uvs, hole_uvs_list)
+        for hidx, face_list in self._sketch_faces.items():
+            for fidx, (face, outer_uvs, hole_uvs) in enumerate(face_list):
                 try:
                     inter = BRepIntCurveSurface_Inter()
                     inter.Init(face.wrapped, line, 1e-6)
                     while inter.More():
                         t = inter.W()
-                        if 0 < t < best_t:
-                            best_t    = t
-                            best_hidx = hidx
-                            best_fidx = fidx
+                        if t > 0:
+                            hits.append((t, hidx, fidx, outer_uvs, hole_uvs))
                         inter.Next()
                 except Exception:
                     pass
+
+        if not hits:
+            return None, None
+
+        # All sketch faces are coplanar — t-distance is meaningless for
+        # disambiguation.  Project the closest hit point to UV and find
+        # the face whose region (outer polygon minus holes) contains it.
+        best_t    = min(h[0] for h in hits)
+        hit_world = np.array([o[0], o[1], o[2]]) + best_t * np.array([d[0], d[1], d[2]])
+
+        # Collect UV point once per entry (all faces in an entry share the plane)
+        se_cache = {}
+        uv_cache = {}  # hidx -> uv_pt
+
+        best_hidx = None
+        best_fidx = None
+        best_area = np.inf
+
+        for t, hidx, fidx, outer_uvs, hole_uvs in hits:
+            if hidx not in uv_cache:
+                try:
+                    se = self.history.entries[hidx].params.get("sketch_entry")
+                    if se is not None:
+                        delta = hit_world - se.plane_origin
+                        uv_cache[hidx] = (float(np.dot(delta, se.plane_x_axis)),
+                                          float(np.dot(delta, se.plane_y_axis)))
+                except Exception:
+                    pass
+
+            uv_pt = uv_cache.get(hidx)
+            if uv_pt is None:
+                continue
+
+            # Must be inside outer polygon and outside all hole polygons
+            if not _uv_point_in_loop(uv_pt, outer_uvs):
+                continue
+            if any(_uv_point_in_loop(uv_pt, h) for h in hole_uvs):
+                continue
+
+            def _uv_area(uvs):
+                a = 0.0
+                for k in range(len(uvs)):
+                    x0,y0=uvs[k]; x1,y1=uvs[(k+1)%len(uvs)]
+                    a += x0*y1 - x1*y0
+                return abs(a)*0.5
+
+            area = _uv_area(outer_uvs)
+            if area < best_area:
+                best_area = area
+                best_hidx = hidx
+                best_fidx = fidx
+
+        # Fallback: if UV test excluded everything, pick closest hit
+        if best_hidx is None and hits:
+            _, best_hidx, best_fidx, _, _ = min(hits, key=lambda h: h[0])
 
         return best_hidx, best_fidx
 
@@ -116,58 +178,78 @@ class SketchPickMixin:
 
         glDisable(GL_LIGHTING)
         glDisable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)   # draw both sides
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-        for hidx, faces in self._sketch_faces.items():
-            is_selected = (hidx == self._selected_sketch_entry)
-            for face in faces:
-                try:
-                    BRepMesh_IncrementalMesh(face.wrapped, 0.1)
-                    location = face.wrapped.Location()
-                    facing   = BRep_Tool.Triangulation_s(face.wrapped, location)
-                    if facing is None:
-                        continue
+        # Build a flat draw list sorted largest→smallest so inner faces
+        # paint on top and alpha doesn't compound across nested regions.
+        def _uv_area(uvs):
+            a = 0.0
+            for k in range(len(uvs)):
+                x0, y0 = uvs[k]; x1, y1 = uvs[(k+1) % len(uvs)]
+                a += x0 * y1 - x1 * y0
+            return abs(a) * 0.5
 
-                    glColor4f(0.29, 0.43, 0.54, 0.45 if is_selected else 0.20)
-                    glBegin(GL_TRIANGLES)
-                    for tri_idx in range(1, facing.NbTriangles() + 1):
-                        tri = facing.Triangle(tri_idx)
-                        n1, n2, n3 = tri.Get()
-                        for ni in (n1, n2, n3):
-                            node = facing.Node(ni)
-                            glVertex3f(node.X(), node.Y(), node.Z())
-                    glEnd()
+        draw_list = []
+        for hidx, face_list in self._sketch_faces.items():
+            for fidx, (face, outer_uvs, hole_uvs) in enumerate(face_list):
+                draw_list.append((hidx, fidx, face, _uv_area(outer_uvs)))
+        draw_list.sort(key=lambda x: x[3], reverse=True)
 
-                    if is_selected:
-                        glColor4f(0.48, 0.70, 0.84, 0.90)
-                        glLineWidth(1.8)
-                    else:
-                        glColor4f(0.29, 0.43, 0.54, 0.50)
-                        glLineWidth(1.2)
+        for hidx, fidx, face, _ in draw_list:
+            entry_selected = (hidx == self._selected_sketch_entry)
+            is_selected = entry_selected and (
+                self._selected_sketch_face is None or
+                fidx == self._selected_sketch_face
+            )
+            try:
+                BRepMesh_IncrementalMesh(face.wrapped, 0.1)
+                location = face.wrapped.Location()
+                facing   = BRep_Tool.Triangulation_s(face.wrapped, location)
+                if facing is None:
+                    continue
 
-                    exp = TopExp_Explorer(face.wrapped, TopAbs_EDGE)
-                    while exp.More():
-                        edge = exp.Current()
-                        try:
-                            adaptor = BRepAdaptor_Curve(edge)
-                            disc    = GCPnts_UniformAbscissa()
-                            disc.Initialize(adaptor, 32)
-                            if disc.IsDone() and disc.NbPoints() >= 2:
-                                glBegin(GL_LINE_STRIP)
-                                for pi in range(1, disc.NbPoints() + 1):
-                                    p = adaptor.Value(disc.Parameter(pi))
-                                    glVertex3f(p.X(), p.Y(), p.Z())
-                                glEnd()
-                        except Exception:
-                            pass
-                        exp.Next()
-                    glLineWidth(1.0)
+                glColor4f(0.29, 0.43, 0.54, 0.45 if is_selected else 0.20)
+                glBegin(GL_TRIANGLES)
+                for tri_idx in range(1, facing.NbTriangles() + 1):
+                    tri = facing.Triangle(tri_idx)
+                    n1, n2, n3 = tri.Get()
+                    for ni in (n1, n2, n3):
+                        node = facing.Node(ni)
+                        glVertex3f(node.X(), node.Y(), node.Z())
+                glEnd()
 
-                except Exception as ex:
-                    print(f"[Sketch] draw_sketch_faces error: {ex}")
+                if is_selected:
+                    glColor4f(0.48, 0.70, 0.84, 0.90)
+                    glLineWidth(1.8)
+                else:
+                    glColor4f(0.29, 0.43, 0.54, 0.50)
+                    glLineWidth(1.2)
+
+                exp = TopExp_Explorer(face.wrapped, TopAbs_EDGE)
+                while exp.More():
+                    edge = exp.Current()
+                    try:
+                        adaptor = BRepAdaptor_Curve(edge)
+                        disc    = GCPnts_UniformAbscissa()
+                        disc.Initialize(adaptor, 32)
+                        if disc.IsDone() and disc.NbPoints() >= 2:
+                            glBegin(GL_LINE_STRIP)
+                            for pi in range(1, disc.NbPoints() + 1):
+                                p = adaptor.Value(disc.Parameter(pi))
+                                glVertex3f(p.X(), p.Y(), p.Z())
+                            glEnd()
+                    except Exception:
+                        pass
+                    exp.Next()
+                glLineWidth(1.0)
+
+            except Exception as ex:
+                print(f"[Sketch] draw_sketch_faces error: {ex}")
 
         glDisable(GL_BLEND)
+        glEnable(GL_CULL_FACE)
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_LIGHTING)
 

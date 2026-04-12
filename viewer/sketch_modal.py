@@ -56,6 +56,7 @@ class SketchModalMixin:
         self._sketch = SketchMode(b3d_plane, body_id, face_idx,
                                   plane_source=plane_source)
         self._selected_sketch_entry = None
+        self._selected_sketch_face  = None
         self.selection.clear()
         self.hover.clear()
         self.selection_changed.emit()
@@ -86,6 +87,7 @@ class SketchModalMixin:
         self._sketch = mode
         self._editing_sketch_history_idx = history_idx
         self._selected_sketch_entry = None
+        self._selected_sketch_face  = None
         self.selection.clear()
         self.hover.clear()
         self.selection_changed.emit()
@@ -125,7 +127,7 @@ class SketchModalMixin:
                 self._editing_sketch_history_idx = None
                 self.sketch_mode_changed.emit(False)
                 self._rebuild_sketch_faces()
-                ok, err = self.history.replay_from(editing_idx)
+                ok, err, _ = self.history.replay_from(editing_idx)
                 if not ok:
                     print(f"[Sketch] Replay after re-entry failed: {err}")
                 self._rebuild_all_meshes()
@@ -182,6 +184,7 @@ class SketchModalMixin:
         self._sketch = SketchMode(b3d_plane, None, -1,
                                   plane_source=plane_source)
         self._selected_sketch_entry = None
+        self._selected_sketch_face  = None
         self.selection.clear()
         self.hover.clear()
         self.selection_changed.emit()

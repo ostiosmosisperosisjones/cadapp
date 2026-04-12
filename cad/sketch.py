@@ -64,6 +64,19 @@ class ReferenceEntity:
         self.occ_edges   = occ_edges
         self.source      = source          # EdgeSource | None
 
+    def __deepcopy__(self, memo):
+        # TopoDS_Edge is not picklable — share by reference (OCCT shapes are
+        # immutable value types so aliasing is safe).
+        import copy
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        result.points      = copy.deepcopy(self.points, memo)
+        result.source_type = self.source_type
+        result.occ_edges   = self.occ_edges   # shared reference, not copied
+        result.source      = copy.deepcopy(self.source, memo)
+        return result
+
 
 # ---------------------------------------------------------------------------
 # SketchPlane
@@ -265,6 +278,29 @@ class SketchMode:
 
 
 # ---------------------------------------------------------------------------
+# UV-space helpers
+# ---------------------------------------------------------------------------
+
+def _uv_point_in_loop(pt: tuple[float, float],
+                      loop: list[tuple[float, float]]) -> bool:
+    """
+    2-D ray-casting point-in-polygon test.
+    Returns True if `pt` is strictly inside the polygon defined by `loop`.
+    """
+    x, y = pt
+    n = len(loop)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = loop[i]
+        xj, yj = loop[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+# ---------------------------------------------------------------------------
 # SketchEntry  — immutable snapshot of a committed sketch
 # ---------------------------------------------------------------------------
 
@@ -328,6 +364,78 @@ class SketchEntry:
     def has_closed_loop(self, tol: float = 1e-3) -> bool:
         return len(self.closed_loops(tol=tol)) > 0
 
+    def face_regions(self, tol: float = 1e-3):
+        """
+        Return UV region descriptors parallel to build_faces().
+        Each entry is (outer_uvs, [hole_uvs, ...]) — the outer polygon and
+        the direct-child polygons that are punched as holes.
+        Used by the picker for exact point-in-region tests.
+        """
+        uv_loops = self._collect_uv_loops(tol)
+        if not uv_loops:
+            return []
+
+        def _area(uvs):
+            a = 0.0
+            for k in range(len(uvs)):
+                x0, y0 = uvs[k]; x1, y1 = uvs[(k + 1) % len(uvs)]
+                a += x0 * y1 - x1 * y0
+            return abs(a) * 0.5
+
+        areas = [_area(uv) for uv in uv_loops]
+        n = len(uv_loops)
+
+        def _loop_contains(j, i):
+            if areas[j] <= areas[i]:
+                return False
+            return all(_uv_point_in_loop(pt, uv_loops[j]) for pt in uv_loops[i])
+
+        parent = [None] * n
+        for i in range(n):
+            containers = [j for j in range(n) if _loop_contains(j, i)]
+            if containers:
+                parent[i] = min(containers, key=lambda j: areas[j])
+
+        return [
+            (uv_loops[i], [uv_loops[j] for j in range(n) if parent[j] == i])
+            for i in range(n)
+        ]
+
+    def _collect_uv_loops(self, tol: float = 1e-3):
+        """Collect closed UV polygon lists from all entities (shared by build_faces and face_regions)."""
+        uv_loops = []
+        for ref in self.entities:
+            if not isinstance(ref, ReferenceEntity) or len(ref.points) < 3:
+                continue
+            pts_close = np.linalg.norm(ref.points[-1] - ref.points[0]) < tol
+            edge_closed = False
+            if not pts_close and ref.occ_edges:
+                try:
+                    from OCP.BRepAdaptor import BRepAdaptor_Curve as _BAC
+                    for _e in ref.occ_edges:
+                        _a = _BAC(_e)
+                        if _a.IsClosed() or _a.IsPeriodic():
+                            edge_closed = True
+                            break
+                except Exception:
+                    pass
+            if not pts_close and not edge_closed:
+                continue
+            raw = ref.points[:-1] if pts_close else ref.points
+            uv = [(float(p[0]), float(p[1])) for p in raw]
+            if len(uv) >= 3:
+                uv_loops.append(uv)
+
+        segs = self.line_segments()
+        if segs:
+            for loop in _chain_segments(segs, tol=tol):
+                if np.linalg.norm(np.array(loop[-1]) - np.array(loop[0])) > tol:
+                    continue
+                open_loop = [(float(u), float(v)) for u, v in loop[:-1]]
+                if len(open_loop) >= 3:
+                    uv_loops.append(open_loop)
+        return uv_loops
+
     def build_wire(self, tol: float = 1e-3):
         """Convert LineEntity segments into a build123d Wire (for DXF export etc.)."""
         from build123d import Polyline, Vector, Compound
@@ -348,115 +456,162 @@ class SketchEntry:
 
     def build_faces(self, tol: float = 1e-3) -> list:
         """
-        Build a planar Face for each closed loop.
+        Build one planar Face per closed loop (includes and drawn lines).
 
-        Reference loops: projects original OCCT edges onto the sketch plane
-        using GeomProjLib.ProjectOnPlane (preserves curve type — circle stays
-        a circle regardless of offset distance).
-        Line loops: built from (u,v) points which are already on the plane.
-        Falls back to tessellated polyline if projection fails.
+        Uses BRepAlgoAPI_Splitter as a "cookie cutter": every loop face is
+        passed as both an argument and a tool so OCCT computes all planar
+        intersections at once and returns naturally non-overlapping regions.
+        Ring-shaped regions automatically get the correct topology with an
+        outer boundary and one or more inner holes.
+
+        Returns (faces, regions) where regions[k] = (outer_uvs, [hole_uvs])
+        parallel to faces[k].  outer_uvs is the vertex list of the largest
+        (outer) wire; hole_uvs is a list of vertex lists for inner wires.
         """
-        from build123d import Face, Polyline, Vector
+        from build123d import Face
         from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakeFace,
                                         BRepBuilderAPI_MakeWire,
                                         BRepBuilderAPI_MakeEdge)
-        from OCP.BRepAdaptor import BRepAdaptor_Curve
-        from OCP.GeomProjLib import GeomProjLib
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter
+        from OCP.BRepTools import BRepTools_WireExplorer
         from OCP.Geom import Geom_Plane
         from OCP.gp import gp_Ax3, gp_Pnt, gp_Dir
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_FACE, TopAbs_WIRE
+        from OCP.TopTools import TopTools_ListOfShape
+        from OCP.TopoDS import TopoDS
+        from OCP.BRep import BRep_Tool
 
-        try:
-            ax3 = gp_Ax3(
-                gp_Pnt(float(self.plane_origin[0]),
-                       float(self.plane_origin[1]),
-                       float(self.plane_origin[2])),
-                gp_Dir(float(self.plane_normal[0]),
-                       float(self.plane_normal[1]),
-                       float(self.plane_normal[2])),
-            )
-            geom_plane = Geom_Plane(ax3)
-            proj_dir   = gp_Dir(float(self.plane_normal[0]),
-                                float(self.plane_normal[1]),
-                                float(self.plane_normal[2]))
-        except Exception as ex:
-            print(f"[Sketch] build_faces: could not build plane — {ex}")
-            geom_plane = None
-            proj_dir   = None
+        _geom_plane = Geom_Plane(gp_Ax3(
+            gp_Pnt(float(self.plane_origin[0]),
+                   float(self.plane_origin[1]),
+                   float(self.plane_origin[2])),
+            gp_Dir(float(self.plane_normal[0]),
+                   float(self.plane_normal[1]),
+                   float(self.plane_normal[2])),
+            gp_Dir(float(self.plane_x_axis[0]),
+                   float(self.plane_x_axis[1]),
+                   float(self.plane_x_axis[2])),
+        ))
 
-        faces = []
+        def _uv_to_wire(uv_pts):
+            try:
+                wm = BRepBuilderAPI_MakeWire()
+                n = len(uv_pts)
+                for k in range(n):
+                    u0, v0 = uv_pts[k]
+                    u1, v1 = uv_pts[(k + 1) % n]
+                    p0 = gp_Pnt(*(self.plane_origin
+                                  + float(u0) * self.plane_x_axis
+                                  + float(v0) * self.plane_y_axis).tolist())
+                    p1 = gp_Pnt(*(self.plane_origin
+                                  + float(u1) * self.plane_x_axis
+                                  + float(v1) * self.plane_y_axis).tolist())
+                    wm.Add(BRepBuilderAPI_MakeEdge(p0, p1).Edge())
+                if wm.IsDone():
+                    return wm.Wire()
+            except Exception as ex:
+                print(f"[Sketch] build_faces: MakeWire error — {ex}")
+            return None
 
-        # --- Reference entity loops ---
-        for ref in self.entities:
-            if not isinstance(ref, ReferenceEntity):
-                continue
-            if len(ref.points) < 2:
-                continue
-            if np.linalg.norm(ref.points[-1] - ref.points[0]) > tol:
-                continue
+        # ── Collect loops as UV polygons (polyline wires) ─────────────────
 
-            built = False
-            if ref.occ_edges and geom_plane is not None:
-                try:
-                    wm = BRepBuilderAPI_MakeWire()
-                    for occ_edge in ref.occ_edges:
-                        adaptor    = BRepAdaptor_Curve(occ_edge)
-                        u0         = adaptor.FirstParameter()
-                        u1         = adaptor.LastParameter()
-                        proj_curve = GeomProjLib.ProjectOnPlane_s(
-                            adaptor.Curve().Curve(), geom_plane, proj_dir, True)
-                        wm.Add(BRepBuilderAPI_MakeEdge(proj_curve, u0, u1).Edge())
-                    if wm.IsDone():
-                        fm = BRepBuilderAPI_MakeFace(wm.Wire(), True)
-                        if fm.IsDone():
-                            faces.append(Face(fm.Face()))
-                            built = True
-                        else:
-                            print(f"[Sketch] build_faces: MakeFace error {fm.Error()}")
-                    else:
-                        print("[Sketch] build_faces: MakeWire failed")
-                except Exception as ex:
-                    print(f"[Sketch] build_faces: projection failed — {ex}")
+        loop_items = []   # (TopoDS_Wire, uv_pts)
 
-            if not built:
-                pts = [Vector(*(self.plane_origin
-                                + float(p[0]) * self.plane_x_axis
-                                + float(p[1]) * self.plane_y_axis).tolist())
-                       for p in ref.points]
-                if len(pts) >= 3:
-                    try:
-                        fm = BRepBuilderAPI_MakeFace(
-                            Polyline(*pts).wrapped, True)
-                        if fm.IsDone():
-                            faces.append(Face(fm.Face()))
-                            print("[Sketch] build_faces: used polyline fallback")
-                        else:
-                            print(f"[Sketch] build_faces: polyline fallback "
-                                  f"error {fm.Error()}")
-                    except Exception as ex:
-                        print(f"[Sketch] build_faces: polyline fallback — {ex}")
+        uv_loops = self._collect_uv_loops(tol)
+        for uv in uv_loops:
+            w = _uv_to_wire(uv)
+            if w is not None:
+                loop_items.append((w, uv))
 
-        # --- Line segment loops ---
-        segs = self.line_segments()
-        if segs:
-            for loop in _chain_segments(segs, tol=tol):
-                if np.linalg.norm(np.array(loop[-1]) - np.array(loop[0])) > tol:
+        if not loop_items:
+            return [], []
+
+        # Build one face per loop
+        loop_faces = []
+        loop_uvs   = []
+        for wire, uv in loop_items:
+            fm = BRepBuilderAPI_MakeFace(_geom_plane, wire)
+            if fm.IsDone():
+                loop_faces.append(fm.Face())
+                loop_uvs.append(uv)
+            else:
+                print(f"[Sketch] build_faces: MakeFace error {fm.Error()}")
+
+        if not loop_faces:
+            return [], []
+
+        if len(loop_faces) == 1:
+            # Single loop — no splitting needed
+            faces   = [Face(loop_faces[0])]
+            regions = [(loop_uvs[0], [])]
+            return faces, regions
+
+        # ── Splitter: cookie-cutter all loops simultaneously ──────────────
+        splitter = BRepAlgoAPI_Splitter()
+        shape_list = TopTools_ListOfShape()
+        for f in loop_faces:
+            shape_list.Append(f)
+        splitter.SetArguments(shape_list)
+        splitter.SetTools(shape_list)
+        splitter.Build()
+
+        if not splitter.IsDone():
+            print("[Sketch] build_faces: Splitter failed")
+            return [], []
+
+        # ── Extract output faces and per-face UV wire polygons ────────────
+        def _wire_uv_pts(wire):
+            """Vertex list of a wire in sketch UV coordinates."""
+            pts = []
+            we = BRepTools_WireExplorer(wire)
+            while we.More():
+                v = we.CurrentVertex()
+                p = BRep_Tool.Pnt_s(v)
+                world = np.array([p.X(), p.Y(), p.Z()])
+                delta = world - self.plane_origin
+                u = float(np.dot(delta, self.plane_x_axis))
+                v_coord = float(np.dot(delta, self.plane_y_axis))
+                pts.append((u, v_coord))
+                we.Next()
+            return pts
+
+        def _uv_area(uvs):
+            a = 0.0
+            for k in range(len(uvs)):
+                x0, y0 = uvs[k]; x1, y1 = uvs[(k + 1) % len(uvs)]
+                a += x0 * y1 - x1 * y0
+            return abs(a) * 0.5
+
+        faces   = []
+        regions = []
+        exp = TopExp_Explorer(splitter.Shape(), TopAbs_FACE)
+        while exp.More():
+            try:
+                occ_face = TopoDS.Face_s(exp.Current())
+                # Collect all wires on this face
+                wire_uvs = []
+                wexp = TopExp_Explorer(occ_face, TopAbs_WIRE)
+                while wexp.More():
+                    wire = TopoDS.Wire_s(wexp.Current())
+                    uvs = _wire_uv_pts(wire)
+                    if len(uvs) >= 3:
+                        wire_uvs.append(uvs)
+                    wexp.Next()
+                if not wire_uvs:
+                    exp.Next()
                     continue
-                pts = [Vector(*(self.plane_origin
-                                + u * self.plane_x_axis
-                                + v * self.plane_y_axis).tolist())
-                       for u, v in loop]
-                if len(pts) < 3:
-                    continue
-                try:
-                    fm = BRepBuilderAPI_MakeFace(Polyline(*pts).wrapped, True)
-                    if fm.IsDone():
-                        faces.append(Face(fm.Face()))
-                    else:
-                        print(f"[Sketch] build_faces: line loop error {fm.Error()}")
-                except Exception as ex:
-                    print(f"[Sketch] build_faces: line loop failed — {ex}")
+                # Largest wire = outer boundary; rest = holes
+                wire_uvs.sort(key=_uv_area, reverse=True)
+                outer_uvs = wire_uvs[0]
+                hole_uvs  = wire_uvs[1:]
+                faces.append(Face(occ_face))
+                regions.append((outer_uvs, hole_uvs))
+            except Exception as ex:
+                print(f"[Sketch] build_faces: face extraction failed — {ex}")
+            exp.Next()
 
-        return faces
+        return faces, regions
 
 
 # ---------------------------------------------------------------------------

@@ -25,22 +25,67 @@ class OperationsMixin:
 
         If the push inserted into mid-history (diverged entries exist after
         cursor), replay the affected body forward so diverged entries get
-        correct shapes or error flags, then rebuild all meshes.
+        correct shapes or error flags, then rebuild only affected meshes.
 
         If we're at the tip of history (normal append), just rebuild the
         primary body mesh — cheaper and no replay needed.
         """
         if self.history.is_mid_history:
             cursor = self.history.cursor
-            ok, err = self.history.replay_from(cursor)
+            ok, err, mutated = self.history.replay_from(cursor)
             if not ok:
                 print(f"[Cascade] Replay after insert: {err}")
-            self._rebuild_all_meshes()
+            self._rebuild_bodies(mutated or {primary_body_id} if primary_body_id else mutated)
         else:
             if primary_body_id is not None:
                 self._rebuild_body_mesh(primary_body_id)
             else:
                 self._rebuild_all_meshes()
+
+    def _rebuild_bodies(self, body_ids: set):
+        """
+        Rebuild meshes for a specific set of body IDs.
+        Falls back to _rebuild_all_meshes if the set is empty.
+        Tessellates all bodies in parallel, then uploads to GL in one pass.
+        """
+        if not body_ids:
+            self._rebuild_all_meshes()
+            return
+        if len(body_ids) == 1:
+            self._rebuild_body_mesh(next(iter(body_ids)))
+            return
+        # Multiple bodies — tessellate in parallel, upload in one GL context block
+        from viewer.viewport import _tessellate_parallel
+        from viewer.mesh import Mesh
+        from OpenGL.GL import glDeleteBuffers
+        bodies = [
+            (bid, self.workspace.current_shape(bid))
+            for bid in body_ids
+            if self.workspace.current_shape(bid) is not None
+        ]
+        for bid in body_ids:
+            self._body_visible.setdefault(bid, True)
+        new_meshes = _tessellate_parallel(bodies)
+
+        self.makeCurrent()
+        for bid in body_ids:
+            old = self._meshes.get(bid)
+            if old:
+                for buf in (old.vbo_verts, old.vbo_normals, old.vbo_edges, old.ebo):
+                    if buf is not None:
+                        glDeleteBuffers(1, [buf])
+            if bid in new_meshes:
+                new_meshes[bid].upload()
+                self._meshes[bid] = new_meshes[bid]
+            else:
+                self._meshes.pop(bid, None)
+            self.selection.clear_for_body(bid)
+        self._hovered_vertex = (None, None)
+        self._hovered_edge   = (None, None)
+        self.doneCurrent()
+        self._rebuild_sketch_faces()
+        self.selection_changed.emit()
+        self.update()
 
     # ------------------------------------------------------------------
     # Undo / Redo / Seek / Replay
@@ -51,7 +96,7 @@ class OperationsMixin:
         if entry is None:
             print("[Undo] Nothing to undo."); return
         print(f"[Undo] Reverting: {entry.label}")
-        self._rebuild_all_meshes()
+        self._rebuild_body_mesh(entry.body_id)
         self.history_changed.emit()
 
     def _do_redo(self):
@@ -59,7 +104,7 @@ class OperationsMixin:
         if entry is None:
             print("[Redo] Nothing to redo."); return
         print(f"[Redo] Restoring: {entry.label}")
-        self._rebuild_all_meshes()
+        self._rebuild_body_mesh(entry.body_id)
         self.history_changed.emit()
 
     def handle_undo(self):
@@ -90,10 +135,10 @@ class OperationsMixin:
 
     def do_replay(self, from_index: int):
         print(f"[Replay] Replaying from entry {from_index}…")
-        ok, err = self.history.replay_from(from_index)
+        ok, err, mutated = self.history.replay_from(from_index)
         if not ok:
             print(f"[Replay] FAILED: {err}")
-        self._rebuild_all_meshes()
+        self._rebuild_bodies(mutated)
         self.history_changed.emit()
         print("[Replay] Done.")
 
@@ -131,9 +176,11 @@ class OperationsMixin:
         # Replay from the first remaining entry for this body, if any
         remaining = [(i, e) for i, e in enumerate(self.history.entries)
                      if e.body_id == body_id]
+        mutated = {body_id} | set(split_body_ids)
         if remaining:
-            self.history.replay_from(remaining[0][0])
-        self._rebuild_all_meshes()
+            _, _, replay_mutated = self.history.replay_from(remaining[0][0])
+            mutated |= replay_mutated
+        self._rebuild_bodies(mutated)
         self.history_changed.emit()
 
     def do_reorder(self, src: int, dst: int):
@@ -145,13 +192,15 @@ class OperationsMixin:
         # Replay from the earliest affected position for every body touched
         lo = min(src, dst)
         replayed_bodies: set[str] = set()
+        all_mutated: set[str] = set()
         for i, e in enumerate(self.history.entries):
             if i < lo:
                 continue
             if e.body_id not in replayed_bodies:
-                self.history.replay_from(i)
+                _, _, mutated = self.history.replay_from(i)
+                all_mutated |= mutated
                 replayed_bodies.add(e.body_id)
-        self._rebuild_all_meshes()
+        self._rebuild_bodies(all_mutated)
         self.history_changed.emit()
 
     # ------------------------------------------------------------------
@@ -244,14 +293,19 @@ class OperationsMixin:
               f"({len(solids)} solid(s))")
 
         if did_split:
-            # Rebuild all bodies so new split bodies get meshes immediately
             if not self.history.is_mid_history:
-                self._rebuild_all_meshes()
+                # All affected bodies are known — no need for full rebuild
+                split_body_ids = {body_id} | {
+                    e.body_id for e in self.history.entries
+                    if e.operation == "import" and e.params.get("split_from") == body_id
+                }
+                self._rebuild_bodies(split_body_ids)
             else:
-                ok, err = self.history.replay_from(self.history.cursor - len(solids) + 1)
+                ok, err, mutated = self.history.replay_from(
+                    self.history.cursor - len(solids) + 1)
                 if not ok:
                     print(f"[Cascade] {err}")
-                self._rebuild_all_meshes()
+                self._rebuild_bodies(mutated)
         else:
             self._post_push_cascade(body_id)
 
@@ -282,9 +336,17 @@ class OperationsMixin:
         if se is None:
             print("[Extrude] No sketch entry found."); return
 
-        faces = self._sketch_faces.get(history_idx, [])
-        if not faces:
+        all_faces = self._sketch_faces.get(history_idx, [])
+        if not all_faces:
             print("[Extrude] Sketch has no closed loops to extrude."); return
+
+        # If a specific face was clicked, extrude only that one.
+        # Otherwise extrude all faces in the sketch.
+        fidx = self._selected_sketch_face
+        if fidx is not None and 0 <= fidx < len(all_faces):
+            faces = [all_faces[fidx][0]]
+        else:
+            faces = [entry[0] for entry in all_faces]
 
         body_id      = se.body_id
         shape_before = self.workspace.current_shape(body_id)
@@ -362,8 +424,17 @@ class OperationsMixin:
                 shape_after  = shape_after,
             )
 
-        self._post_push_cascade(body_id)
+        if len(solids) > 1:
+            # New bodies were created — rebuild all affected bodies at once
+            affected = {body_id} | {
+                e.body_id for e in self.history.entries
+                if e.operation == "import" and e.params.get("split_from") == body_id
+            }
+            self._rebuild_bodies(affected)
+        else:
+            self._post_push_cascade(body_id)
         self._selected_sketch_entry = None
+        self._selected_sketch_face  = None
         print(f"[Extrude] Sketch → body={self.workspace.bodies[body_id].name} "
               f"distance={distance:+.3f}  OK  ({len(solids)} solid(s))")
         self.history_changed.emit()

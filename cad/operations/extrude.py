@@ -57,11 +57,19 @@ def extrude_face_direct(body_shape, face: Face, distance: float):
         extruded = b3d_extrude(face, amount=abs(distance))
         return Compound(extruded.wrapped)
 
-    return _do_extrude_boolean(body_shape, face, distance)
+    return _do_extrude_boolean(body_shape, face, distance, glue=False)
 
 
-def _do_extrude_boolean(shape, face: Face, distance: float):
-    """Shared boolean logic for both extrude entry points."""
+def _do_extrude_boolean(shape, face: Face, distance: float, glue: bool = True):
+    """
+    Shared boolean logic for both extrude entry points.
+
+    glue=True  — safe only when the tool's base face is the exact same OCCT
+                 face object as an existing face on shape (i.e. extrude_face).
+                 Tells OCCT shapes share a face → skips full intersection scan.
+    glue=False — required for sketch-profile extrudes where the face is
+                 reconstructed geometry, not a face already on shape.
+    """
     extrude_amount = abs(distance)
     if distance < 0:
         extrude_amount = -extrude_amount
@@ -72,12 +80,14 @@ def _do_extrude_boolean(shape, face: Face, distance: float):
         op = BRepAlgoAPI_Fuse()
         op.SetArguments(_to_list(shape.wrapped))
         op.SetTools(_to_list(extruded.wrapped))
-        op.SetGlue(BOPAlgo_GlueEnum.BOPAlgo_GlueShift)
+        if glue:
+            op.SetGlue(BOPAlgo_GlueEnum.BOPAlgo_GlueShift)
     else:
         op = BRepAlgoAPI_Cut()
         op.SetArguments(_to_list(shape.wrapped))
         op.SetTools(_to_list(extruded.wrapped))
 
+    op.SetRunParallel(True)
     op.Build()
 
     if not op.IsDone():

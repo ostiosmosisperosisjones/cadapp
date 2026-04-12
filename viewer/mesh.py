@@ -6,7 +6,6 @@ Vertices are exactly as OCCT/build123d gives them (millimeters).
 The camera fits itself to the scene bounding box instead.
 """
 
-import uuid
 import numpy as np
 from ocp_tessellate.tessellator import tessellate
 from OpenGL.GL import *
@@ -14,9 +13,12 @@ from OpenGL.GL import *
 
 class Mesh:
     def __init__(self, shape):
+        # Use a stable cache key based on the shape's OCCT hash so the
+        # tessellator can reuse cached results for identical shapes (e.g. undo/redo).
+        cache_key = f"mesh_{hash(shape.wrapped)}"
         tess = tessellate(
             shape.wrapped,
-            cache_key=f"mesh_{uuid.uuid4().hex}",
+            cache_key=cache_key,
             deviation=0.01,
             quality=0.01,
             angular_tolerance=0.1,
@@ -143,16 +145,18 @@ def _extract_topo_edges(shape) -> tuple[list[np.ndarray], list]:
     """
     Extract topological edges from a build123d shape via OCCT.
 
+    Uses curvature-adaptive sampling (GCPnts_TangentialDeflection) so straight
+    lines get 2 points and curves get only as many as needed to look smooth.
+
     Returns
     -------
     topo_edges     : list of (N, 3) float32 arrays — discretised polylines
     topo_edges_occ : list of TopoDS_Edge — the raw OCCT edge, parallel to above
     """
-    from OCP.BRep import BRep_Tool
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_EDGE
     from OCP.TopoDS import TopoDS
-    from OCP.GCPnts import GCPnts_UniformAbscissa
+    from OCP.GCPnts import GCPnts_TangentialDeflection
     from OCP.BRepAdaptor import BRepAdaptor_Curve
 
     edges     = []
@@ -168,12 +172,14 @@ def _extract_topo_edges(shape) -> tuple[list[np.ndarray], list]:
             first   = adaptor.FirstParameter()
             last    = adaptor.LastParameter()
 
-            discretiser = GCPnts_UniformAbscissa()
-            discretiser.Initialize(adaptor, 64, first, last, 0.05)
+            # Adaptive: angular deflection 0.2 rad (~11°), chordal 0.05 mm
+            # Straight lines → 2 pts; tight curves → more pts automatically
+            discretiser = GCPnts_TangentialDeflection(adaptor, 0.2, 0.05)
 
             pts = []
-            if discretiser.IsDone() and discretiser.NbPoints() >= 2:
-                for i in range(1, discretiser.NbPoints() + 1):
+            n = discretiser.NbPoints()
+            if n >= 2:
+                for i in range(1, n + 1):
                     p = adaptor.Value(discretiser.Parameter(i))
                     pts.append([p.X(), p.Y(), p.Z()])
             else:

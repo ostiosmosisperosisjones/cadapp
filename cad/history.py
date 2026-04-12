@@ -184,16 +184,23 @@ class History:
         return True
 
     # ------------------------------------------------------------------
-    # Shape lookup helpers (used by plane/edge sources during replay)
+    # Shape lookup (used by plane_ref / edge_ref during replay)
     # ------------------------------------------------------------------
 
     def _shape_for_body_at(self, body_id: str, before_index: int) -> Any | None:
         """
-        Return the most recent shape_after for *body_id* among entries with
-        index < before_index.  During replay entries are updated in-order,
-        so already-replayed entries carry up-to-date values; entries for
-        unreplayed bodies retain their last cached values — both correct.
+        Return the most recent shape for *body_id* up to (not including)
+        *before_index*.
+
+        During an active replay_from() call, _replay_shape_cache is set and
+        contains already-computed shapes for all bodies seen so far — O(1).
+        Outside of replay (e.g. initial plane resolve at sketch creation),
+        fall back to a linear scan of the entry list.
         """
+        cache = getattr(self, '_replay_shape_cache', None)
+        if cache is not None:
+            return cache.get(body_id)
+        # Fallback linear scan (used only outside of replay_from)
         result = None
         for i, entry in enumerate(self._entries):
             if i >= before_index:
@@ -206,28 +213,46 @@ class History:
     # Parametric replay
     # ------------------------------------------------------------------
 
-    def replay_from(self, index: int) -> tuple[bool, str]:
+    def replay_from(self, index: int) -> tuple[bool, str, set[str]]:
         """
         Re-execute all entries from *index* onward for the body targeted by
         entry[index].  Entries for other bodies are skipped.
 
         On failure, the failing entry is marked with error=True/error_msg
         instead of aborting immediately, so the rest of the chain can still
-        be attempted.  Returns (all_ok, first_error_message).
-        """
-        from cad.operations import REGISTRY
+        be attempted.
 
+        Returns (all_ok, first_error_message, mutated_body_ids) where
+        mutated_body_ids is the set of body IDs whose shape_after changed
+        — callers can use this to rebuild only the affected meshes.
+        """
         if index < 0 or index >= len(self._entries):
-            return False, f"Index {index} out of range"
+            return False, f"Index {index} out of range", set()
 
         target_body_id = self._entries[index].body_id
 
-        # Derive starting shape from the live shape_after chain.
-        # Do NOT fall back to entry.shape_before — it can be stale after a
-        # reorder. If there is genuinely no prior shape (e.g. world-plane sketch
-        # body with no import), start with None and let the loop's error paths
-        # handle each entry appropriately.
-        current_shape = self._shape_for_body_at(target_body_id, index)
+        # Build a shape cache from all entries before `index` so we can look up
+        # any body's current shape in O(1) instead of scanning the list each time.
+        shape_cache: dict[str, Any] = {}
+        for e in self._entries[:index]:
+            if e.shape_after is not None:
+                shape_cache[e.body_id] = e.shape_after
+
+        current_shape = shape_cache.get(target_body_id)
+        mutated_bodies: set[str] = set()
+
+        # Expose cache on self so plane_ref/edge_ref resolve() calls are O(1)
+        self._replay_shape_cache = shape_cache
+        try:
+            return self._replay_from_inner(
+                index, target_body_id, current_shape,
+                shape_cache, mutated_bodies)
+        finally:
+            self._replay_shape_cache = None
+
+    def _replay_from_inner(self, index, target_body_id, current_shape,
+                           shape_cache, mutated_bodies):
+        from cad.operations import REGISTRY
 
         first_error  = ""
         chain_broken = False   # once True, all subsequent ops for this body cascade-error
@@ -254,6 +279,7 @@ class History:
             # ---- import ---------------------------------------------------
             if entry.operation == "import":
                 current_shape = entry.shape_after
+                shape_cache[entry.body_id] = entry.shape_after
                 continue
 
             # ---- sketch (geometry no-op, but re-project references) -------
@@ -284,11 +310,14 @@ class History:
                     chain_broken = True
                     if not first_error:
                         first_error = err
+                    mutated_bodies.add(entry.body_id)
                 else:
                     entry.shape_before = current_shape
                     entry.shape_after  = new_shape
                     current_shape      = new_shape
+                    shape_cache[entry.body_id] = new_shape
                     entry.label        = _make_label(entry.operation, entry.params)
+                    mutated_bodies.add(entry.body_id)
                 continue
 
             # ---- direct face extrude / cut --------------------------------
@@ -318,6 +347,7 @@ class History:
                 _null_split_dependents(self._entries, i)
                 chain_broken = True
                 if not first_error: first_error = err
+                mutated_bodies.add(entry.body_id)
                 continue
 
             face_idx, _ = entry.face_ref.find_in(current_shape)
@@ -330,6 +360,7 @@ class History:
                 _null_split_dependents(self._entries, i)
                 chain_broken = True
                 if not first_error: first_error = err
+                mutated_bodies.add(entry.body_id)
                 continue
 
             shape_before = current_shape
@@ -342,12 +373,15 @@ class History:
                 _null_split_dependents(self._entries, i)
                 chain_broken = True
                 if not first_error: first_error = err
+                mutated_bodies.add(entry.body_id)
                 continue
 
             entry.shape_before = shape_before
             entry.shape_after  = new_shape
             current_shape      = new_shape
+            shape_cache[entry.body_id] = new_shape
             entry.label        = _make_label(entry.operation, entry.params)
+            mutated_bodies.add(entry.body_id)
 
             # Propagate / nullify split-body shapes.
             # Always scan — if the op no longer produces a split, orphaned
@@ -360,11 +394,12 @@ class History:
                     solid_idx = e.params.get("solid_index", 1)
                     if solid_idx < len(new_solids):
                         e.shape_after = new_solids[solid_idx]
+                        mutated_bodies.add(e.body_id)
                     else:
-                        # Split no longer produces this piece — nullify it
                         e.shape_after = None
+                        mutated_bodies.add(e.body_id)
 
-        return (not first_error), first_error
+        return (not first_error), first_error, mutated_bodies
 
     # ------------------------------------------------------------------
     # Queries
@@ -471,7 +506,7 @@ def _replay_sketch_extrude(entry, entry_index: int, current_shape,
         return False, None, (
             f"sketch extrude: no sketch_entry at history index {sketch_idx}")
 
-    faces = se.build_faces()
+    faces, _ = se.build_faces()
     if not faces:
         return False, None, "sketch extrude: sketch has no closed loops"
 
