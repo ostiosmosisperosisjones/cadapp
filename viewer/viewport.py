@@ -65,6 +65,11 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
 
         self.camera_projection_changed = None
         self.request_extrude_distance  = None
+        self._extrude_panel        = None
+        self._extrude_pick_active  = False
+        self._extrude_vtx_active   = False
+        self._extrude_preview_mesh = None   # list of build123d solids | None
+        self._extrude_preview_dist = 0.0
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
@@ -224,6 +229,7 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
     def resizeGL(self, w, h):
         glViewport(0, 0, w, h)
         self._set_projection(w, h)
+        self._position_extrude_panel()
 
     def paintGL(self):
         self._set_projection(self.width(), self.height())
@@ -264,6 +270,7 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
                            active_sketch=self._sketch)
 
         self._draw_sketch_faces()
+        self._draw_extrude_preview()
 
         draw_overlays(visible, self.selection,
                       self._hovered_vertex, self._hovered_edge,
@@ -362,6 +369,15 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
                 super().keyPressEvent(e)
             return
 
+        if e.key() == Qt.Key.Key_Escape:
+            if getattr(self, '_extrude_pick_active', False):
+                panel = getattr(self, '_extrude_panel', None)
+                if panel:
+                    panel._end_pick_edge()
+                return
+            if getattr(self, '_extrude_panel', None) is not None:
+                self._close_extrude_panel()
+                return
         if prefs.matches("undo", e):
             self._do_undo()
         elif prefs.matches("redo", e):
@@ -466,6 +482,9 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
             hov_ebody, hov_eidx = self._hovered_edge
 
             if hov_body is not None:
+                # Route to extrude panel pick-vertex mode if active
+                if self.route_vertex_pick_for_extrude(hov_body, hov_idx):
+                    return
                 self.selection.select_vertex(hov_body, hov_idx,
                                              additive=additive)
                 self.workspace.set_active_body(hov_body)
@@ -488,6 +507,9 @@ class Viewport(SketchPickMixin, SketchModalMixin, OperationsMixin, QOpenGLWidget
                         print(f"Picked sketch edge | entry {history_idx} "
                               f"entity {entity_idx}")
                 else:
+                    # Route to extrude panel pick-edge mode if active
+                    if self.route_edge_pick_for_extrude(hov_eidx, hov_ebody):
+                        return
                     self.selection.select_edge(hov_ebody, hov_eidx,
                                                additive=additive)
                     self.workspace.set_active_body(hov_ebody)

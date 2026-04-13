@@ -253,6 +253,89 @@ class SketchPickMixin:
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_LIGHTING)
 
+    def _draw_extrude_preview(self):
+        """
+        Draw semi-transparent extrude preview solids.
+        Blue for positive (add), red for negative (cut).
+        """
+        solids = getattr(self, '_extrude_preview_mesh', None)
+        if not solids:
+            return
+
+        dist = getattr(self, '_extrude_preview_dist', 0.0)
+        is_cut = dist < 0
+
+        from OCP.BRep import BRep_Tool
+        from OCP.BRepMesh import BRepMesh_IncrementalMesh
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
+        from OCP.TopoDS import TopoDS
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GCPnts import GCPnts_UniformAbscissa
+
+        glDisable(GL_LIGHTING)
+        glEnable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        if is_cut:
+            fill_color   = (0.75, 0.18, 0.18, 0.28)
+            edge_color   = (1.00, 0.35, 0.35, 0.75)
+        else:
+            fill_color   = (0.22, 0.55, 0.85, 0.22)
+            edge_color   = (0.48, 0.75, 1.00, 0.80)
+
+        for solid in solids:
+            try:
+                wrapped = solid.wrapped
+                BRepMesh_IncrementalMesh(wrapped, 0.15)
+
+                # Filled triangles
+                glColor4f(*fill_color)
+                exp = TopExp_Explorer(wrapped, TopAbs_FACE)
+                while exp.More():
+                    face = TopoDS.Face_s(exp.Current())
+                    loc  = face.Location()
+                    tri  = BRep_Tool.Triangulation_s(face, loc)
+                    if tri is not None:
+                        glBegin(GL_TRIANGLES)
+                        for i in range(1, tri.NbTriangles() + 1):
+                            n1, n2, n3 = tri.Triangle(i).Get()
+                            for ni in (n1, n2, n3):
+                                p = tri.Node(ni)
+                                glVertex3f(p.X(), p.Y(), p.Z())
+                        glEnd()
+                    exp.Next()
+
+                # Edges
+                glColor4f(*edge_color)
+                glLineWidth(1.4)
+                exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
+                while exp2.More():
+                    edge = exp2.Current()
+                    try:
+                        adaptor = BRepAdaptor_Curve(edge)
+                        disc    = GCPnts_UniformAbscissa()
+                        disc.Initialize(adaptor, 24)
+                        if disc.IsDone() and disc.NbPoints() >= 2:
+                            glBegin(GL_LINE_STRIP)
+                            for pi in range(1, disc.NbPoints() + 1):
+                                p = adaptor.Value(disc.Parameter(pi))
+                                glVertex3f(p.X(), p.Y(), p.Z())
+                            glEnd()
+                    except Exception:
+                        pass
+                    exp2.Next()
+                glLineWidth(1.0)
+
+            except Exception as ex:
+                print(f"[Preview] draw error: {ex}")
+
+        glDisable(GL_BLEND)
+        glEnable(GL_CULL_FACE)
+        glEnable(GL_LIGHTING)
+
     # ------------------------------------------------------------------
     # Screen-space snap radius
     # ------------------------------------------------------------------

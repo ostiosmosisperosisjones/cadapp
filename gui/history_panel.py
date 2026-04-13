@@ -139,6 +139,7 @@ class _EditDialog(QDialog):
 
 class _EntryWidget(QFrame):
     sketch_vis_toggled = pyqtSignal(int)   # emits entry index
+    double_clicked     = pyqtSignal(int)   # emits entry index
 
     def __init__(self, entry: HistoryEntry, index: int,
                  is_current: bool, is_future: bool,
@@ -242,6 +243,10 @@ class _EntryWidget(QFrame):
             row.addWidget(eye_btn)
 
         outer.addLayout(row)
+
+    def mouseDoubleClickEvent(self, event):
+        self.double_clicked.emit(self._index)
+        event.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +362,7 @@ class HistoryPanel(QWidget):
     replay_requested         = pyqtSignal(int)
     sketch_vis_changed       = pyqtSignal()
     reenter_sketch_requested = pyqtSignal(int)
+    reopen_extrude_requested = pyqtSignal(int)
     delete_requested         = pyqtSignal(int)
     reorder_requested        = pyqtSignal(int, int)
 
@@ -470,6 +476,7 @@ class HistoryPanel(QWidget):
                 is_hidden_body   = is_hidden_body,
             )
             w.sketch_vis_toggled.connect(self._on_sketch_vis_toggled)
+            w.double_clicked.connect(self._on_item_double_clicked_idx)
 
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, i)  # store real history index
@@ -491,7 +498,9 @@ class HistoryPanel(QWidget):
         self.seek_requested.emit(self._item_index(item))
 
     def _on_item_double_clicked(self, item: QListWidgetItem):
-        index = self._item_index(item)
+        self._on_item_double_clicked_idx(self._item_index(item))
+
+    def _on_item_double_clicked_idx(self, index: int):
         entries = self._history.entries
         if index >= len(entries):
             return
@@ -504,6 +513,16 @@ class HistoryPanel(QWidget):
                 return
             self.seek_requested.emit(index)
             self.reenter_sketch_requested.emit(index)
+            return
+
+        # Extrude/cut: de-compute and reopen the ExtrudePanel with preserved values
+        if entry.operation in ("extrude", "cut"):
+            if index > self._history.cursor:
+                QMessageBox.information(
+                    self, "Can't edit future entry",
+                    "Single-click to seek here first, then double-click to edit.")
+                return
+            self.reopen_extrude_requested.emit(index)
             return
 
         if entry.operation not in EDIT_SCHEMA:

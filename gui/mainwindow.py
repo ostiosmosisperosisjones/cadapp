@@ -219,7 +219,7 @@ class MainWindow(QMainWindow):
         vp.fit_camera_to_scene()
         vp.camera_projection_changed = self._sync_proj_menu
         self._sync_proj_menu(vp.camera.ortho)
-        vp.request_extrude_distance  = self._show_extrude_dialog
+        # request_extrude_distance left as None — panel handles direct face extrudes too
 
         sidebar = Sidebar(workspace, history)
         sidebar.seek_requested.connect(vp.seek_history)
@@ -233,6 +233,7 @@ class MainWindow(QMainWindow):
             sidebar.history_panel.set_selected_body)
         sidebar.history_panel.sketch_vis_changed.connect(vp.update)
         sidebar.history_panel.reenter_sketch_requested.connect(vp._reenter_sketch)
+        sidebar.history_panel.reopen_extrude_requested.connect(vp.reopen_extrude)
         sidebar.history_panel.delete_requested.connect(vp.do_delete)
         sidebar.history_panel.reorder_requested.connect(vp.do_reorder)
         sidebar.plane_visibility_changed.connect(vp.set_world_plane_visible)

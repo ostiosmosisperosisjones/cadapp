@@ -105,6 +105,16 @@ class SketchModalMixin:
         self.update()
         print("[Sketch] Exited sketch mode.")
 
+    def _complete_sketch_delete(self, editing_idx: int):
+        """Delete a sketch entry (and cascade) when re-edited to empty."""
+        self._sketch = None
+        self._editing_sketch_history_idx = None
+        self.sketch_mode_changed.emit(False)
+        self.do_delete(editing_idx)
+        self._rebuild_sketch_faces()
+        self.update()
+        print(f"[Sketch] Deleted empty sketch entry {editing_idx}.")
+
     def _complete_sketch(self):
         if self._sketch is None:
             return
@@ -112,13 +122,17 @@ class SketchModalMixin:
         from cad.sketch import LineEntity, ReferenceEntity, SketchEntry
         lines = [e for e in sketch.entities if isinstance(e, LineEntity)]
         refs  = [e for e in sketch.entities if isinstance(e, ReferenceEntity)]
+        editing_idx = self._editing_sketch_history_idx
         if not lines and not refs:
-            print("[Sketch] Nothing to commit — draw lines or include geometry first.")
+            if editing_idx is not None:
+                # Empty sketch on re-edit — delete the entry and cascade
+                self._complete_sketch_delete(editing_idx)
+            else:
+                print("[Sketch] Nothing to commit — draw lines or include geometry first.")
             return
         entity_count = len(lines) + len(refs)
         new_se = SketchEntry.from_sketch_mode(sketch)
 
-        editing_idx = self._editing_sketch_history_idx
         if editing_idx is not None:
             entries = self.history.entries
             if editing_idx < len(entries):

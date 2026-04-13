@@ -436,6 +436,19 @@ class SketchEntry:
                     uv_loops.append(open_loop)
         return uv_loops
 
+    def _collect_uv_loops_drawn(self, tol: float = 1e-3):
+        """Collect closed UV polygon loops from drawn LineEntity segments only."""
+        uv_loops = []
+        segs = self.line_segments()
+        if segs:
+            for loop in _chain_segments(segs, tol=tol):
+                if np.linalg.norm(np.array(loop[-1]) - np.array(loop[0])) > tol:
+                    continue
+                open_loop = [(float(u), float(v)) for u, v in loop[:-1]]
+                if len(open_loop) >= 3:
+                    uv_loops.append(open_loop)
+        return uv_loops
+
     def build_wire(self, tol: float = 1e-3):
         """Convert LineEntity segments into a build123d Wire (for DXF export etc.)."""
         from build123d import Polyline, Vector, Compound
@@ -514,29 +527,126 @@ class SketchEntry:
                 print(f"[Sketch] build_faces: MakeWire error — {ex}")
             return None
 
-        # ── Collect loops as UV polygons (polyline wires) ─────────────────
+        def _project_edge_to_plane(edge):
+            """
+            Re-create an edge whose 3-D curve is projected onto the sketch plane.
+            Handles circles/arcs exactly; falls back to None for other curve types.
+            """
+            from OCP.BRepAdaptor import BRepAdaptor_Curve as _BAC2
+            from OCP.GeomAbs import GeomAbs_Circle, GeomAbs_Line
+            from OCP.Geom import Geom_Circle as _GCircle
+            from OCP.gp import gp_Ax2 as _gAx2
+            adp = _BAC2(edge)
+            if adp.GetType() == GeomAbs_Circle:
+                circ = adp.Circle()
+                # Project centre onto sketch plane
+                c3d = circ.Location()
+                cw  = np.array([c3d.X(), c3d.Y(), c3d.Z()])
+                delta = cw - self.plane_origin
+                cu   = float(np.dot(delta, self.plane_x_axis))
+                cv   = float(np.dot(delta, self.plane_y_axis))
+                c_on_plane = (self.plane_origin
+                              + cu * self.plane_x_axis
+                              + cv * self.plane_y_axis)
+                ax2 = _gAx2(
+                    gp_Pnt(*c_on_plane.tolist()),
+                    gp_Dir(float(self.plane_normal[0]),
+                           float(self.plane_normal[1]),
+                           float(self.plane_normal[2])),
+                    gp_Dir(float(self.plane_x_axis[0]),
+                           float(self.plane_x_axis[1]),
+                           float(self.plane_x_axis[2])),
+                )
+                new_circ = _GCircle(ax2, circ.Radius())
+                u1, u2 = adp.FirstParameter(), adp.LastParameter()
+                if abs(u2 - u1 - 2 * np.pi) < 1e-9:
+                    return BRepBuilderAPI_MakeEdge(new_circ).Edge()
+                else:
+                    return BRepBuilderAPI_MakeEdge(new_circ, u1, u2).Edge()
+            return None  # unsupported type — caller falls back to polyline
 
-        loop_items = []   # (TopoDS_Wire, uv_pts)
+        def _occ_edges_to_face(occ_edges, uv_fallback):
+            """
+            Build a planar face from exact OCCT edges projected onto the sketch plane.
+            Falls back to polyline wire if anything goes wrong.
+            """
+            try:
+                wm = BRepBuilderAPI_MakeWire()
+                all_projected = True
+                for edge in occ_edges:
+                    projected = _project_edge_to_plane(edge)
+                    if projected is None:
+                        all_projected = False
+                        break
+                    wm.Add(projected)
+                if not all_projected or not wm.IsDone():
+                    raise RuntimeError(f"projection/wire failed")
+                wire = wm.Wire()
+                fm = BRepBuilderAPI_MakeFace(_geom_plane, wire)
+                if fm.IsDone():
+                    return fm.Face()
+                raise RuntimeError(f"MakeFace failed: {fm.Error()}")
+            except Exception as ex:
+                print(f"[Sketch] build_faces: occ_edges face error — {ex}")
+            # Fallback to polyline wire
+            w = _uv_to_wire(uv_fallback)
+            if w is None:
+                return None
+            fm = BRepBuilderAPI_MakeFace(_geom_plane, w)
+            return fm.Face() if fm.IsDone() else None
 
-        uv_loops = self._collect_uv_loops(tol)
-        for uv in uv_loops:
-            w = _uv_to_wire(uv)
-            if w is not None:
-                loop_items.append((w, uv))
+        # ── Collect loops: exact edges for ReferenceEntity, polylines for drawn segments ──
 
-        if not loop_items:
-            return [], []
-
-        # Build one face per loop
         loop_faces = []
         loop_uvs   = []
-        for wire, uv in loop_items:
-            fm = BRepBuilderAPI_MakeFace(_geom_plane, wire)
-            if fm.IsDone():
-                loop_faces.append(fm.Face())
-                loop_uvs.append(uv)
-            else:
-                print(f"[Sketch] build_faces: MakeFace error {fm.Error()}")
+
+        for ref in self.entities:
+            if not isinstance(ref, ReferenceEntity) or len(ref.points) < 3:
+                continue
+            pts_close = np.linalg.norm(ref.points[-1] - ref.points[0]) < tol
+            edge_closed = False
+            if not pts_close and ref.occ_edges:
+                try:
+                    from OCP.BRepAdaptor import BRepAdaptor_Curve as _BAC
+                    for _e in ref.occ_edges:
+                        _a = _BAC(_e)
+                        if _a.IsClosed() or _a.IsPeriodic():
+                            edge_closed = True
+                            break
+                except Exception:
+                    pass
+            if not pts_close and not edge_closed:
+                continue
+            raw = ref.points[:-1] if pts_close else ref.points
+            uv = [(float(p[0]), float(p[1])) for p in raw]
+            if len(uv) < 3:
+                continue
+            valid_occ_edges = [e for e in (ref.occ_edges or []) if e is not None]
+            if valid_occ_edges:
+                f = _occ_edges_to_face(valid_occ_edges, uv)
+                if f is not None:
+                    loop_faces.append(f)
+                    loop_uvs.append(uv)
+                    continue
+            # Fallback: polyline wire
+            w = _uv_to_wire(uv)
+            if w is not None:
+                fm = BRepBuilderAPI_MakeFace(_geom_plane, w)
+                if fm.IsDone():
+                    loop_faces.append(fm.Face())
+                    loop_uvs.append(uv)
+                else:
+                    print(f"[Sketch] build_faces: MakeFace error {fm.Error()}")
+
+        for uv in self._collect_uv_loops_drawn(tol):
+            w = _uv_to_wire(uv)
+            if w is not None:
+                fm = BRepBuilderAPI_MakeFace(_geom_plane, w)
+                if fm.IsDone():
+                    loop_faces.append(fm.Face())
+                    loop_uvs.append(uv)
+                else:
+                    print(f"[Sketch] build_faces: MakeFace error {fm.Error()}")
 
         if not loop_faces:
             return [], []
@@ -562,17 +672,28 @@ class SketchEntry:
 
         # ── Extract output faces and per-face UV wire polygons ────────────
         def _wire_uv_pts(wire):
-            """Vertex list of a wire in sketch UV coordinates."""
+            """Sample UV points along a wire (handles polyline and curved edges)."""
+            from OCP.BRepAdaptor import BRepAdaptor_Curve as _BAC2
+            from OCP.GCPnts import GCPnts_QuasiUniformAbscissa
+            from OCP.TopExp import TopExp_Explorer as _TExp
+            from OCP.TopAbs import TopAbs_EDGE as _EDGE
+            from OCP.TopoDS import TopoDS as _TDS
             pts = []
             we = BRepTools_WireExplorer(wire)
             while we.More():
-                v = we.CurrentVertex()
-                p = BRep_Tool.Pnt_s(v)
-                world = np.array([p.X(), p.Y(), p.Z()])
-                delta = world - self.plane_origin
-                u = float(np.dot(delta, self.plane_x_axis))
-                v_coord = float(np.dot(delta, self.plane_y_axis))
-                pts.append((u, v_coord))
+                edge = we.Current()
+                adp = _BAC2(edge)
+                # 32 points per edge is plenty for area comparison; skip last to avoid dup
+                sampler = GCPnts_QuasiUniformAbscissa()
+                sampler.Initialize(adp, 33)
+                npts = sampler.NbPoints()
+                for j in range(1, npts):
+                    p3d = adp.Value(sampler.Parameter(j))
+                    world = np.array([p3d.X(), p3d.Y(), p3d.Z()])
+                    delta = world - self.plane_origin
+                    u = float(np.dot(delta, self.plane_x_axis))
+                    v_coord = float(np.dot(delta, self.plane_y_axis))
+                    pts.append((u, v_coord))
                 we.Next()
             return pts
 

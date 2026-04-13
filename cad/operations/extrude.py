@@ -2,14 +2,17 @@
 cad/operations/extrude.py
 """
 
+import numpy as np
 from build123d import extrude, Plane, Face, Compound
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut
 from OCP.BOPAlgo import BOPAlgo_GlueEnum
 
 
-def extrude_face(shape, face_idx: int, distance: float):
+def extrude_face(shape, face_idx: int, distance: float,
+                 direction: np.ndarray | None = None):
     """
-    Extrude a planar face of *shape* by *distance* along its normal.
+    Extrude a planar face of *shape* by *distance* along its normal
+    (or along *direction* if given).
 
     Positive distance  → extrude outward, fuse  (adds material).
     Negative distance  → extrude inward,  cut   (removes material).
@@ -28,10 +31,11 @@ def extrude_face(shape, face_idx: int, distance: float):
     if distance == 0:
         return shape
 
-    return _do_extrude_boolean(shape, face, distance)
+    return _do_extrude_boolean(shape, face, distance, direction=direction)
 
 
-def extrude_face_direct(body_shape, face: Face, distance: float):
+def extrude_face_direct(body_shape, face: Face, distance: float,
+                        direction: np.ndarray | None = None):
     """
     Extrude a face object directly (not looked up by index).
 
@@ -52,15 +56,32 @@ def extrude_face_direct(body_shape, face: Face, distance: float):
     Plane(face)  # raises if not planar
 
     if body_shape is None:
-        # No existing solid — pure extrusion, no boolean needed
-        from build123d import extrude as b3d_extrude
-        extruded = b3d_extrude(face, amount=abs(distance))
+        extruded = _do_extrude_solid(face, distance, direction)
         return Compound(extruded.wrapped)
 
-    return _do_extrude_boolean(body_shape, face, distance, glue=False)
+    return _do_extrude_boolean(body_shape, face, distance, glue=False,
+                               direction=direction)
 
 
-def _do_extrude_boolean(shape, face: Face, distance: float, glue: bool = True):
+def _do_extrude_solid(face: Face, distance: float,
+                      direction: np.ndarray | None = None):
+    """Produce the raw extruded solid (no boolean)."""
+    from build123d import extrude as b3d_extrude, Vector
+    if direction is not None:
+        # direction is a unit vector; scale by signed distance so the solid
+        # extends in the correct direction and by the correct amount.
+        d = direction / np.linalg.norm(direction)
+        vec = Vector(float(d[0] * distance),
+                     float(d[1] * distance),
+                     float(d[2] * distance))
+        return b3d_extrude(face, amount=abs(distance), dir=vec)
+    # No custom direction — negative amount extrudes inward (into the body).
+    return b3d_extrude(face, amount=distance)
+
+
+def _do_extrude_boolean(shape, face: Face, distance: float,
+                        glue: bool = True,
+                        direction: np.ndarray | None = None):
     """
     Shared boolean logic for both extrude entry points.
 
@@ -70,11 +91,7 @@ def _do_extrude_boolean(shape, face: Face, distance: float, glue: bool = True):
     glue=False — required for sketch-profile extrudes where the face is
                  reconstructed geometry, not a face already on shape.
     """
-    extrude_amount = abs(distance)
-    if distance < 0:
-        extrude_amount = -extrude_amount
-
-    extruded = extrude(face, amount=extrude_amount)
+    extruded = _do_extrude_solid(face, distance, direction)
 
     if distance > 0:
         op = BRepAlgoAPI_Fuse()

@@ -506,9 +506,17 @@ def _replay_sketch_extrude(entry, entry_index: int, current_shape,
         return False, None, (
             f"sketch extrude: no sketch_entry at history index {sketch_idx}")
 
-    faces, _ = se.build_faces()
-    if not faces:
+    all_faces, _ = se.build_faces()
+    if not all_faces:
         return False, None, "sketch extrude: sketch has no closed loops"
+
+    face_indices = entry.params.get("face_indices")
+    if face_indices is not None:
+        faces = [all_faces[i] for i in face_indices if i < len(all_faces)]
+        if not faces:
+            return False, None, "sketch extrude: stored face indices out of range"
+    else:
+        faces = all_faces  # legacy: no index stored, extrude all
 
     distance = entry.params.get("distance", 0)
     if entry.operation == "cut":
