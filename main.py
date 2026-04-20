@@ -90,6 +90,14 @@ def apply_dark_palette(app: QApplication):
 
 
 def main():
+    from PyQt6.QtGui import QSurfaceFormat
+    fmt = QSurfaceFormat()
+    fmt.setDepthBufferSize(24)
+    fmt.setRedBufferSize(8)
+    fmt.setGreenBufferSize(8)
+    fmt.setBlueBufferSize(8)
+    QSurfaceFormat.setDefaultFormat(fmt)
+
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
