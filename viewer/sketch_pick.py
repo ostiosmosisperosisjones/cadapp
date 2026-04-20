@@ -1,0 +1,375 @@
+"""
+viewer/sketch_pick.py
+
+SketchPickMixin — manages pickable/renderable sketch faces.
+
+Owns:
+  _rebuild_sketch_faces()  — called after any history mutation
+  _pick_sketch_face()      — ray-tests committed sketch faces
+  _draw_sketch_faces()     — renders semi-transparent filled polygons
+  _snap_radius_mm()        — converts screen pixels → world mm for snap
+
+Expects self to have: history, _sketch_faces, _sketch,
+_selected_sketch_entry, camera, _modelview, _projection, _viewport,
+devicePixelRatio(), width(), height()
+"""
+
+from __future__ import annotations
+import numpy as np
+from OpenGL.GL import *
+
+
+class SketchPickMixin:
+
+    # ------------------------------------------------------------------
+    # Rebuild
+    # ------------------------------------------------------------------
+
+    def _rebuild_sketch_faces(self):
+        """
+        Rebuild pickable/renderable faces from all committed sketch entries
+        up to the current history cursor.  Called after any history mutation.
+        """
+        self._sketch_faces.clear()
+        cursor = self.history.cursor
+        for i, entry in enumerate(self.history.entries):
+            if i > cursor:
+                break
+            if entry.operation != "sketch":
+                continue
+            se = entry.params.get("sketch_entry")
+            if se is None or not se.visible:
+                continue
+            try:
+                segs             = se.line_segments()
+                loops            = se.closed_loops()
+                faces, regions   = se.build_faces()
+                print(f"[Sketch] Entry {i}: {len(segs)} segments, "
+                      f"{len(loops)} closed loops, {len(faces)} faces built")
+                if faces:
+                    # Store as list of (face, outer_uvs, hole_uvs_list)
+                    self._sketch_faces[i] = [
+                        (face, reg[0], reg[1])
+                        for face, reg in zip(faces, regions)
+                    ]
+            except Exception as ex:
+                print(f"[Sketch] Could not build faces for entry {i}: {ex}")
+
+    # ------------------------------------------------------------------
+    # Pick
+    # ------------------------------------------------------------------
+
+    def _pick_sketch_face(self, ray_origin: np.ndarray, ray_dir: np.ndarray
+                          ) -> tuple[int | None, int | None]:
+        """
+        Ray-test all committed sketch faces.
+        Returns (history_index, face_index_within_entry) or (None, None).
+
+        Among all hit faces, prefer the one with the smallest area — this
+        ensures that nested faces (which are geometrically disjoint rings/
+        regions) resolve to the innermost region under the cursor rather
+        than a larger outer face that shares the same ray-parameter t.
+        """
+        from OCP.BRepIntCurveSurface import BRepIntCurveSurface_Inter
+        from OCP.gp import gp_Lin, gp_Pnt, gp_Dir
+
+        d = ray_dir
+        o = ray_origin
+        try:
+            line = gp_Lin(
+                gp_Pnt(float(o[0]), float(o[1]), float(o[2])),
+                gp_Dir(float(d[0]), float(d[1]), float(d[2])),
+            )
+        except Exception:
+            return None, None
+
+        # Collect all ray hits with their UV intersection point
+        from cad.sketch import _uv_point_in_loop
+
+        hits = []   # (t, hidx, fidx, outer_uvs, hole_uvs_list)
+        for hidx, face_list in self._sketch_faces.items():
+            for fidx, (face, outer_uvs, hole_uvs) in enumerate(face_list):
+                try:
+                    inter = BRepIntCurveSurface_Inter()
+                    inter.Init(face.wrapped, line, 1e-6)
+                    while inter.More():
+                        t = inter.W()
+                        if t > 0:
+                            hits.append((t, hidx, fidx, outer_uvs, hole_uvs))
+                        inter.Next()
+                except Exception:
+                    pass
+
+        if not hits:
+            return None, None
+
+        # All sketch faces are coplanar — t-distance is meaningless for
+        # disambiguation.  Project the closest hit point to UV and find
+        # the face whose region (outer polygon minus holes) contains it.
+        best_t    = min(h[0] for h in hits)
+        hit_world = np.array([o[0], o[1], o[2]]) + best_t * np.array([d[0], d[1], d[2]])
+
+        # Collect UV point once per entry (all faces in an entry share the plane)
+        se_cache = {}
+        uv_cache = {}  # hidx -> uv_pt
+
+        best_hidx = None
+        best_fidx = None
+        best_area = np.inf
+
+        for t, hidx, fidx, outer_uvs, hole_uvs in hits:
+            if hidx not in uv_cache:
+                try:
+                    se = self.history.entries[hidx].params.get("sketch_entry")
+                    if se is not None:
+                        delta = hit_world - se.plane_origin
+                        uv_cache[hidx] = (float(np.dot(delta, se.plane_x_axis)),
+                                          float(np.dot(delta, se.plane_y_axis)))
+                except Exception:
+                    pass
+
+            uv_pt = uv_cache.get(hidx)
+            if uv_pt is None:
+                continue
+
+            # Must be inside outer polygon and outside all hole polygons
+            if not _uv_point_in_loop(uv_pt, outer_uvs):
+                continue
+            if any(_uv_point_in_loop(uv_pt, h) for h in hole_uvs):
+                continue
+
+            def _uv_area(uvs):
+                a = 0.0
+                for k in range(len(uvs)):
+                    x0,y0=uvs[k]; x1,y1=uvs[(k+1)%len(uvs)]
+                    a += x0*y1 - x1*y0
+                return abs(a)*0.5
+
+            area = _uv_area(outer_uvs)
+            if area < best_area:
+                best_area = area
+                best_hidx = hidx
+                best_fidx = fidx
+
+        # Fallback: if UV test excluded everything, pick closest hit
+        if best_hidx is None and hits:
+            _, best_hidx, best_fidx, _, _ = min(hits, key=lambda h: h[0])
+
+        return best_hidx, best_fidx
+
+    # ------------------------------------------------------------------
+    # Draw
+    # ------------------------------------------------------------------
+
+    def _draw_sketch_faces(self):
+        """
+        Draw committed sketch faces as semi-transparent filled polygons
+        with boundary outlines.  Selected entry is drawn more opaque.
+        """
+        if not self._sketch_faces:
+            return
+
+        from OCP.BRep import BRep_Tool
+        from OCP.BRepMesh import BRepMesh_IncrementalMesh
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_EDGE
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GCPnts import GCPnts_UniformAbscissa
+
+        glDisable(GL_LIGHTING)
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)   # draw both sides
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        # Build a flat draw list sorted largest→smallest so inner faces
+        # paint on top and alpha doesn't compound across nested regions.
+        def _uv_area(uvs):
+            a = 0.0
+            for k in range(len(uvs)):
+                x0, y0 = uvs[k]; x1, y1 = uvs[(k+1) % len(uvs)]
+                a += x0 * y1 - x1 * y0
+            return abs(a) * 0.5
+
+        draw_list = []
+        for hidx, face_list in self._sketch_faces.items():
+            for fidx, (face, outer_uvs, hole_uvs) in enumerate(face_list):
+                draw_list.append((hidx, fidx, face, _uv_area(outer_uvs)))
+        draw_list.sort(key=lambda x: x[3], reverse=True)
+
+        for hidx, fidx, face, _ in draw_list:
+            entry_selected = (hidx == self._selected_sketch_entry)
+            is_selected = entry_selected and (
+                self._selected_sketch_face is None or
+                fidx == self._selected_sketch_face
+            )
+            try:
+                BRepMesh_IncrementalMesh(face.wrapped, 0.1)
+                location = face.wrapped.Location()
+                facing   = BRep_Tool.Triangulation_s(face.wrapped, location)
+                if facing is None:
+                    continue
+
+                glColor4f(0.29, 0.43, 0.54, 0.45 if is_selected else 0.20)
+                glBegin(GL_TRIANGLES)
+                for tri_idx in range(1, facing.NbTriangles() + 1):
+                    tri = facing.Triangle(tri_idx)
+                    n1, n2, n3 = tri.Get()
+                    for ni in (n1, n2, n3):
+                        node = facing.Node(ni)
+                        glVertex3f(node.X(), node.Y(), node.Z())
+                glEnd()
+
+                if is_selected:
+                    glColor4f(0.48, 0.70, 0.84, 0.90)
+                    glLineWidth(1.8)
+                else:
+                    glColor4f(0.29, 0.43, 0.54, 0.50)
+                    glLineWidth(1.2)
+
+                exp = TopExp_Explorer(face.wrapped, TopAbs_EDGE)
+                while exp.More():
+                    edge = exp.Current()
+                    try:
+                        adaptor = BRepAdaptor_Curve(edge)
+                        disc    = GCPnts_UniformAbscissa()
+                        disc.Initialize(adaptor, 32)
+                        if disc.IsDone() and disc.NbPoints() >= 2:
+                            glBegin(GL_LINE_STRIP)
+                            for pi in range(1, disc.NbPoints() + 1):
+                                p = adaptor.Value(disc.Parameter(pi))
+                                glVertex3f(p.X(), p.Y(), p.Z())
+                            glEnd()
+                    except Exception:
+                        pass
+                    exp.Next()
+                glLineWidth(1.0)
+
+            except Exception as ex:
+                print(f"[Sketch] draw_sketch_faces error: {ex}")
+
+        glDisable(GL_BLEND)
+        glEnable(GL_CULL_FACE)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_LIGHTING)
+
+    def _draw_extrude_preview(self):
+        """
+        Draw semi-transparent extrude preview solids.
+        Blue for positive (add), red for negative (cut).
+        """
+        solids = getattr(self, '_extrude_preview_mesh', None)
+        if not solids:
+            return
+
+        dist = getattr(self, '_extrude_preview_dist', 0.0)
+        is_cut = dist < 0
+
+        from OCP.BRep import BRep_Tool
+        from OCP.BRepMesh import BRepMesh_IncrementalMesh
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
+        from OCP.TopoDS import TopoDS
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GCPnts import GCPnts_UniformAbscissa
+
+        glDisable(GL_LIGHTING)
+        glEnable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        if is_cut:
+            fill_color   = (0.75, 0.18, 0.18, 0.28)
+            edge_color   = (1.00, 0.35, 0.35, 0.75)
+        else:
+            fill_color   = (0.22, 0.55, 0.85, 0.22)
+            edge_color   = (0.48, 0.75, 1.00, 0.80)
+
+        for solid in solids:
+            try:
+                wrapped = solid.wrapped
+                BRepMesh_IncrementalMesh(wrapped, 0.15)
+
+                # Filled triangles
+                glColor4f(*fill_color)
+                exp = TopExp_Explorer(wrapped, TopAbs_FACE)
+                while exp.More():
+                    face = TopoDS.Face_s(exp.Current())
+                    loc  = face.Location()
+                    tri  = BRep_Tool.Triangulation_s(face, loc)
+                    if tri is not None:
+                        glBegin(GL_TRIANGLES)
+                        for i in range(1, tri.NbTriangles() + 1):
+                            n1, n2, n3 = tri.Triangle(i).Get()
+                            for ni in (n1, n2, n3):
+                                p = tri.Node(ni)
+                                glVertex3f(p.X(), p.Y(), p.Z())
+                        glEnd()
+                    exp.Next()
+
+                # Edges
+                glColor4f(*edge_color)
+                glLineWidth(1.4)
+                exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
+                while exp2.More():
+                    edge = exp2.Current()
+                    try:
+                        adaptor = BRepAdaptor_Curve(edge)
+                        disc    = GCPnts_UniformAbscissa()
+                        disc.Initialize(adaptor, 24)
+                        if disc.IsDone() and disc.NbPoints() >= 2:
+                            glBegin(GL_LINE_STRIP)
+                            for pi in range(1, disc.NbPoints() + 1):
+                                p = adaptor.Value(disc.Parameter(pi))
+                                glVertex3f(p.X(), p.Y(), p.Z())
+                            glEnd()
+                    except Exception:
+                        pass
+                    exp2.Next()
+                glLineWidth(1.0)
+
+            except Exception as ex:
+                print(f"[Preview] draw error: {ex}")
+
+        glDisable(GL_BLEND)
+        glEnable(GL_CULL_FACE)
+        glEnable(GL_LIGHTING)
+
+    # ------------------------------------------------------------------
+    # Screen-space snap radius
+    # ------------------------------------------------------------------
+
+    def _snap_radius_mm(self, snap_pixels: float = 14.0) -> float:
+        """
+        Convert a fixed pixel radius to world-mm at the sketch plane depth.
+        Gives consistent snap feel regardless of zoom level.
+        """
+        from OpenGL.GLU import gluUnProject
+
+        if self._modelview is None or self._sketch is None:
+            return self.camera.distance * 0.015
+        try:
+            dpr = self.devicePixelRatio()
+            cx  = self.width()  * 0.5 * dpr
+            cy  = self.height() * 0.5 * dpr
+
+            near0 = np.array(gluUnProject(cx,       cy, 0.0,
+                             self._modelview, self._projection, self._viewport))
+            near1 = np.array(gluUnProject(cx + 1.0, cy, 0.0,
+                             self._modelview, self._projection, self._viewport))
+            far0  = np.array(gluUnProject(cx,       cy, 1.0,
+                             self._modelview, self._projection, self._viewport))
+            far1  = np.array(gluUnProject(cx + 1.0, cy, 1.0,
+                             self._modelview, self._projection, self._viewport))
+
+            plane = self._sketch.plane
+            _, pt0 = plane.ray_intersect(near0, far0 - near0)
+            _, pt1 = plane.ray_intersect(near1, far1 - near1)
+
+            if pt0 is not None and pt1 is not None:
+                mm_per_px = float(np.linalg.norm(pt1 - pt0))
+                return max(0.01, mm_per_px * snap_pixels)
+        except Exception:
+            pass
+        return self.camera.distance * 0.015

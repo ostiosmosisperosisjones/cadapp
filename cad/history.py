@@ -1,0 +1,511 @@
+"""
+cad/history.py
+
+Single flat workspace history with cursor-based undo/redo and parametric replay.
+Each entry is tagged with a body_id so operations are scoped to their body.
+
+Every entry gets a stable UUID (entry_id) at push() time.  Cross-entry
+references (sketch→extrude, parent→split-child) use these UUIDs instead of
+fragile integer indices, so insert/delete/reorder never corrupts the graph.
+
+Parametric replay
+-----------------
+replay_from(index) re-executes all entries for the target body from *index*
+onward.  Two special cases beyond the REGISTRY executors:
+
+  "sketch" entries
+      Re-resolve the sketch plane via SketchEntry.plane_source and
+      re-project every ReferenceEntity that carries a parametric EdgeSource.
+
+  "extrude" / "cut" entries with op.from_sketch_id set
+      These are sketch-profile extrudes.  The executor rebuilds the sketch
+      profile faces from the SketchEntry and calls extrude_face_direct.
+      After the extrude, any split-body import entries whose
+      op.source_entry_id matches this entry's entry_id are updated to
+      receive the correct solid from the new result.
+"""
+
+from __future__ import annotations
+import uuid
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Any
+from cad.face_ref import FaceRef
+
+
+@dataclass
+class HistoryEntry:
+    label:        str
+    operation:    str
+    params:       dict
+    body_id:      str        # which body this operation targets
+    face_ref:     FaceRef | None
+    shape_before: Any        # shape of the body before this op
+    shape_after:  Any        # shape of the body after this op
+    # Stable identity — never changes regardless of list position
+    entry_id:     str  = field(default_factory=lambda: str(uuid.uuid4()))
+    # Authoritative op class name — survives operation string mutations
+    op_type:      str  = ""
+    # Non-destructive history state
+    diverged:     bool = False   # True when a branch was inserted before this entry
+    error:        bool = False   # True when this entry failed to replay
+    error_msg:    str  = ""
+    editing:      bool = False   # True while the ExtrudePanel is open editing this entry
+    # Typed operation object — mirrors params, set by history.push()
+    op:           Any  = field(default=None, repr=False)
+
+
+class History:
+    def __init__(self):
+        self._entries:   list[HistoryEntry] = []
+        self._cursor:    int = -1
+        self._workspace: Any = None   # set by Workspace after construction
+
+    # ------------------------------------------------------------------
+    # Mutation
+    # ------------------------------------------------------------------
+
+    def push(self, label, operation, params, body_id,
+             face_ref, shape_before, shape_after,
+             entry_id: str | None = None) -> HistoryEntry:
+        from cad.op_types import Op
+        insert_at = self._cursor + 1
+        op = Op.from_params(operation, params)
+        entry = HistoryEntry(
+            label=label, operation=operation, params=params,
+            body_id=body_id, face_ref=face_ref,
+            shape_before=shape_before, shape_after=shape_after,
+            op=op,
+            op_type=(type(op).__name__ if op is not None else operation),
+        )
+        if entry_id is not None:
+            entry.entry_id = entry_id
+        if insert_at < len(self._entries):
+            self._entries.insert(insert_at, entry)
+            for i in range(insert_at + 1, len(self._entries)):
+                self._entries[i].diverged = True
+            self._cursor = insert_at
+            return entry
+        self._entries.append(entry)
+        self._cursor = insert_at
+        return entry
+
+    @property
+    def is_mid_history(self) -> bool:
+        """True when cursor is not at the last entry (diverged entries exist)."""
+        return self._cursor < len(self._entries) - 1
+
+    # ------------------------------------------------------------------
+    # Op mutation
+    # ------------------------------------------------------------------
+
+    def update_entry_op(self, index: int, new_params: dict,
+                        new_distance: float | None = None) -> None:
+        """
+        Update an entry's params (and optionally distance/sign) and
+        rebuild entry.op and entry.operation atomically.
+
+        new_distance is signed: positive → extrude, negative → cut.
+        Caller triggers replay_from() after this.
+        """
+        from cad.op_types import Op
+        if index < 0 or index >= len(self._entries):
+            return
+        entry = self._entries[index]
+        entry.params.update(new_params)
+
+        if new_distance is not None:
+            entry.params["distance"] = abs(new_distance)
+            # For FaceExtrudeOp the sign is stored on the op distance field.
+            # Rebuild op first, then patch sign.
+            is_cut = new_distance < 0
+            entry.operation = "cut" if is_cut else "extrude"
+
+        entry.op = Op.from_params(entry.operation, entry.params)
+        entry.op_type = type(entry.op).__name__ if entry.op is not None else entry.operation
+
+    # ------------------------------------------------------------------
+    # UUID ↔ index resolution
+    # ------------------------------------------------------------------
+
+    def id_to_index(self, entry_id: str) -> int | None:
+        """Return the current list index for a given entry_id, or None."""
+        for i, e in enumerate(self._entries):
+            if e.entry_id == entry_id:
+                return i
+        return None
+
+    def index_to_id(self, index: int) -> str | None:
+        """Return the entry_id at a given index, or None if out of range."""
+        if 0 <= index < len(self._entries):
+            return self._entries[index].entry_id
+        return None
+
+    def delete(self, index: int) -> None:
+        """
+        Remove the entry at *index* and clamp the cursor.
+        No index-patching needed — cross-references use entry_id UUIDs.
+        Caller is responsible for triggering replay_from() and rebuilding meshes.
+        """
+        if index < 0 or index >= len(self._entries):
+            return
+        del self._entries[index]
+        if self._cursor >= len(self._entries):
+            self._cursor = len(self._entries) - 1
+
+    def reorder(self, src: int, dst: int) -> None:
+        """
+        Move the entry at *src* to *dst*.
+        No index-patching needed — cross-references use entry_id UUIDs.
+        Caller is responsible for triggering replay_from() and rebuilding meshes.
+        """
+        n = len(self._entries)
+        if src == dst or src < 0 or src >= n or dst < 0 or dst >= n:
+            return
+        entry = self._entries.pop(src)
+        self._entries.insert(dst, entry)
+        if self._cursor == src:
+            self._cursor = dst
+        elif src < dst and src < self._cursor <= dst:
+            self._cursor -= 1
+        elif dst < src and dst <= self._cursor < src:
+            self._cursor += 1
+        self._cursor = max(0, min(self._cursor, len(self._entries) - 1))
+
+    def undo(self) -> HistoryEntry | None:
+        if self._cursor <= 0:
+            return None
+        entry = self._entries[self._cursor]
+        self._cursor -= 1
+        return entry
+
+    def redo(self) -> HistoryEntry | None:
+        if self._cursor >= len(self._entries) - 1:
+            return None
+        self._cursor += 1
+        return self._entries[self._cursor]
+
+    def seek(self, index: int) -> bool:
+        """Move cursor to index. Returns True if index is valid."""
+        if index < 0 or index >= len(self._entries):
+            return False
+        self._cursor = index
+        return True
+
+    # ------------------------------------------------------------------
+    # Shape lookup (used by plane_ref / edge_ref during replay)
+    # ------------------------------------------------------------------
+
+    def _shape_for_body_at(self, body_id: str, before_index: int) -> Any | None:
+        """
+        Return the most recent shape for *body_id* up to (not including)
+        *before_index*.
+
+        During an active replay_from() call, _replay_shape_cache is set and
+        contains already-computed shapes for all bodies seen so far — O(1).
+        Outside of replay (e.g. initial plane resolve at sketch creation),
+        fall back to a linear scan of the entry list.
+
+        For force_new_body child bodies (no history entries of their own),
+        falls back to workspace.source_shape when the parent entry is visible
+        at before_index.
+        """
+        cache = getattr(self, '_replay_shape_cache', None)
+        if cache is not None:
+            result = cache.get(body_id)
+            if result is not None:
+                return result
+            # Not in cache — may be a force_new_body child; fall through to source_shape.
+        else:
+            # Fallback linear scan (used only outside of replay_from)
+            result = None
+            for i, entry in enumerate(self._entries):
+                if i >= before_index:
+                    break
+                if entry.body_id == body_id and entry.shape_after is not None:
+                    result = entry.shape_after
+            if result is not None:
+                return result
+
+        # Last resort: workspace.source_shape for force_new_body children.
+        # Only return it if the body's creation entry is visible at before_index.
+        if self._workspace is not None:
+            body = self._workspace.bodies.get(body_id)
+            if body is not None and body.source_shape is not None:
+                if body.created_at_entry_id is None:
+                    return body.source_shape
+                created_idx = self.id_to_index(body.created_at_entry_id)
+                if created_idx is not None and created_idx < before_index:
+                    return body.source_shape
+        return None
+
+    # ------------------------------------------------------------------
+    # Parametric replay
+    # ------------------------------------------------------------------
+
+    def replay_from(self, index: int) -> tuple[bool, str, set[str]]:
+        """
+        Re-execute all entries from *index* onward for the body targeted by
+        entry[index].  Entries for other bodies are skipped.
+
+        On failure, the failing entry is marked with error=True/error_msg
+        instead of aborting immediately, so the rest of the chain can still
+        be attempted.
+
+        Returns (all_ok, first_error_message, mutated_body_ids) where
+        mutated_body_ids is the set of body IDs whose shape_after changed
+        — callers can use this to rebuild only the affected meshes.
+        """
+        if index < 0 or index >= len(self._entries):
+            return False, f"Index {index} out of range", set()
+
+        target_body_id = self._entries[index].body_id
+
+        # Build a shape cache from all entries before `index` so we can look up
+        # any body's current shape in O(1) instead of scanning the list each time.
+        shape_cache: dict[str, Any] = {}
+        for e in self._entries[:index]:
+            if e.shape_after is not None:
+                shape_cache[e.body_id] = e.shape_after
+
+        current_shape = shape_cache.get(target_body_id)
+        mutated_bodies: set[str] = set()
+
+        # Expose cache on self so plane_ref/edge_ref resolve() calls are O(1)
+        self._replay_shape_cache = shape_cache
+        try:
+            return self._replay_from_inner(
+                index, target_body_id, current_shape,
+                shape_cache, mutated_bodies)
+        finally:
+            self._replay_shape_cache = None
+
+    def _replay_from_inner(self, index, target_body_id, current_shape,
+                           shape_cache, mutated_bodies):
+        from cad.op_types import ImportOp, SketchOp
+
+        first_error  = ""
+        chain_broken = False   # once True, all subsequent ops for this body cascade-error
+
+        for i in range(index, len(self._entries)):
+            entry = self._entries[i]
+
+            if entry.body_id != target_body_id:
+                continue
+
+            # Clear previous error state on re-play
+            entry.error     = False
+            entry.error_msg = ""
+
+            op = entry.op
+
+            # ---- import / force_new_body child: shape is authoritative ----
+            # ImportOp entries and force_new_body children (shape_before=None,
+            # source_entry_id set) carry their result in shape_after directly.
+            # Their shapes are updated by the parent op's split propagation.
+            if isinstance(op, ImportOp) or (
+                    entry.shape_before is None
+                    and entry.params.get("source_entry_id") is not None):
+                current_shape = entry.shape_after
+                shape_cache[entry.body_id] = entry.shape_after
+                continue
+
+            # If a prior op in this chain failed, cascade-error everything else
+            if chain_broken:
+                entry.error     = True
+                entry.error_msg = "Dependency error: a prior operation in this chain failed"
+                entry.shape_before = current_shape
+                entry.shape_after  = None
+                _null_split_dependents(self._entries, i)
+                continue
+
+            if op is None:
+                err = f"Entry {i} '{entry.label}': unknown operation '{entry.operation}'"
+                entry.error = True; entry.error_msg = err
+                entry.shape_before = current_shape; entry.shape_after = None
+                _null_split_dependents(self._entries, i)
+                chain_broken = True
+                if not first_error: first_error = err
+                mutated_bodies.add(entry.body_id)
+                continue
+
+            # ---- sketch: geometry no-op, re-projects references -----------
+            if isinstance(op, SketchOp):
+                try:
+                    op.execute(current_shape, self, i)
+                except Exception as ex:
+                    entry.error     = True
+                    entry.error_msg = str(ex)
+                    if not first_error:
+                        first_error = str(ex)
+                entry.shape_before = current_shape
+                entry.shape_after  = current_shape
+                continue
+
+            # ---- all other ops: need a valid input shape ------------------
+            force_new = getattr(op, 'force_new_body', False)
+            if current_shape is None and not force_new:
+                err = f"Entry {i} '{entry.label}': no input shape (prior operation failed)"
+                entry.error = True; entry.error_msg = err
+                entry.shape_before = None; entry.shape_after = None
+                _null_split_dependents(self._entries, i)
+                chain_broken = True
+                if not first_error: first_error = err
+                mutated_bodies.add(entry.body_id)
+                continue
+
+            shape_before = current_shape
+            try:
+                new_shape = op.execute(current_shape, self, i)
+            except Exception as ex:
+                err = f"Entry {i} '{entry.label}' failed: {ex}"
+                entry.error = True; entry.error_msg = err
+                entry.shape_before = current_shape; entry.shape_after = None
+                _null_split_dependents(self._entries, i)
+                chain_broken = True
+                if not first_error: first_error = err
+                mutated_bodies.add(entry.body_id)
+                continue
+
+            entry.shape_before = shape_before
+            entry.shape_after  = new_shape
+            current_shape      = new_shape
+            shape_cache[entry.body_id] = new_shape
+            entry.label        = _make_label(entry.operation, entry.params)
+            mutated_bodies.add(entry.body_id)
+
+            # force_new_body child bodies are updated inside execute() directly.
+            child_body_ids = entry.params.get("child_body_ids", [])
+            for bid in child_body_ids:
+                mutated_bodies.add(bid)
+
+        return (not first_error), first_error, mutated_bodies
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+
+    def entries_for_body(self, body_id: str) -> list[tuple[int, HistoryEntry]]:
+        """Return [(global_index, entry)] for all entries belonging to body_id."""
+        return [(i, e) for i, e in enumerate(self._entries)
+                if e.body_id == body_id]
+
+    def replay_sketch_dependents(self, sketch_entry_id: str) -> tuple[bool, str, set[str]]:
+        """
+        Replay all body chains that contain a SketchExtrudeOp referencing
+        sketch_entry_id.  Called after a sketch is re-edited so that extruded
+        bodies built from it are automatically recomputed.
+
+        Returns (all_ok, first_error, mutated_body_ids).
+        """
+        from cad.op_types import SketchExtrudeOp
+        all_ok   = True
+        first_err = ""
+        mutated: set[str] = set()
+        seen_bodies: set[str] = set()
+
+        for i, entry in enumerate(self._entries):
+            op = entry.op
+            if not isinstance(op, SketchExtrudeOp):
+                continue
+            if op.from_sketch_id != sketch_entry_id:
+                continue
+            body_id = entry.body_id
+            if body_id in seen_bodies:
+                continue
+            seen_bodies.add(body_id)
+            ok, err, mut = self.replay_from(i)
+            mutated |= mut
+            if not ok:
+                all_ok = False
+                if not first_err:
+                    first_err = err
+
+        return all_ok, first_err, mutated
+
+    @property
+    def entries(self) -> list[HistoryEntry]:
+        return list(self._entries)
+
+    @property
+    def cursor(self) -> int:
+        return self._cursor
+
+    @property
+    def can_undo(self) -> bool:
+        return self._cursor > 0
+
+    @property
+    def can_redo(self) -> bool:
+        return self._cursor < len(self._entries) - 1
+
+    def __len__(self):
+        return len(self._entries)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _replay_sketch_entry(se, history: History, before_index: int
+                         ) -> tuple[bool, str]:
+    """
+    Update the plane cache and re-project all parametric ReferenceEntity
+    instances on a SketchEntry.  Called during replay_from() for sketch ops.
+    """
+    from cad.sketch import ReferenceEntity
+
+    try:
+        b3d_plane = se.plane_source.resolve(history, before_index)
+    except Exception as ex:
+        return False, f"Sketch plane resolve failed: {ex}"
+
+    o = b3d_plane.origin
+    x = b3d_plane.x_dir
+    y = b3d_plane.y_dir
+    z = b3d_plane.z_dir
+    se.plane_origin = np.array([o.X, o.Y, o.Z], dtype=np.float64)
+    se.plane_x_axis = np.array([x.X, x.Y, x.Z], dtype=np.float64)
+    se.plane_y_axis = np.array([y.X, y.Y, y.Z], dtype=np.float64)
+    se.plane_normal = np.array([z.X, z.Y, z.Z], dtype=np.float64)
+
+    for ent in se.entities:
+        if not isinstance(ent, ReferenceEntity) or ent.source is None:
+            continue
+        try:
+            world_pts, occ_edges = ent.source.resolve(history, before_index)
+        except Exception as ex:
+            return False, f"Reference entity re-projection failed: {ex}"
+
+        uv_pts = []
+        for wp in world_pts:
+            wp_arr = np.array(wp, dtype=np.float64)
+            delta  = wp_arr - se.plane_origin
+            u = float(np.dot(delta, se.plane_x_axis))
+            v = float(np.dot(delta, se.plane_y_axis))
+            uv_pts.append(np.array([u, v], dtype=np.float64))
+        ent.points = uv_pts
+
+        if occ_edges is not None:
+            ent.occ_edges = occ_edges
+
+    return True, ""
+
+
+
+def _null_split_dependents(entries: list, parent_idx: int) -> None:
+    """
+    Null the shape_after of any split-body import entries that were produced
+    by the entry at *parent_idx*.  Called whenever a parent op errors so the
+    child bodies disappear from the viewport instead of showing stale geometry.
+    """
+    parent_id = entries[parent_idx].entry_id
+    for e in entries[parent_idx + 1:]:
+        if (e.operation == "import" and
+                e.params.get("source_entry_id") == parent_id):
+            e.shape_after = None
+
+
+def _make_label(operation: str, params: dict) -> str:
+    from cad.units import format_op_label
+    return format_op_label(operation, params)

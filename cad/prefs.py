@@ -1,0 +1,268 @@
+"""
+cad/prefs.py
+
+User preferences — colors, display settings, keybindings.
+
+Stored as JSON in the platform config directory:
+  Linux/Mac : ~/.config/cadapp/prefs.json
+  Windows   : %APPDATA%/cadapp/prefs.json
+
+Usage
+-----
+    from cad.prefs import prefs          # the singleton
+    prefs.body_color                     # read
+    prefs.body_color = (0.5, 0.6, 0.7)  # write (in-memory only)
+    prefs.save()                         # persist to disk
+
+All color values are (R, G, B) tuples with components in [0.0, 1.0].
+Keybind values are key strings like "L", "Ctrl+Z", "Return", "Escape".
+"""
+
+from __future__ import annotations
+import json
+import os
+from dataclasses import dataclass, field, asdict
+from typing import Tuple
+
+
+Color3 = Tuple[float, float, float]
+
+
+def _p(r, g, b) -> Color3:
+    return (float(r), float(g), float(b))
+
+
+# ---------------------------------------------------------------------------
+# Keybind metadata — consumed by prefs_dialog.py to build the UI
+# ---------------------------------------------------------------------------
+
+# Default key string for each action
+KEYBIND_DEFAULTS: dict[str, str] = {
+    # 3D mode
+    "extrude":           "E",
+    "thicken":           "T",
+    "undo":              "Ctrl+Z",
+    "redo":              "Ctrl+Y",
+    "projection_toggle": "",
+    # Sketch mode — tools
+    "sketch_line":       "L",
+    "sketch_arc":        "A",
+    "sketch_circle":     "C",
+    "sketch_trim":       "T",
+    "sketch_divide":     "D",
+    "sketch_point":      "P",
+    "sketch_offset":     "O",
+    "sketch_fillet":     "F",
+    "sketch_include":    "I",
+    "sketch_dimension":  "Shift+D",
+    "sketch_geometric":  "Shift+P",
+    "sketch_commit":     "Return",
+    # Sketch mode — snap declarations (take priority over tool switches when tool active)
+    "snap_endpoint":     "E",
+    "snap_midpoint":     "M",
+    "snap_center":       "C",
+    "snap_nearest":      "N",
+    "snap_tangent":         "T",
+    "snap_intersection":    "I",
+    # Sketch mode — constrained line shortcuts
+    "sketch_hline":      "H",
+    "sketch_vline":      "V",
+    # Sketch mode — navigation
+    "sketch_projection_toggle": "",
+}
+
+# Human-readable labels: action → (section, label)
+KEYBIND_LABELS: dict[str, tuple[str, str]] = {
+    "extrude":                  ("3D Mode",    "Extrude selected face"),
+    "thicken":                  ("3D Mode",    "Thicken active body"),
+    "undo":                     ("3D Mode",    "Undo"),
+    "redo":                     ("3D Mode",    "Redo"),
+    "projection_toggle":        ("3D Mode",    "Toggle ortho/perspective"),
+    "sketch_line":              ("Sketch",     "Line tool"),
+    "sketch_arc":               ("Sketch",     "Arc tool (3-point)"),
+    "sketch_circle":            ("Sketch",     "Circle tool"),
+    "sketch_trim":              ("Sketch",     "Trim tool"),
+    "sketch_divide":            ("Sketch",     "Divide tool"),
+    "sketch_point":             ("Sketch",     "Point tool"),
+    "sketch_offset":            ("Sketch",     "Offset tool"),
+    "sketch_fillet":            ("Sketch",     "Fillet tool"),
+    "sketch_include":           ("Sketch",     "Include geometry"),
+    "sketch_dimension":         ("Sketch",     "Dimension tool (length constraint)"),
+    "sketch_geometric":         ("Sketch",     "Geometric constraint tool"),
+    "snap_endpoint":            ("Sketch",     "Force snap: endpoint"),
+    "snap_midpoint":            ("Sketch",     "Force snap: midpoint"),
+    "snap_center":              ("Sketch",     "Force snap: center"),
+    "snap_nearest":             ("Sketch",     "Force snap: nearest"),
+    "snap_tangent":             ("Sketch",     "Force snap: tangent to arc/circle"),
+    "snap_intersection":        ("Sketch",     "Force snap: intersection"),
+    "sketch_hline":             ("Sketch",     "Horizontal line"),
+    "sketch_vline":             ("Sketch",     "Vertical line"),
+    "sketch_commit":            ("Sketch",     "Commit sketch"),
+    "sketch_projection_toggle": ("Sketch",     "Toggle ortho/perspective"),
+}
+
+
+# ---------------------------------------------------------------------------
+# Prefs dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Prefs:
+    # ------------------------------------------------------------------
+    # Viewport background
+    # ------------------------------------------------------------------
+    background_color:       Color3 = field(default_factory=lambda: _p(0.15, 0.15, 0.15))
+
+    # ------------------------------------------------------------------
+    # Body colors
+    # ------------------------------------------------------------------
+    body_color:             Color3 = field(default_factory=lambda: _p(0.55, 0.65, 0.75))
+    body_color_active:      Color3 = field(default_factory=lambda: _p(0.65, 0.75, 0.85))
+
+    # ------------------------------------------------------------------
+    # Edge wireframe
+    # ------------------------------------------------------------------
+    edge_color:             Color3 = field(default_factory=lambda: _p(0.20, 0.20, 0.22))
+    edge_width:             float  = 1.2
+    show_edges:             bool   = True
+
+    # ------------------------------------------------------------------
+    # Selection highlights
+    # ------------------------------------------------------------------
+    face_selected_color:    Color3 = field(default_factory=lambda: _p(0.95, 0.60, 0.10))
+    edge_hovered_color:     Color3 = field(default_factory=lambda: _p(0.90, 0.90, 0.30))
+    edge_selected_color:    Color3 = field(default_factory=lambda: _p(1.00, 1.00, 0.40))
+    vertex_hovered_color:   Color3 = field(default_factory=lambda: _p(1.00, 1.00, 1.00))
+    vertex_selected_color:  Color3 = field(default_factory=lambda: _p(1.00, 0.85, 0.20))
+
+    # ------------------------------------------------------------------
+    # Sketch overlay
+    # ------------------------------------------------------------------
+    sketch_line_color:      Color3 = field(default_factory=lambda: _p(0.05, 0.05, 0.05))
+    sketch_reference_color: Color3 = field(default_factory=lambda: _p(0.45, 0.55, 0.75))
+    sketch_preview_color:   Color3 = field(default_factory=lambda: _p(0.95, 0.75, 0.10))
+    sketch_cursor_color:    Color3 = field(default_factory=lambda: _p(0.10, 0.10, 0.10))
+    sketch_axis_x_color:    Color3 = field(default_factory=lambda: _p(0.85, 0.20, 0.20))
+    sketch_axis_y_color:    Color3 = field(default_factory=lambda: _p(0.20, 0.75, 0.30))
+    sketch_grid_major_color:Color3 = field(default_factory=lambda: _p(0.35, 0.45, 0.60))
+    sketch_grid_minor_color:Color3 = field(default_factory=lambda: _p(0.22, 0.30, 0.42))
+    sketch_line_width:      float  = 2.5
+    sketch_reference_width: float  = 1.8
+
+    # ------------------------------------------------------------------
+    # Camera
+    # ------------------------------------------------------------------
+    camera_rotate_speed:    float  = 1.0
+    camera_pan_speed:       float  = 1.0
+    camera_mode:            str    = 'trackball'
+    camera_invert_yaw:      bool   = False
+    camera_invert_pitch:    bool   = False
+
+    # ------------------------------------------------------------------
+    # Units
+    # ------------------------------------------------------------------
+    default_unit:     str = "mm"
+    display_decimals: int = 3
+
+    # ------------------------------------------------------------------
+    # Keybindings  — action_name → key string
+    # ------------------------------------------------------------------
+    keybinds: dict = field(
+        default_factory=lambda: dict(KEYBIND_DEFAULTS))
+
+    # ------------------------------------------------------------------
+    # Keybind helpers
+    # ------------------------------------------------------------------
+
+    def key(self, action: str) -> str:
+        """Return the current key string for an action, falling back to default."""
+        return self.keybinds.get(action, KEYBIND_DEFAULTS.get(action, ""))
+
+    def matches(self, action: str, qt_key_event) -> bool:
+        """
+        Return True if a QKeyEvent matches the bound key for action.
+
+        Handles plain keys ("L", "E", "Return") and modified keys ("Ctrl+Z").
+        """
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QKeySequence
+
+        bound = self.key(action)
+        if not bound:
+            return False
+
+        seq     = QKeySequence(bound)
+        if seq.isEmpty():
+            return False
+
+        # Reconstruct a QKeySequence from the event for comparison
+        mods = qt_key_event.modifiers()
+        k    = qt_key_event.key()
+
+        # Strip modifier-only keypresses
+        if k in (Qt.Key.Key_Control, Qt.Key.Key_Shift,
+                 Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+            return False
+
+        event_seq = QKeySequence(int(mods.value) | k)
+        return seq == event_seq
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _config_path() -> str:
+        if os.name == 'nt':
+            base = os.environ.get('APPDATA', os.path.expanduser('~'))
+        else:
+            base = os.environ.get('XDG_CONFIG_HOME',
+                                  os.path.join(os.path.expanduser('~'), '.config'))
+        return os.path.join(base, 'cadapp', 'prefs.json')
+
+    def save(self):
+        path = self._config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        d = asdict(self)
+        with open(path, 'w') as f:
+            json.dump(d, f, indent=2)
+
+    def load(self):
+        path = self._config_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            for key, val in data.items():
+                if not hasattr(self, key):
+                    continue
+                if isinstance(val, list):
+                    val = tuple(val)
+                # Merge keybinds: start from defaults, then apply saved values.
+                # Explicitly saved "" means intentionally unbound — preserve it.
+                if key == 'keybinds' and isinstance(val, dict):
+                    merged = dict(KEYBIND_DEFAULTS)
+                    merged.update(val)   # saved "" overwrites default correctly
+                    val = merged
+                setattr(self, key, val)
+        except Exception as e:
+            print(f"[Prefs] Could not load preferences: {e}")
+
+    def reset(self):
+        """Reset all preferences to defaults."""
+        defaults = Prefs()
+        for key in asdict(self):
+            setattr(self, key, getattr(defaults, key))
+
+    def reset_keybinds(self):
+        """Reset only keybindings to defaults."""
+        self.keybinds = dict(KEYBIND_DEFAULTS)
+
+
+# ---------------------------------------------------------------------------
+# Singleton
+# ---------------------------------------------------------------------------
+
+prefs = Prefs()
+prefs.load()
