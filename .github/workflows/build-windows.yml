@@ -74,6 +74,12 @@ jobs:
           wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
 
+      - name: Strip bundled Qt OpenGL libs (use system Mesa instead)
+        run: |
+          rm -f dist/cadapp/_internal/PyQt6/Qt6/lib/libQt6OpenGL*.so*
+          rm -f dist/cadapp/_internal/libGL*.so*
+          rm -f dist/cadapp/_internal/libEGL*.so*
+
       - name: Assemble AppDir
         run: |
           mkdir -p AppDir/usr/bin
