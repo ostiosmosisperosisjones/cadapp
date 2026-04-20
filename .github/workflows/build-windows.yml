@@ -74,10 +74,11 @@ jobs:
           wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
 
-      - name: Strip bundled libGL so system Mesa is used instead
+      - name: Strip bundled GL/XCB libs so system Mesa is used instead
         run: |
           cd dist/cadapp/_internal
           rm -f libGL.so* libGL-*.so* libEGL.so* libEGL-*.so*
+          rm -f libxcb-glx.so*
 
       - name: Assemble AppDir
         run: |
@@ -103,7 +104,6 @@ jobs:
           cat > AppDir/AppRun << 'EOF'
           #!/bin/bash
           HERE="$(dirname "$(readlink -f "$0")")"
-          # Put system lib paths BEFORE bundled ones so system GL/XCB wins
           export LD_LIBRARY_PATH="/usr/lib:/usr/lib/x86_64-linux-gnu:$HERE/usr/bin:$HERE/usr/bin/_internal"
           exec "$HERE/usr/bin/cadapp" "$@"
           EOF
