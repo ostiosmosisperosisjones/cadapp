@@ -74,16 +74,10 @@ jobs:
           wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
 
-      - name: Strip bundled OpenGL/XCB libs (use system Mesa instead)
+      - name: Strip bundled libGL so system Mesa is used instead
         run: |
           cd dist/cadapp/_internal
-          rm -f libQt6OpenGL*.so* libQt6XcbQpa*.so* libQt6EglFS*.so*
-          rm -f libGL*.so* libEGL*.so*
-          rm -f libxcb-glx*.so* libxcb-bac6ebc8*.so*
-          rm -f PyQt6/Qt6/lib/libQt6OpenGL*.so*
-          rm -f PyQt6/Qt6/lib/libQt6XcbQpa*.so*
-          rm -f PyQt6/Qt6/lib/libQt6EglFS*.so*
-          rm -f PyQt6/Qt6/plugins/xcbglintegrations/libqxcb-glx-integration.so
+          rm -f libGL.so* libGL-*.so* libEGL.so* libEGL-*.so*
 
       - name: Assemble AppDir
         run: |
@@ -109,10 +103,8 @@ jobs:
           cat > AppDir/AppRun << 'EOF'
           #!/bin/bash
           HERE="$(dirname "$(readlink -f "$0")")"
-          export LD_LIBRARY_PATH="$HERE/usr/bin:$LD_LIBRARY_PATH"
-          # Use system Qt platform plugins and OpenGL to avoid GLX conflicts
-          export QT_QPA_PLATFORM_PLUGIN_PATH=""
-          export PYINSTALLER_SUPPRESS_COMBINING_WARNINGS=1
+          # Put system lib paths BEFORE bundled ones so system GL/XCB wins
+          export LD_LIBRARY_PATH="/usr/lib:/usr/lib/x86_64-linux-gnu:$HERE/usr/bin:$HERE/usr/bin/_internal"
           exec "$HERE/usr/bin/cadapp" "$@"
           EOF
           chmod +x AppDir/AppRun
