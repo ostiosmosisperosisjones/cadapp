@@ -74,11 +74,16 @@ jobs:
           wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
 
-      - name: Strip bundled Qt OpenGL libs (use system Mesa instead)
+      - name: Strip bundled OpenGL/XCB libs (use system Mesa instead)
         run: |
-          rm -f dist/cadapp/_internal/PyQt6/Qt6/lib/libQt6OpenGL*.so*
-          rm -f dist/cadapp/_internal/libGL*.so*
-          rm -f dist/cadapp/_internal/libEGL*.so*
+          cd dist/cadapp/_internal
+          rm -f libQt6OpenGL*.so* libQt6XcbQpa*.so* libQt6EglFS*.so*
+          rm -f libGL*.so* libEGL*.so*
+          rm -f libxcb-glx*.so* libxcb-bac6ebc8*.so*
+          rm -f PyQt6/Qt6/lib/libQt6OpenGL*.so*
+          rm -f PyQt6/Qt6/lib/libQt6XcbQpa*.so*
+          rm -f PyQt6/Qt6/lib/libQt6EglFS*.so*
+          rm -f PyQt6/Qt6/plugins/xcbglintegrations/libqxcb-glx-integration.so
 
       - name: Assemble AppDir
         run: |
