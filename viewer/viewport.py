@@ -74,6 +74,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._hovered_vertex: tuple[str | None, int | None] = (None, None)
         self._hovered_edge:   tuple[str | None, int | None] = (None, None)
 
+        from viewer.history_commands import CommandStack
+        self._cmd_stack = CommandStack()
+
         self._sketch = None                              # SketchMode | None
         self._sketch_faces: dict[int, list] = {}        # history_idx → [Face]
         self._selected_sketch_entry: int | None = None  # history_idx

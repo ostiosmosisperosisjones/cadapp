@@ -248,7 +248,7 @@ class FaceExtrudeOp(Op):
         # Seek and rebuild BEFORE showing panel.
         if history_idx > 0:
             vp.history.seek(history_idx - 1)
-            vp._rebuild_body_mesh(self.source_body_id)
+            vp._rebuild_all_meshes()
         vp.history_changed.emit()
 
         vp._show_extrude_panel(
@@ -646,7 +646,12 @@ class SketchExtrudeOp(Op):
             raise RuntimeError(
                 f"SketchExtrudeOp: sketch entry is after this entry — invalid reorder")
 
-        se = history._entries[sketch_idx].params.get("sketch_entry")
+        sketch_entry_rec = history._entries[sketch_idx]
+        if sketch_entry_rec.error:
+            raise RuntimeError(
+                f"SketchExtrudeOp: sketch entry is in an error state")
+
+        se = sketch_entry_rec.params.get("sketch_entry")
         if se is None:
             raise RuntimeError(
                 f"SketchExtrudeOp: no sketch_entry at id '{self.from_sketch_id}'")
@@ -872,13 +877,9 @@ class SketchExtrudeOp(Op):
         sketch_idx = vp.history.id_to_index(self.from_sketch_id)
 
         # Seek and rebuild BEFORE showing panel.
-        # Rebuild the sketch's body (not entry.body_id which may be a new body).
         if history_idx > 0:
             vp.history.seek(history_idx - 1)
-            se_entry = vp.history.entries[sketch_idx] if sketch_idx is not None else None
-            se = se_entry.params.get("sketch_entry") if se_entry else None
-            rebuild_id = se.body_id if se else entry.body_id
-            vp._rebuild_body_mesh(rebuild_id)
+            vp._rebuild_all_meshes()
         vp.history_changed.emit()
 
         vp._selected_sketch_entry = sketch_idx

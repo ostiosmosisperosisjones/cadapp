@@ -402,30 +402,35 @@ class SketchEntry:
 
     def __init__(self, plane_origin, plane_x_axis, plane_y_axis, plane_normal,
                  entities, body_id, face_idx, visible=True, plane_source=None,
-                 constraints=None):
-        self.plane_origin = np.array(plane_origin, dtype=np.float64)
-        self.plane_x_axis = np.array(plane_x_axis, dtype=np.float64)
-        self.plane_y_axis = np.array(plane_y_axis, dtype=np.float64)
-        self.plane_normal = np.array(plane_normal, dtype=np.float64)
-        self.entities     = entities
-        self.body_id      = body_id
-        self.face_idx     = face_idx
-        self.visible      = visible
-        self.plane_source = plane_source   # SketchPlaneSource | None
-        self.constraints  = constraints or []
+                 constraints=None, undo_snapshots=None):
+        self.plane_origin    = np.array(plane_origin, dtype=np.float64)
+        self.plane_x_axis    = np.array(plane_x_axis, dtype=np.float64)
+        self.plane_y_axis    = np.array(plane_y_axis, dtype=np.float64)
+        self.plane_normal    = np.array(plane_normal, dtype=np.float64)
+        self.entities        = entities
+        self.body_id         = body_id
+        self.face_idx        = face_idx
+        self.visible         = visible
+        self.plane_source    = plane_source   # SketchPlaneSource | None
+        self.constraints     = constraints or []
+        # Per-sketch undo history — list of (entities, constraints) snapshots.
+        # Populated from SketchMode on commit; restored on re-entry so the user
+        # can undo individual sketch operations after re-opening the sketch.
+        self.undo_snapshots  = undo_snapshots or []
 
     @classmethod
     def from_sketch_mode(cls, sketch: SketchMode) -> SketchEntry:
         return cls(
-            plane_origin = sketch.plane.origin.copy(),
-            plane_x_axis = sketch.plane.x_axis.copy(),
-            plane_y_axis = sketch.plane.y_axis.copy(),
-            plane_normal = sketch.plane.normal.copy(),
-            entities     = copy.deepcopy(sketch.entities),
-            body_id      = sketch.body_id,
-            face_idx     = sketch.face_idx,
-            plane_source = sketch.plane_source,
-            constraints  = copy.deepcopy(getattr(sketch, 'constraints', [])),
+            plane_origin    = sketch.plane.origin.copy(),
+            plane_x_axis    = sketch.plane.x_axis.copy(),
+            plane_y_axis    = sketch.plane.y_axis.copy(),
+            plane_normal    = sketch.plane.normal.copy(),
+            entities        = copy.deepcopy(sketch.entities),
+            body_id         = sketch.body_id,
+            face_idx        = sketch.face_idx,
+            plane_source    = sketch.plane_source,
+            constraints     = copy.deepcopy(getattr(sketch, 'constraints', [])),
+            undo_snapshots  = copy.deepcopy(sketch._entity_snapshots),
         )
 
     # ------------------------------------------------------------------
@@ -762,13 +767,10 @@ class SketchEntry:
                 if isinstance(e, ReferenceEntity) and len(e.points) >= 2]
 
     def closed_loops(self, tol: float = 1e-3) -> list[list[tuple[float, float]]]:
-        """All closed chains from LineEntity segments and ReferenceEntity polylines."""
+        """All closed chains from LineEntity/ArcEntity segments and ReferenceEntity polylines."""
         closed = []
-        segs = self.line_segments()
-        if segs:
-            for chain in _chain_segments(segs, tol=tol):
-                if np.linalg.norm(np.array(chain[-1]) - np.array(chain[0])) < tol:
-                    closed.append(chain)
+        for _chain, uv_pts in self._collect_drawn_loops_with_arcs(tol=tol):
+            closed.append(uv_pts)
         for chain in self.reference_chains():
             if np.linalg.norm(np.array(chain[-1]) - np.array(chain[0])) < tol:
                 closed.append(chain)
@@ -839,14 +841,9 @@ class SketchEntry:
             if len(uv) >= 3:
                 uv_loops.append(uv)
 
-        segs = self.line_segments()
-        if segs:
-            for loop in _chain_segments(segs, tol=tol):
-                if np.linalg.norm(np.array(loop[-1]) - np.array(loop[0])) > tol:
-                    continue
-                open_loop = [(float(u), float(v)) for u, v in loop[:-1]]
-                if len(open_loop) >= 3:
-                    uv_loops.append(open_loop)
+        for _chain, uv_pts in self._collect_drawn_loops_with_arcs(tol=tol):
+            if len(uv_pts) >= 3:
+                uv_loops.append(uv_pts)
         return uv_loops
 
     def _collect_drawn_loops_with_arcs(self, tol: float = 1e-3):

@@ -112,12 +112,22 @@ class Workspace:
                 return None
 
         result = None
+        last_entry_errored = False
         for i, entry in enumerate(entries):
             if i > cursor:
                 break
-            if entry.body_id == body_id and entry.shape_after is not None:
+            if entry.body_id != body_id:
+                continue
+            if entry.error:
+                # Chain is broken here — body doesn't exist in a valid state
+                result = None
+                last_entry_errored = True
+            elif entry.shape_after is not None:
                 result = entry.shape_after
+                last_entry_errored = False
 
+        if last_entry_errored:
+            return None
         return result or body.source_shape
 
     def all_current_shapes(self) -> list[tuple[str, Any]]:

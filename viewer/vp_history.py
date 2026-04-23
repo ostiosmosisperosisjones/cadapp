@@ -25,7 +25,11 @@ class HistoryMixin:
         Mid-history insert: replay the affected body forward so diverged
         entries get correct shapes or error flags, then rebuild affected meshes.
         Tip-of-history append: just rebuild the primary body — cheaper.
+
+        Also clears the structural command stack because entry indices are
+        invalidated by any new push.
         """
+        self._cmd_stack.clear()
         if self.history.is_mid_history:
             cursor = self.history.cursor
             ok, err, mutated = self.history.replay_from(cursor)
@@ -109,8 +113,10 @@ class HistoryMixin:
 
     def handle_undo(self):
         """
-        Context-aware undo: per-sketch entity undo while in sketch mode,
-        global history undo otherwise.
+        Three-level context-aware undo:
+          1. Inside sketch  → per-sketch entity undo
+          2. Outside sketch, structural commands pending → undo reorder/delete
+          3. Otherwise      → history cursor undo (CAD operation)
         """
         if self._sketch is not None:
             if self._sketch.undo_entity():
@@ -118,14 +124,28 @@ class HistoryMixin:
                 self.update()
             else:
                 print("[Sketch] Nothing to undo in sketch")
+        elif self._cmd_stack.can_undo:
+            desc = self._cmd_stack.undo(self)
+            print(f"[Cmd] Undo: {desc}")
+            self.history_changed.emit()
         else:
             self._do_undo()
 
     def handle_redo(self):
-        """Context-aware redo — no-op inside a sketch session."""
+        """
+        Context-aware redo:
+          1. Inside sketch  → no-op
+          2. Structural commands available → redo reorder/delete
+          3. Otherwise      → history cursor redo
+        """
         if self._sketch is not None:
             return
-        self._do_redo()
+        if self._cmd_stack.can_redo:
+            desc = self._cmd_stack.redo(self)
+            print(f"[Cmd] Redo: {desc}")
+            self.history_changed.emit()
+        else:
+            self._do_redo()
 
     def seek_history(self, index: int):
         if self.history.seek(index):
@@ -142,20 +162,20 @@ class HistoryMixin:
         print("[Replay] Done.")
 
     # ------------------------------------------------------------------
-    # Delete / Reorder
+    # Delete / Reorder  (internal implementations)
     # ------------------------------------------------------------------
 
-    def do_delete(self, index: int):
+    def _do_delete(self, index: int):
+        """Raw delete — called by DeleteCommand.apply() and legacy callers."""
         entries = self.history.entries
         if index < 0 or index >= len(entries):
             return
         body_id = entries[index].body_id
         print(f"[History] Deleting entry {index}: '{entries[index].label}'")
 
-        # Collect child bodies (force_new_body) and split-import children
-        # before mutating the list — both need GL cleanup.
-        child_body_ids = list(entries[index].params.get("child_body_ids", []))
-        entry_id = entries[index].entry_id
+        deleted_entry = entries[index]
+        child_body_ids = list(deleted_entry.params.get("child_body_ids", []))
+        entry_id = deleted_entry.entry_id
         split_body_ids = [
             e.body_id for e in entries
             if e.params.get("source_entry_id") == entry_id
@@ -166,34 +186,47 @@ class HistoryMixin:
             reverse=True
         )
 
-        # Remove entries and bodies.
         for i in split_indices:
             self.history.delete(i)
         for bid in split_body_ids + child_body_ids:
             self.workspace.remove_body(bid)
         self.history.delete(index)
 
-        # Replay the surviving chain for the primary body, then rebuild meshes.
-        # Include removed bodies in mutated so their GL buffers get purged.
+        # Replay all surviving body chains and cascade cross-body dependencies,
+        # same as do_reorder — deletion can break any downstream chain.
         removed_body_ids = set(split_body_ids) | set(child_body_ids)
-        remaining = [(i, e) for i, e in enumerate(self.history.entries)
-                     if e.body_id == body_id]
         mutated = {body_id} | removed_body_ids
-        if remaining:
-            _, _, replay_mutated = self.history.replay_from(remaining[0][0])
-            mutated |= replay_mutated
+
+        replayed_bodies: set[str] = set()
+        for i, e in enumerate(self.history.entries):
+            if e.body_id not in replayed_bodies:
+                _, _, replay_mutated = self.history.replay_from(i)
+                mutated |= replay_mutated
+                replayed_bodies.add(e.body_id)
+
+        from cad.op_types import SketchOp
+        seen_sketch_ids: set[str] = set()
+        for e in self.history.entries:
+            if isinstance(e.op, SketchOp) and e.entry_id not in seen_sketch_ids:
+                seen_sketch_ids.add(e.entry_id)
+                _, _, dep_mutated = self.history.replay_sketch_dependents(e.entry_id)
+                mutated |= dep_mutated
+
         self._rebuild_bodies(mutated)
         self.history_changed.emit()
 
-    def do_reorder(self, src: int, dst: int):
+    def _do_reorder(self, src: int, dst: int):
+        """Raw reorder — called by ReorderCommand.apply()/revert() and direct callers."""
         entries = self.history.entries
         if src == dst or src < 0 or src >= len(entries):
             return
         print(f"[History] Reordering entry {src} → {dst}")
         self.history.reorder(src, dst)
+
         lo = min(src, dst)
-        replayed_bodies: set[str] = set()
         all_mutated: set[str] = set()
+        replayed_bodies: set[str] = set()
+
         for i, e in enumerate(self.history.entries):
             if i < lo:
                 continue
@@ -201,5 +234,59 @@ class HistoryMixin:
                 _, _, mutated = self.history.replay_from(i)
                 all_mutated |= mutated
                 replayed_bodies.add(e.body_id)
+
+        from cad.op_types import SketchOp
+        seen_sketch_ids: set[str] = set()
+        for e in self.history.entries:
+            if isinstance(e.op, SketchOp) and e.entry_id not in seen_sketch_ids:
+                seen_sketch_ids.add(e.entry_id)
+                _, _, dep_mutated = self.history.replay_sketch_dependents(e.entry_id)
+                all_mutated |= dep_mutated
+
         self._rebuild_bodies(all_mutated)
         self.history_changed.emit()
+
+    # ------------------------------------------------------------------
+    # Public command-stack entry points (used by history panel / keybinds)
+    # ------------------------------------------------------------------
+
+    def do_delete(self, index: int):
+        """Delete with undo support via command stack."""
+        import copy
+        entries = self.history.entries
+        if index < 0 or index >= len(entries):
+            return
+
+        # Snapshot the primary entry and any split/child entries before deletion.
+        entry_id = entries[index].entry_id
+        split_indices = sorted(
+            [i for i, e in enumerate(entries)
+             if e.params.get("source_entry_id") == entry_id]
+        )
+        all_indices = [index] + split_indices
+        entries_snapshot = [(i, copy.deepcopy(entries[i])) for i in all_indices]
+
+        # Snapshot bodies that will be removed.
+        child_body_ids = list(entries[index].params.get("child_body_ids", []))
+        split_body_ids = [entries[i].body_id for i in split_indices]
+        removed_bodies = [
+            (bid, copy.deepcopy(self.workspace.bodies[bid]))
+            for bid in (split_body_ids + child_body_ids)
+            if bid in self.workspace.bodies
+        ]
+
+        from viewer.history_commands import DeleteCommand
+        cmd = DeleteCommand(index, entries_snapshot, removed_bodies)
+        # Apply directly (skip push so we don't double-apply).
+        self._cmd_stack._do_push_no_apply(cmd)
+        self._do_delete(index)
+
+    def do_reorder(self, src: int, dst: int):
+        """Reorder with undo support via command stack."""
+        entries = self.history.entries
+        if src == dst or src < 0 or src >= len(entries):
+            return
+        from viewer.history_commands import ReorderCommand
+        cmd = ReorderCommand(src, dst)
+        self._cmd_stack._do_push_no_apply(cmd)
+        self._do_reorder(src, dst)

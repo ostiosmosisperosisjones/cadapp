@@ -334,10 +334,15 @@ class History:
                 try:
                     op.execute(current_shape, self, i)
                 except Exception as ex:
-                    entry.error     = True
-                    entry.error_msg = str(ex)
+                    entry.error        = True
+                    entry.error_msg    = str(ex)
+                    entry.shape_before = current_shape
+                    entry.shape_after  = None
+                    chain_broken = True
                     if not first_error:
                         first_error = str(ex)
+                    mutated_bodies.add(entry.body_id)
+                    continue
                 entry.shape_before = current_shape
                 entry.shape_after  = current_shape
                 continue
@@ -452,23 +457,33 @@ def _replay_sketch_entry(se, history: History, before_index: int
     """
     Update the plane cache and re-project all parametric ReferenceEntity
     instances on a SketchEntry.  Called during replay_from() for sketch ops.
+
+    Never mutates se if resolution fails — the cached plane stays valid so
+    the sketch doesn't visually corrupt to Z=0 while in an error state.
+    Also fails if the body the sketch plane references is itself in error.
     """
     from cad.sketch import ReferenceEntity
+
+    # Check that the body this sketch plane depends on is not in an error state.
+    # FacePlaneSource depends on a specific body; if that body's chain is broken
+    # the plane resolve might "succeed" but return stale/wrong geometry.
+    plane_body_id = getattr(se.plane_source, 'body_id', None)
+    if plane_body_id is not None:
+        # Walk entries up to before_index looking for the last entry on that body.
+        last_entry_for_body = None
+        for e in history._entries[:before_index]:
+            if e.body_id == plane_body_id:
+                last_entry_for_body = e
+        if last_entry_for_body is not None and last_entry_for_body.error:
+            return False, f"Sketch plane body '{plane_body_id}' is in an error state"
 
     try:
         b3d_plane = se.plane_source.resolve(history, before_index)
     except Exception as ex:
         return False, f"Sketch plane resolve failed: {ex}"
 
-    o = b3d_plane.origin
-    x = b3d_plane.x_dir
-    y = b3d_plane.y_dir
-    z = b3d_plane.z_dir
-    se.plane_origin = np.array([o.X, o.Y, o.Z], dtype=np.float64)
-    se.plane_x_axis = np.array([x.X, x.Y, x.Z], dtype=np.float64)
-    se.plane_y_axis = np.array([y.X, y.Y, y.Z], dtype=np.float64)
-    se.plane_normal = np.array([z.X, z.Y, z.Z], dtype=np.float64)
-
+    # Resolve all reference entities before committing any mutations.
+    ref_updates = []
     for ent in se.entities:
         if not isinstance(ent, ReferenceEntity) or ent.source is None:
             continue
@@ -476,16 +491,30 @@ def _replay_sketch_entry(se, history: History, before_index: int
             world_pts, occ_edges = ent.source.resolve(history, before_index)
         except Exception as ex:
             return False, f"Reference entity re-projection failed: {ex}"
+        ref_updates.append((ent, world_pts, occ_edges))
 
+    # All resolved successfully — now commit.
+    o = b3d_plane.origin
+    x = b3d_plane.x_dir
+    y = b3d_plane.y_dir
+    z = b3d_plane.z_dir
+    plane_origin = np.array([o.X, o.Y, o.Z], dtype=np.float64)
+    plane_x_axis = np.array([x.X, x.Y, x.Z], dtype=np.float64)
+    plane_y_axis = np.array([y.X, y.Y, y.Z], dtype=np.float64)
+    se.plane_origin = plane_origin
+    se.plane_x_axis = plane_x_axis
+    se.plane_y_axis = plane_y_axis
+    se.plane_normal = np.array([z.X, z.Y, z.Z], dtype=np.float64)
+
+    for ent, world_pts, occ_edges in ref_updates:
         uv_pts = []
         for wp in world_pts:
             wp_arr = np.array(wp, dtype=np.float64)
-            delta  = wp_arr - se.plane_origin
-            u = float(np.dot(delta, se.plane_x_axis))
-            v = float(np.dot(delta, se.plane_y_axis))
+            delta  = wp_arr - plane_origin
+            u = float(np.dot(delta, plane_x_axis))
+            v = float(np.dot(delta, plane_y_axis))
             uv_pts.append(np.array([u, v], dtype=np.float64))
         ent.points = uv_pts
-
         if occ_edges is not None:
             ent.occ_edges = occ_edges
 

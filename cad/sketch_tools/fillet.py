@@ -307,137 +307,42 @@ def compute_fillet_all(corner_pt, ent_a, end_a, ent_b, end_b,
         end_angle   = math.atan2(float(tp_b[1]-center[1]),
                                  float(tp_b[0]-center[0]))
 
-        span = (end_angle - start_angle) % (2*math.pi)
-        if span > math.pi:
-            start_angle, end_angle = end_angle, start_angle + 2*math.pi
-            span = (end_angle - start_angle) % (2*math.pi)
-            end_angle = start_angle + span
+        span_ccw = (end_angle - start_angle) % (2*math.pi)
+        span_cw  = (2*math.pi) - span_ccw
 
-        if span < tol:
+        if span_ccw < tol or span_cw < tol:
             continue
 
-        # Deduplicate — same center within tolerance
-        duplicate = any(
-            float(np.linalg.norm(r[0] - center)) < tol * 100
-            for r in results
-        )
-        if not duplicate:
-            results.append((center, tp_a, tp_b, start_angle, end_angle, t_a, t_b))
+        # Both arc spans connect tp_a to tp_b with the same center/radius.
+        # Store both; tag which one is interior (midpoint closer to corner).
+        def _arc_mid_pt(sa, sp):
+            a = sa + sp / 2.0
+            return center + radius * np.array([math.cos(a), math.sin(a)])
 
-    return results
+        mid_ccw = _arc_mid_pt(start_angle, span_ccw)
+        mid_cw  = _arc_mid_pt(start_angle + span_ccw, span_cw)
+        d_ccw = float(np.linalg.norm(mid_ccw - corner_pt))
+        d_cw  = float(np.linalg.norm(mid_cw  - corner_pt))
 
-
-def _mirror_fillet(center: np.ndarray, tp_a: np.ndarray, tp_b: np.ndarray,
-                   start_angle: float, end_angle: float,
-                   radius: float, tol: float = 1e-9) -> tuple | None:
-    """
-    Mirror the fillet arc center across the chord tp_a→tp_b.
-    Returns a new result tuple with the mirrored center, or None if degenerate.
-    """
-    chord = tp_b - tp_a
-    chord_len = float(np.linalg.norm(chord))
-    if chord_len < tol:
-        return None
-
-    # Reflect center across the line through tp_a and tp_b
-    chord_unit = chord / chord_len
-    v = center - tp_a
-    mirrored_center = center - 2 * float(np.dot(v, _left_normal(chord_unit))) * _left_normal(chord_unit)
-
-    # Arc angles: same connectivity as original (tp_a is start, tp_b is end)
-    # but winding flips when center mirrors, so just recompute CCW from tp_a to tp_b
-    new_sa = math.atan2(float(tp_a[1] - mirrored_center[1]),
-                        float(tp_a[0] - mirrored_center[0]))
-    new_ea = math.atan2(float(tp_b[1] - mirrored_center[1]),
-                        float(tp_b[0] - mirrored_center[0]))
-
-    # Force same winding direction as original arc (CCW = ea > sa, span < pi)
-    # by choosing the span that matches the original's span direction
-    orig_span = (end_angle - start_angle) % (2 * math.pi)
-    new_span  = (new_ea - new_sa) % (2 * math.pi)
-
-    # Mirror flips the winding — use the complementary span
-    if abs(new_span - (2 * math.pi - orig_span)) < abs(new_span - orig_span):
-        new_span = 2 * math.pi - orig_span
-    new_ea = new_sa + new_span
-
-    if new_span < tol or new_span > 2 * math.pi - tol:
-        return None
-
-    return (mirrored_center, tp_a.copy(), tp_b.copy(), new_sa, new_ea,
-            None, None)
-
-
-def _compute_fillet_other_side(corner_pt, ent_a, end_a, ent_b, end_b,
-                                radius: float, tol: float = 1e-6) -> list:
-    """
-    Return fillet candidates that are geometrically valid (correct radius)
-    but on the exterior side — i.e. failed _t_valid in compute_fillet_all.
-    These are the 'other side' options for the flip button.
-    """
-    from cad.sketch import LineEntity, ArcEntity
-
-    candidates = _fillet_center_candidates(ent_a, end_a, ent_b, end_b,
-                                           corner_pt, radius)
-    if not candidates:
-        return []
-    candidates.sort(key=lambda p: float(np.linalg.norm(p - corner_pt)))
-
-    def _t_valid_strict(t, end_idx):
-        if not (0.0 - tol <= t <= 1.0 + tol):
-            return False
-        return t > tol if end_idx == 0 else t < 1.0 - tol
-
-    results = []
-    for center in candidates:
-        if isinstance(ent_a, LineEntity):
-            tp_a, t_a = _foot_on_line(center, ent_a)
+        # Interior arc: midpoint closer to corner; exterior: farther
+        if d_ccw <= d_cw:
+            sa_in, ea_in = start_angle, start_angle + span_ccw
+            sa_ex, ea_ex = start_angle + span_ccw, start_angle + 2*math.pi
         else:
-            tp_a, t_a = _foot_on_arc(center, ent_a)
-
-        if isinstance(ent_b, LineEntity):
-            tp_b, t_b = _foot_on_line(center, ent_b)
-        else:
-            tp_b, t_b = _foot_on_arc(center, ent_b)
-
-        # Skip if it would have passed _t_valid (already in normal results)
-        if _t_valid_strict(t_a, end_a) and _t_valid_strict(t_b, end_b):
-            continue
-
-        # Must still have correct radius
-        da = float(np.linalg.norm(center - tp_a))
-        db = float(np.linalg.norm(center - tp_b))
-        if abs(da - radius) > radius * 0.05 + tol:
-            continue
-        if abs(db - radius) > radius * 0.05 + tol:
-            continue
-
-        # Only include candidates close to the corner (within ~10× radius)
-        if float(np.linalg.norm(center - corner_pt)) > radius * 10:
-            continue
-
-        # Clamp t to entity bounds for the arc/line trim
-        t_a = max(0.0, min(1.0, t_a))
-        t_b = max(0.0, min(1.0, t_b))
-
-        start_angle = math.atan2(float(tp_a[1]-center[1]),
-                                 float(tp_a[0]-center[0]))
-        end_angle   = math.atan2(float(tp_b[1]-center[1]),
-                                 float(tp_b[0]-center[0]))
-        span = (end_angle - start_angle) % (2*math.pi)
-        if span > math.pi:
-            start_angle, end_angle = end_angle, start_angle + 2*math.pi
-            span = (end_angle - start_angle) % (2*math.pi)
-            end_angle = start_angle + span
-        if span < tol:
-            continue
+            sa_in, ea_in = start_angle + span_ccw, start_angle + 2*math.pi
+            sa_ex, ea_ex = start_angle, start_angle + span_ccw
 
         duplicate = any(float(np.linalg.norm(r[0] - center)) < tol * 100
                         for r in results)
         if not duplicate:
-            results.append((center, tp_a, tp_b, start_angle, end_angle, t_a, t_b))
+            # Interior arc first, exterior (flip) arc second
+            results.append((center, tp_a, tp_b, sa_in, ea_in, t_a, t_b))
+            results.append((center, tp_a, tp_b, sa_ex, ea_ex, t_a, t_b))
 
     return results
+
+
+
 
 
 def compute_fillet(corner_pt, ent_a, end_a, ent_b, end_b,
@@ -569,19 +474,8 @@ class FilletTool(BaseTool):
             self._all_results = []
             return
         pt, ent_a, ent_b, end_a, end_b = self.selected_corner
-        normal = compute_fillet_all(pt, ent_a, end_a, ent_b, end_b, radius_mm)
-        tagged = [(r, end_a, end_b) for r in normal]
-
-        # Mirror the primary result's center across the tp_a→tp_b chord
-        # to get the "other concavity" option. Tangent points stay fixed.
-        if tagged:
-            best_r = tagged[0][0]
-            center, tp_a, tp_b, sa, ea2, t_a, t_b = best_r
-            mirrored = _mirror_fillet(center, tp_a, tp_b, sa, ea2, radius_mm)
-            if mirrored is not None:
-                tagged.append((mirrored, end_a, end_b))
-
-        self._all_results = tagged
+        all_results = compute_fillet_all(pt, ent_a, end_a, ent_b, end_b, radius_mm)
+        self._all_results = [(r, end_a, end_b) for r in all_results]
         self._result_idx = 0
 
     def apply_fillet(self, radius_mm: float, sketch) -> bool:

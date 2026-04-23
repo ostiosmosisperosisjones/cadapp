@@ -38,7 +38,7 @@ class SketchPickMixin:
             if entry.operation != "sketch":
                 continue
             se = entry.params.get("sketch_entry")
-            if se is None or not se.visible:
+            if se is None or not se.visible or entry.error:
                 continue
             try:
                 segs             = se.line_segments()

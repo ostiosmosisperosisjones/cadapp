@@ -234,34 +234,54 @@ def _constraint_from_dict(d: dict):
 # SketchEntry
 # ---------------------------------------------------------------------------
 
+def _snapshot_to_list(snapshot) -> list:
+    """Serialize one undo snapshot: (entities, constraints) tuple or bare entity list."""
+    if isinstance(snapshot, tuple):
+        ents, cons = snapshot
+        return {"entities": [_entity_to_dict(e) for e in ents],
+                "constraints": [_constraint_to_dict(c) for c in cons]}
+    return {"entities": [_entity_to_dict(e) for e in snapshot], "constraints": []}
+
+
+def _snapshot_from_dict(d) -> tuple:
+    if isinstance(d, list):
+        # legacy bare list format
+        return ([_entity_from_dict(e) for e in d], [])
+    ents = [_entity_from_dict(e) for e in d.get("entities", [])]
+    cons = [_constraint_from_dict(c) for c in d.get("constraints", [])]
+    return (ents, cons)
+
+
 def _sketch_entry_to_dict(se) -> dict:
     return {
-        "plane_origin": _arr(se.plane_origin),
-        "plane_x_axis": _arr(se.plane_x_axis),
-        "plane_y_axis": _arr(se.plane_y_axis),
-        "plane_normal": _arr(se.plane_normal),
-        "body_id":      se.body_id,
-        "face_idx":     se.face_idx,
-        "visible":      se.visible,
-        "plane_source": _plane_source_to_dict(se.plane_source),
-        "entities":     [_entity_to_dict(e) for e in se.entities],
-        "constraints":  [_constraint_to_dict(c) for c in se.constraints],
+        "plane_origin":   _arr(se.plane_origin),
+        "plane_x_axis":   _arr(se.plane_x_axis),
+        "plane_y_axis":   _arr(se.plane_y_axis),
+        "plane_normal":   _arr(se.plane_normal),
+        "body_id":        se.body_id,
+        "face_idx":       se.face_idx,
+        "visible":        se.visible,
+        "plane_source":   _plane_source_to_dict(se.plane_source),
+        "entities":       [_entity_to_dict(e) for e in se.entities],
+        "constraints":    [_constraint_to_dict(c) for c in se.constraints],
+        "undo_snapshots": [_snapshot_to_list(s) for s in getattr(se, 'undo_snapshots', [])],
     }
 
 
 def _sketch_entry_from_dict(d: dict):
     from cad.sketch import SketchEntry
     return SketchEntry(
-        plane_origin = d["plane_origin"],
-        plane_x_axis = d["plane_x_axis"],
-        plane_y_axis = d["plane_y_axis"],
-        plane_normal = d["plane_normal"],
-        entities     = [_entity_from_dict(e) for e in d.get("entities", [])],
-        body_id      = d["body_id"],
-        face_idx     = int(d["face_idx"]),
-        visible      = bool(d.get("visible", True)),
-        plane_source = _plane_source_from_dict(d.get("plane_source")),
-        constraints  = [_constraint_from_dict(c) for c in d.get("constraints", [])],
+        plane_origin   = d["plane_origin"],
+        plane_x_axis   = d["plane_x_axis"],
+        plane_y_axis   = d["plane_y_axis"],
+        plane_normal   = d["plane_normal"],
+        entities       = [_entity_from_dict(e) for e in d.get("entities", [])],
+        body_id        = d["body_id"],
+        face_idx       = int(d["face_idx"]),
+        visible        = bool(d.get("visible", True)),
+        plane_source   = _plane_source_from_dict(d.get("plane_source")),
+        constraints    = [_constraint_from_dict(c) for c in d.get("constraints", [])],
+        undo_snapshots = [_snapshot_from_dict(s) for s in d.get("undo_snapshots", [])],
     )
 
 

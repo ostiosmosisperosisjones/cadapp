@@ -88,7 +88,7 @@ class SketchModalMixin:
         mode = SketchMode(b3d_plane, se.body_id, se.face_idx,
                           plane_source=se.plane_source)
         existing = copy.deepcopy(se.entities)
-        mode._entity_snapshots = [existing[:i] for i in range(len(existing))]
+        mode._entity_snapshots = copy.deepcopy(se.undo_snapshots)
         mode.entities    = existing
         mode.constraints = copy.deepcopy(se.constraints)
         self._sketch = mode
@@ -164,18 +164,19 @@ class SketchModalMixin:
         if self._sketch is None:
             return
         sketch = self._sketch
-        from cad.sketch import LineEntity, ReferenceEntity, SketchEntry
+        from cad.sketch import LineEntity, ArcEntity, ReferenceEntity, SketchEntry
         lines = [e for e in sketch.entities if isinstance(e, LineEntity)]
+        arcs  = [e for e in sketch.entities if isinstance(e, ArcEntity)]
         refs  = [e for e in sketch.entities if isinstance(e, ReferenceEntity)]
         editing_idx = self._editing_sketch_history_idx
-        if not lines and not refs:
+        if not lines and not arcs and not refs:
             if editing_idx is not None:
                 # Empty sketch on re-edit — delete the entry and cascade
                 self._complete_sketch_delete(editing_idx)
             else:
                 print("[Sketch] Nothing to commit — draw lines or include geometry first.")
             return
-        entity_count = len(lines) + len(refs)
+        entity_count = len(lines) + len(arcs) + len(refs)
         new_se = SketchEntry.from_sketch_mode(sketch)
 
         if editing_idx is not None:
