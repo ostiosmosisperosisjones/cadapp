@@ -308,9 +308,9 @@ def draw_world_planes(world_plane_visible: dict, scene_radius: float = 100.0):
     arm = scene_radius * 0.06
     glLineWidth(2.0)
     glBegin(GL_LINES)
-    glColor4f(0.85, 0.25, 0.25, 0.9); glVertex3f(0, 0, 0); glVertex3f(arm, 0, 0)
-    glColor4f(0.25, 0.75, 0.25, 0.9); glVertex3f(0, 0, 0); glVertex3f(0, arm, 0)
-    glColor4f(0.30, 0.55, 0.90, 0.9); glVertex3f(0, 0, 0); glVertex3f(0, 0, arm)
+    glColor4f(0.85, 0.25, 0.25, 0.9); glVertex3f(0, 0, 0); glVertex3f(arm, 0, 0)  # X red
+    glColor4f(0.30, 0.55, 0.90, 0.9); glVertex3f(0, 0, 0); glVertex3f(0, arm, 0)  # Y blue
+    glColor4f(0.25, 0.75, 0.25, 0.9); glVertex3f(0, 0, 0); glVertex3f(0, 0, arm)  # Z green (up)
     glEnd()
     glLineWidth(1.0)
     glPointSize(6.0)

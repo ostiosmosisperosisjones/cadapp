@@ -169,3 +169,54 @@ class FaceRef:
             centroid_perp  = self.centroid_perp,
             centroid_along = round(self.centroid_along + distance, 6),
         )
+
+
+# ---------------------------------------------------------------------------
+# AnyFaceRef  —  centroid+area fingerprint that works for non-planar faces
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AnyFaceRef:
+    """
+    Geometry-based face identifier for any face type (planar or curved).
+
+    Matches by centroid position and area — sufficient to re-locate a
+    face after operations that preserve face identity (thicken, offset).
+    """
+    centroid: tuple   # (x, y, z) world coords
+    area:     float
+
+    @classmethod
+    def from_occ_face(cls, occ_face) -> "AnyFaceRef":
+        centroid, area = _occ_face_props(occ_face)
+        return cls(
+            centroid = tuple(np.round(centroid, 6)),
+            area     = round(float(area), 6),
+        )
+
+    def find_in(self, shape,
+                area_tol:     float = 0.5,
+                centroid_tol: float = 0.5,
+                ) -> tuple[int, object] | tuple[None, None]:
+        """
+        Find best matching face by centroid proximity and area.
+        Returns (face_index, b3d_face) or (None, None).
+        """
+        ref_c = np.array(self.centroid)
+        best_idx  = None
+        best_face = None
+        best_dist = float("inf")
+
+        for idx, face in enumerate(shape.faces()):
+            centroid, area = _occ_face_props(face.wrapped)
+            if abs(area - self.area) > area_tol:
+                continue
+            dist = float(np.linalg.norm(centroid - ref_c))
+            if dist > centroid_tol:
+                continue
+            if dist < best_dist:
+                best_dist  = dist
+                best_idx   = idx
+                best_face  = face
+
+        return best_idx, best_face

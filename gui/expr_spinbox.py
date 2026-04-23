@@ -65,7 +65,7 @@ class ExprSpinBox(QLineEdit):
         self._valid    = True
 
         self.setStyleSheet(self._STYLE_NORMAL)
-        self.setFixedWidth(140)
+        self.setMinimumWidth(60)
         self.setAlignment(Qt.AlignmentFlag.AlignRight)
 
         self.editingFinished.connect(self._on_commit)

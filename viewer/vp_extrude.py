@@ -174,6 +174,9 @@ class ExtrudeMixin:
                                  sketch_idx, body_id, face_idx):
         """Compute the preview solid and trigger a repaint."""
         from cad.operations.extrude import _do_extrude_solid
+        panel        = getattr(self, '_extrude_panel', None)
+        start_offset = (panel._start_offset.mm_value() or 0.0) if panel else 0.0
+        end_offset   = (panel._end_offset.mm_value()   or 0.0) if panel else 0.0
         try:
             if sketch_idx is not None:
                 all_faces = self._sketch_faces.get(sketch_idx, [])
@@ -201,7 +204,9 @@ class ExtrudeMixin:
                 self.update(); return
 
             self._extrude_preview_mesh = [
-                _do_extrude_solid(f, dist, direction) for f in preview_faces
+                _do_extrude_solid(f, dist, direction,
+                                  start_offset=start_offset, end_offset=end_offset)
+                for f in preview_faces
             ]
             self._extrude_preview_dist = dist
         except Exception as ex:

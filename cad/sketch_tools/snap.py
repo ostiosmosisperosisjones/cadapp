@@ -31,6 +31,7 @@ class SnapType(Enum):
     NEAREST      = auto()
     TANGENT      = auto()
     INTERSECTION = auto()   # future
+    ANGLE        = auto()   # angle-locked to 15° increments from anchor
 
 
 @dataclass
@@ -51,12 +52,15 @@ class SnapResult:
 
 class SnapEngine:
 
+    ANGLE_STEP_DEG = 15.0   # degrees between sticky angles
+
     def __init__(self, snap_radius_mm: float = 2.0, grid_size: float = 1.0):
         self.snap_radius_mm  = snap_radius_mm
         self.grid_size       = grid_size
         self.forced_type: SnapType | None = None   # legacy one-shot
         self.declared_type: SnapType | None = None  # sticky until click
-        self.anchor_pt: np.ndarray | None = None    # set by active tool; used by tangent snap
+        self.anchor_pt: np.ndarray | None = None    # set by active tool; used by tangent/angle snap
+        self.angle_snap_active: bool = False         # True while Shift held in a modal tool
         self.enabled: set[SnapType] = {
             SnapType.ENDPOINT,
             SnapType.MIDPOINT,
@@ -74,11 +78,33 @@ class SnapEngine:
         """Clear the sticky declaration after a click."""
         self.declared_type = None
 
+    def set_angle_snap(self, active: bool):
+        self.angle_snap_active = active
+
     def set_grid_snap(self, active: bool):
-        if active:
-            self.enabled.add(SnapType.GRID)
-        else:
-            self.enabled.discard(SnapType.GRID)
+        """Legacy — kept for compatibility; maps to angle snap."""
+        self.set_angle_snap(active)
+
+    # ------------------------------------------------------------------
+    # Angle-lock helper
+    # ------------------------------------------------------------------
+
+    def _apply_angle_lock(self, cursor: np.ndarray) -> tuple[np.ndarray, float]:
+        """
+        Project cursor onto the nearest 15° ray from anchor_pt.
+        Returns (locked_cursor, locked_angle_deg).
+        Only called when angle_snap_active and anchor_pt is set.
+        """
+        delta = cursor - self.anchor_pt
+        dist  = float(np.linalg.norm(delta))
+        if dist < 1e-9:
+            return cursor.copy(), 0.0
+        raw_deg  = float(np.degrees(np.arctan2(delta[1], delta[0])))
+        step     = self.ANGLE_STEP_DEG
+        snapped  = round(raw_deg / step) * step
+        rad      = np.radians(snapped)
+        locked   = self.anchor_pt + dist * np.array([np.cos(rad), np.sin(rad)])
+        return locked, snapped % 360
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -96,30 +122,46 @@ class SnapEngine:
         cursor = np.array(cursor_pt2d, dtype=np.float64)
         radius = self.snap_radius_mm
 
+        # Angle lock: when Shift is held and a tool anchor is set, constrain
+        # the cursor to 15° rays from the anchor before running other snaps.
+        angle_locked = False
+        locked_angle = 0.0
+        if self.angle_snap_active and self.anchor_pt is not None:
+            cursor, locked_angle = self._apply_angle_lock(cursor)
+            angle_locked = True
+
         # declared_type is sticky (set by key press, cleared by consume_declared)
         # forced_type is one-shot legacy
         forced = self.declared_type or self.forced_type
         self.forced_type = None
 
         if forced is not None:
-            # Use a larger search radius when snap is declared — user is explicit
             search_r = max(radius * 8, 20.0)
             p, eidx = self._try_snap(forced, cursor, sketch_entities, search_r, plane)
             if p is not None:
                 return SnapResult(point=p, type=forced, cursor_raw=cursor,
                                   entity_idx=eidx)
-            # Declared but nothing found — return FREE so cursor moves freely
             return SnapResult(point=cursor.copy(), type=SnapType.FREE,
                               cursor_raw=cursor)
 
-        for snap_type in [SnapType.ENDPOINT, SnapType.MIDPOINT,
-                          SnapType.CENTER, SnapType.NEAREST, SnapType.GRID]:
+        # When angle-locked, run endpoint/midpoint/center/nearest snaps against
+        # the locked cursor (so snapping to geometry on the constrained ray works),
+        # but skip GRID (irrelevant when angle-locked).
+        snap_order = [SnapType.ENDPOINT, SnapType.MIDPOINT,
+                      SnapType.CENTER, SnapType.NEAREST, SnapType.GRID]
+        for snap_type in snap_order:
+            if angle_locked and snap_type == SnapType.GRID:
+                continue
             if snap_type not in self.enabled:
                 continue
             p, eidx = self._try_snap(snap_type, cursor, sketch_entities, radius, plane)
             if p is not None:
                 return SnapResult(point=p, type=snap_type, cursor_raw=cursor,
                                   entity_idx=eidx)
+
+        if angle_locked:
+            return SnapResult(point=cursor.copy(), type=SnapType.ANGLE,
+                              cursor_raw=cursor_pt2d)
 
         return SnapResult(point=cursor.copy(), type=SnapType.FREE,
                           cursor_raw=cursor)

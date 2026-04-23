@@ -130,7 +130,9 @@ class FaceExtrudeOp(Op):
         direction = (np.array(self.direction, dtype=float)
                      if self.direction is not None else None)
         if self.force_new_body:
-            extruded = _do_extrude_solid(face_obj, self.distance, direction)
+            extruded = _do_extrude_solid(face_obj, self.distance, direction,
+                                         start_offset=self.start_offset,
+                                         end_offset=self.end_offset)
             result = Compound(extruded.wrapped)
             # Update child body source_shapes from the workspace back-reference.
             child_body_ids = entry.params.get("child_body_ids", [])
@@ -141,7 +143,8 @@ class FaceExtrudeOp(Op):
                     if body is not None:
                         body.source_shape = Compound(solids[i].wrapped) if i < len(solids) else None
             return shape  # source body is unchanged
-        return extrude_face(shape, face_idx, self.distance, direction=direction)
+        return extrude_face(shape, face_idx, self.distance, direction=direction,
+                            start_offset=self.start_offset, end_offset=self.end_offset)
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         try:
@@ -180,12 +183,16 @@ class FaceExtrudeOp(Op):
         original_solid_count = len(list(shape_before.solids()))
 
         if self.force_new_body:
-            face_obj  = list(shape_before.faces())[self.face_idx]
-            distance  = self.distance
-            body_id   = self.source_body_id
+            face_obj     = list(shape_before.faces())[self.face_idx]
+            distance     = self.distance
+            body_id      = self.source_body_id
+            start_offset = self.start_offset
+            end_offset   = self.end_offset
 
             def compute():
-                extruded = _do_extrude_solid(face_obj, distance, direction)
+                extruded = _do_extrude_solid(face_obj, distance, direction,
+                                             start_offset=start_offset,
+                                             end_offset=end_offset)
                 return Compound(extruded.wrapped)
 
             def finalize(shape_after):
@@ -215,11 +222,14 @@ class FaceExtrudeOp(Op):
 
             return compute, finalize
 
-        face_idx = self.face_idx
-        distance = self.distance
+        face_idx     = self.face_idx
+        distance     = self.distance
+        start_offset = self.start_offset
+        end_offset   = self.end_offset
 
         def compute():
-            result = extrude_face(shape_before, face_idx, distance, direction=direction)
+            result = extrude_face(shape_before, face_idx, distance, direction=direction,
+                                  start_offset=start_offset, end_offset=end_offset)
             if not list(result.solids()):
                 raise RuntimeError("Boolean result has no solids.")
             return result
@@ -385,7 +395,8 @@ class CrossBodyCutOp(Op):
                 fd = -np.array([z.X, z.Y, z.Z], dtype=float)
             else:
                 fd = tool_dir
-            s = _do_extrude_solid(face, tool_dist, fd)
+            s = _do_extrude_solid(face, tool_dist, fd,
+                                  start_offset=self.start_offset, end_offset=self.end_offset)
             if tool_solid is None:
                 tool_solid = s
             else:
@@ -454,8 +465,10 @@ class CrossBodyCutOp(Op):
         if target_shape is None:
             raise RuntimeError("[Cut] Target body has no shape.")
         original_solid_count = len(list(target_shape.solids()))
-        target_occ = target_shape.wrapped
-        tool_dist  = self.distance + 0.01
+        target_occ   = target_shape.wrapped
+        tool_dist    = self.distance + 0.01
+        start_offset = self.start_offset
+        end_offset   = self.end_offset
 
         op_params = self.to_params()
         if extra_params:
@@ -469,7 +482,8 @@ class CrossBodyCutOp(Op):
                 else:
                     z  = Plane(face).z_dir
                     fd = -np.array([z.X, z.Y, z.Z], dtype=float)
-                s = _do_extrude_solid(face, tool_dist, fd)
+                s = _do_extrude_solid(face, tool_dist, fd,
+                                      start_offset=start_offset, end_offset=end_offset)
                 if tool_solid is None:
                     tool_solid = s
                 else:
@@ -675,7 +689,9 @@ class SketchExtrudeOp(Op):
 
         result = shape
         for face in faces:
-            result = extrude_face_direct(result, face, signed_dist)
+            result = extrude_face_direct(result, face, signed_dist,
+                                         start_offset=self.start_offset,
+                                         end_offset=self.end_offset)
 
         solids = list(result.solids())
         solids.sort(key=lambda s: s.volume, reverse=True)
@@ -752,7 +768,9 @@ class SketchExtrudeOp(Op):
             op_params.update(extra_params)
         mesh     = viewport._meshes.get(body_id)
         face_ref = (FaceRef.from_b3d_face(mesh.occt_faces[se.face_idx]) if mesh else None)
-        distance = self.distance
+        distance     = self.distance
+        start_offset = self.start_offset
+        end_offset   = self.end_offset
 
         # --- merge branch ---
         if self.merge_body_id is not None and not self.force_new_body:
@@ -773,7 +791,8 @@ class SketchExtrudeOp(Op):
             def compute():
                 tool_solid = None
                 for face in faces:
-                    s = _do_extrude_solid(face, distance, direction)
+                    s = _do_extrude_solid(face, distance, direction,
+                                          start_offset=start_offset, end_offset=end_offset)
                     if tool_solid is None:
                         tool_solid = s
                     else:
@@ -808,7 +827,8 @@ class SketchExtrudeOp(Op):
         def compute():
             result = None if force_new else shape_before
             for face in faces:
-                result = extrude_face_direct(result, face, distance, direction=direction)
+                result = extrude_face_direct(result, face, distance, direction=direction,
+                                             start_offset=start_offset, end_offset=end_offset)
             if not force_new and not list(result.solids()):
                 raise RuntimeError("Sketch extrude produced no solids.")
             return result
@@ -1084,28 +1104,53 @@ def _push_result(viewport, op_str: str, op_params: dict, body_id: str,
 @dataclass
 class ThickenOp(Op):
     """
-    Grow one or more faces on *source_body_id* outward by *thickness* mm,
-    fusing each thickened solid into the body in turn.
+    Grow/shrink one or more faces on *source_body_id* by *thickness* mm.
 
     source_body_id : body whose faces are selected
-    face_indices   : list of face indices to thicken
-    thickness      : mm — positive = grow outward
+    face_indices   : face indices at commit time (fallback for old entries)
+    face_refs      : AnyFaceRef fingerprints — used for stable replay
+    thickness      : mm — positive = grow outward, negative = cut inward
     """
     source_body_id: str
     face_indices:   list
     thickness:      float
+    face_refs:      list = None   # list of AnyFaceRef, populated at commit
 
-    # Legacy single-face convenience (used by reopen and old serialised entries)
+    def __post_init__(self):
+        if self.face_refs is None:
+            self.face_refs = []
+
+    # Legacy single-face convenience
     @property
     def face_idx(self) -> int:
         return self.face_indices[0] if self.face_indices else 0
 
+    def _resolve_faces(self, shape):
+        """Return list of (idx, b3d_face) using face_refs when available."""
+        from cad.face_ref import AnyFaceRef
+        all_faces = list(shape.faces())
+        resolved = []
+        if self.face_refs:
+            for ref in self.face_refs:
+                idx, face = ref.find_in(shape)
+                if idx is None:
+                    raise RuntimeError(
+                        f"ThickenOp: could not re-locate face "
+                        f"(centroid={ref.centroid}, area={ref.area:.3f})")
+                resolved.append((idx, face))
+        else:
+            # Fallback for old entries without face_refs
+            for idx in self.face_indices:
+                if idx >= len(all_faces):
+                    raise RuntimeError(f"ThickenOp: face_idx {idx} out of range")
+                resolved.append((idx, all_faces[idx]))
+        return resolved
+
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         from cad.operations.thicken import thicken_face
-        all_faces = list(shape.faces())
+        resolved = self._resolve_faces(shape)
         result = shape
-        for idx in self.face_indices:
-            face = all_faces[idx]
+        for _idx, face in resolved:
             result = thicken_face(result.wrapped, face.wrapped, self.thickness)
         return result
 
@@ -1120,6 +1165,7 @@ class ThickenOp(Op):
 
     def _split_commit(self, viewport: Any, extra_params: dict | None = None):
         from cad.operations.thicken import thicken_face
+        from cad.face_ref import AnyFaceRef
 
         shape_before = viewport.workspace.current_shape(self.source_body_id)
         if shape_before is None:
@@ -1128,6 +1174,12 @@ class ThickenOp(Op):
         for idx in self.face_indices:
             if idx >= len(all_faces):
                 raise RuntimeError(f"[Thicken] face_idx {idx} out of range")
+
+        # Build face_refs now so execute() can re-locate faces after history edits.
+        self.face_refs = [
+            AnyFaceRef.from_occ_face(all_faces[idx].wrapped)
+            for idx in self.face_indices
+        ]
 
         # Snapshot OCC pointers — safe to capture for the worker thread.
         body_occ   = shape_before.wrapped
@@ -1161,27 +1213,40 @@ class ThickenOp(Op):
         vp._show_thicken_panel(self.source_body_id, self.face_indices, editing_entry=entry)
         panel = getattr(vp, '_thicken_panel', None)
         if panel is not None:
-            panel._spinbox.set_mm(self.thickness)
+            panel.set_thickness(self.thickness)
             panel._emit_preview()
 
     def to_params(self) -> dict:
-        return {
+        p: dict = {
             "source_body_id": self.source_body_id,
             "face_indices":   self.face_indices,
             "thickness":      self.thickness,
         }
+        if self.face_refs:
+            p["face_refs"] = [
+                {"centroid": list(r.centroid), "area": r.area}
+                for r in self.face_refs
+            ]
+        return p
 
     @classmethod
     def _from_params(cls, params: dict, sign: int = 1) -> "ThickenOp":
+        from cad.face_ref import AnyFaceRef
         # Support old single-face entries (face_idx key) transparently.
         if "face_indices" in params:
             indices = list(params["face_indices"])
         else:
             indices = [int(params.get("face_idx", 0))]
+        raw_refs = params.get("face_refs", [])
+        face_refs = [
+            AnyFaceRef(centroid=tuple(r["centroid"]), area=r["area"])
+            for r in raw_refs
+        ]
         return cls(
             source_body_id = params.get("source_body_id", ""),
             face_indices   = indices,
             thickness      = float(params.get("thickness", 0)),
+            face_refs      = face_refs,
         )
 
 

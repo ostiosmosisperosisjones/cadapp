@@ -226,6 +226,42 @@ class SketchOverlay:
         glColor3f(r, g, b)
         glLineWidth(1.6)
 
+        # Angle-lock ray: dashed line from anchor along the locked angle
+        snap = getattr(sketch, 'last_snap', None)
+        from cad.sketch_tools.snap import SnapType as _ST
+        if (snap is not None and snap.type == _ST.ANGLE
+                and sketch.snap.anchor_pt is not None):
+            import math as _math
+            anchor = sketch.snap.anchor_pt
+            cur_s  = snap.point
+            delta  = cur_s - anchor
+            dist   = float(np.linalg.norm(delta))
+            if dist > 1e-6:
+                # Extend the ray well beyond the cursor so it reads as a guide
+                direction = delta / dist
+                far = anchor + direction * max(dist * 2.0, 40.0)
+                glColor4f(0.40, 0.85, 1.00, 0.45)
+                glLineWidth(1.0)
+                # Dashed: draw short segments with gaps
+                seg_len  = 3.0   # mm on
+                gap_len  = 3.0   # mm off
+                total    = float(np.linalg.norm(far - anchor))
+                t = 0.0
+                drawing = True
+                glBegin(GL_LINES)
+                while t < total:
+                    t_end = min(t + (seg_len if drawing else gap_len), total)
+                    if drawing:
+                        p0 = anchor + direction * t
+                        p1 = anchor + direction * t_end
+                        glVertex3f(*self._pt(sketch.plane, p0[0], p0[1]))
+                        glVertex3f(*self._pt(sketch.plane, p1[0], p1[1]))
+                    t = t_end
+                    drawing = not drawing
+                glEnd()
+            glColor3f(r, g, b)
+            glLineWidth(1.6)
+
         if sketch.tool == SketchTool.LINE:
             from cad.sketch_tools.line import LineTool, _HLINE_EXTENT
             tool = sketch._active_tool
@@ -641,6 +677,7 @@ class SketchOverlay:
             SnapType.TANGENT:      (0.85, 0.30, 1.00),   # purple
             SnapType.INTERSECTION: (1.00, 0.20, 0.50),   # pink-red
             SnapType.GRID:         (0.55, 0.55, 0.55),   # grey
+            SnapType.ANGLE:        (0.40, 0.85, 1.00),   # cyan
         }
         r, g, b = colors.get(snap.type, (1.0, 1.0, 1.0))
 
@@ -722,6 +759,22 @@ class SketchOverlay:
             glVertex3f(*self._pt(sketch.plane, u + s, v))
             glVertex3f(*self._pt(sketch.plane, u,     v - s))
             glVertex3f(*self._pt(sketch.plane, u - s, v))
+            glEnd()
+
+        elif snap.type == SnapType.ANGLE:
+            # Rotated square (diamond) + small arc tick
+            glBegin(GL_LINE_LOOP)
+            glVertex3f(*self._pt(sketch.plane, u,       v + s))
+            glVertex3f(*self._pt(sketch.plane, u + s,   v))
+            glVertex3f(*self._pt(sketch.plane, u,       v - s))
+            glVertex3f(*self._pt(sketch.plane, u - s,   v))
+            glEnd()
+            # Tick lines (cross inside diamond)
+            glBegin(GL_LINES)
+            glVertex3f(*self._pt(sketch.plane, u - s * 0.5, v))
+            glVertex3f(*self._pt(sketch.plane, u + s * 0.5, v))
+            glVertex3f(*self._pt(sketch.plane, u, v - s * 0.5))
+            glVertex3f(*self._pt(sketch.plane, u, v + s * 0.5))
             glEnd()
 
         glLineWidth(1.0)

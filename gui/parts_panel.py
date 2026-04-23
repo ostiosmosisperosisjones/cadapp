@@ -326,8 +326,9 @@ class PartsPanel(QWidget):
             return
         try:
             if fmt == "STEP":
-                from build123d import export_step
-                export_step(shape, path)
+                from build123d import export_step, Compound
+                from cad.importer import _heal
+                export_step(Compound(_heal(shape.wrapped)), path)
             elif fmt == "STL":
                 from build123d import export_stl
                 export_stl(shape, path)

@@ -819,7 +819,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     if origin is not None:
                         shift = bool(e.modifiers() &
                                      Qt.KeyboardModifier.ShiftModifier)
-                        self._sketch.snap.set_grid_snap(shift)
+                        self._sketch.snap.set_angle_snap(shift)
                         self._sketch.snap.snap_radius_mm = self._snap_radius_mm()
                         self._sketch.handle_click(
                             origin, direction, self.camera.distance)
@@ -983,7 +983,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 if origin is not None:
                     shift = bool(e.modifiers() &
                                  Qt.KeyboardModifier.ShiftModifier)
-                    self._sketch.snap.set_grid_snap(shift)
+                    self._sketch.snap.set_angle_snap(shift)
                     self._sketch.snap.snap_radius_mm = self._snap_radius_mm()
                     self._sketch.handle_mouse_move(
                         origin, direction, self.camera.distance)

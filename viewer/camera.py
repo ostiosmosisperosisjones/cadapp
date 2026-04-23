@@ -88,9 +88,10 @@ class Camera:
         self.ortho_scale = 1.5
         self.ortho       = True
         # Rotation stored as a quaternion (w, x, y, z)
-        # Default: slight elevation and azimuth so the initial view is isometric-ish
-        q_el  = _quat_from_axis_angle(np.array([1,0,0], dtype=float), radians(20))
-        q_az  = _quat_from_axis_angle(np.array([0,1,0], dtype=float), radians(-30))
+        # Default: isometric-ish view with Z-up convention.
+        # Azimuth around world Z, then tilt down toward the XY ground plane.
+        q_az  = _quat_from_axis_angle(np.array([0,0,1], dtype=float), radians(45))
+        q_el  = _quat_from_axis_angle(np.array([1,0,0], dtype=float), radians(60))
         self.rotation = _quat_mul(q_el, q_az)
         self.rotation /= np.linalg.norm(self.rotation)
         # Orbit drag state
@@ -342,9 +343,9 @@ class Camera:
             up /= np.linalg.norm(up)
         else:
             # Fallback: derive axes from world up (world-plane sketches)
-            world_up = np.array([0.0, 1.0, 0.0])
+            world_up = np.array([0.0, 0.0, 1.0])
             if abs(np.dot(forward, world_up)) > 0.99:
-                world_up = np.array([0.0, 0.0, 1.0])
+                world_up = np.array([0.0, 1.0, 0.0])
             right = np.cross(world_up, forward)
             right /= np.linalg.norm(right)
             up = np.cross(forward, right)

@@ -155,15 +155,22 @@ class ThickenMixin:
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
+        is_cut = getattr(self, '_thicken_preview_dist', 0.0) < 0
         if tris:
-            glColor4f(0.22, 0.70, 0.45, 0.22)
+            if is_cut:
+                glColor4f(0.70, 0.22, 0.22, 0.22)
+            else:
+                glColor4f(0.22, 0.70, 0.45, 0.22)
             glBegin(GL_TRIANGLES)
             for i in range(0, len(tris), 3):
                 glVertex3f(tris[i], tris[i+1], tris[i+2])
             glEnd()
 
         if edges:
-            glColor4f(0.40, 0.90, 0.60, 0.80)
+            if is_cut:
+                glColor4f(0.90, 0.40, 0.40, 0.80)
+            else:
+                glColor4f(0.40, 0.90, 0.60, 0.80)
             glLineWidth(1.4)
             for strip in edges:
                 glBegin(GL_LINE_STRIP)

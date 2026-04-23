@@ -28,7 +28,7 @@ def _snap_meta(snap_result) -> tuple | None:
     """
     if snap_result is None:
         return None
-    skip = {SnapType.FREE, SnapType.GRID, SnapType.ENDPOINT, SnapType.INTERSECTION}
+    skip = {SnapType.FREE, SnapType.GRID, SnapType.ANGLE, SnapType.ENDPOINT, SnapType.INTERSECTION}
     if snap_result.type in skip or snap_result.entity_idx is None:
         return None
     return (snap_result.entity_idx, snap_result.type)

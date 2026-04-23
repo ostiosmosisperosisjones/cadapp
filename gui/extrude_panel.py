@@ -445,16 +445,13 @@ class ExtrudePanel(QWidget):
 
     def _dist_and_dir(self):
         """Return (abs_distance_mm, direction_or_None). Distance is always positive."""
-        start_off = self._start_offset.mm_value() or 0.0
-        end_off   = self._end_offset.mm_value()   or 0.0
-
         if self._target_group.checkedId() == 1:
             if self._vertex_dist_mm is None:
                 return None, None
             # _vertex_dist_mm is signed: negative means vertex is behind the face
             # normal.  Absorb the sign into a direction flip so callers always
             # receive a positive distance.
-            vtx_signed = self._vertex_dist_mm + end_off - start_off
+            vtx_signed = self._vertex_dist_mm
             vtx_flip   = vtx_signed < 0
             dist       = abs(vtx_signed)
         else:
@@ -462,7 +459,7 @@ class ExtrudePanel(QWidget):
             dist = self._spinbox.mm_value()
             if dist is None:
                 return None, None
-            dist = abs(dist) + end_off - start_off
+            dist = abs(dist)
 
         flip = self._flip ^ vtx_flip   # XOR: user flip + vertex-direction flip
 
