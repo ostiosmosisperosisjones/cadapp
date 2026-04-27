@@ -227,14 +227,36 @@ class TrimTool(BaseTool):
         if len(pieces) <= 1:
             return False
 
-        # Find the piece whose midpoint is closest to click_pt
-        def piece_mid(p):
-            if isinstance(p, LineEntity):
-                return _line_mid(p)
-            return _arc_mid(p)
+        # Find the piece the click falls on by projecting onto each piece.
+        # For lines: use the parameter of the click projection on the original
+        # line so that tail segments (sharing an endpoint with inner segments)
+        # are disambiguated correctly even when the nearest-point distances tie.
+        from cad.sketch_tools.snap import _nearest_on_segment, _nearest_on_arc
 
-        remove_idx = min(range(len(pieces)),
-                         key=lambda i: np.linalg.norm(piece_mid(pieces[i]) - click_pt))
+        if isinstance(target, LineEntity):
+            d = target.p1 - target.p0
+            len_sq = float(np.dot(d, d))
+            t_click = (float(np.dot(click_pt - target.p0, d)) / len_sq
+                       if len_sq > 1e-12 else 0.0)
+
+            def piece_score_line(p):
+                # parameter range of this piece on the original line
+                d2 = target.p1 - target.p0
+                ta = float(np.dot(p.p0 - target.p0, d2)) / len_sq
+                tb = float(np.dot(p.p1 - target.p0, d2)) / len_sq
+                lo, hi = min(ta, tb), max(ta, tb)
+                # distance from t_click to this piece's interval
+                return max(0.0, lo - t_click, t_click - hi)
+
+            remove_idx = min(range(len(pieces)),
+                             key=lambda i: piece_score_line(pieces[i]))
+        else:
+            def piece_nearest_dist(p):
+                nearest, _ = _nearest_on_arc(click_pt, p)
+                return float(np.linalg.norm(nearest - click_pt))
+
+            remove_idx = min(range(len(pieces)),
+                             key=lambda i: piece_nearest_dist(pieces[i]))
 
         survivors = [p for i, p in enumerate(pieces) if i != remove_idx]
 

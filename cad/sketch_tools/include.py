@@ -17,6 +17,48 @@ from __future__ import annotations
 import numpy as np
 
 
+def _is_circle_edge_on(occ_edge, sketch_plane_normal: np.ndarray,
+                        tol: float = 1e-3) -> bool:
+    """True if occ_edge is a circle whose normal is perpendicular to the sketch plane."""
+    try:
+        from OCP.BRepAdaptor import BRepAdaptor_Curve as _BAC
+        from OCP.GeomAbs import GeomAbs_Circle
+        adp = _BAC(occ_edge)
+        if adp.GetType() != GeomAbs_Circle:
+            return False
+        ax = adp.Circle().Axis().Direction()
+        circ_normal = np.array([ax.X(), ax.Y(), ax.Z()], dtype=np.float64)
+        return abs(float(np.dot(circ_normal, sketch_plane_normal))) < tol
+    except Exception:
+        return False
+
+
+def _collapse_if_degenerate(uv_pts: list, tol: float = 1e-3) -> list:
+    """
+    If all UV points are collinear (e.g. a circle projected edge-on), return
+    just the two extreme endpoints.  Otherwise return uv_pts unchanged.
+    """
+    if len(uv_pts) < 3:
+        return uv_pts
+    pts = np.array(uv_pts, dtype=np.float64)
+    centroid = pts.mean(axis=0)
+    centered = pts - centroid
+    # PCA: largest singular value direction
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    axis = vt[0]
+    projections = centered @ axis
+    spread_along = projections.max() - projections.min()
+    spread_perp  = np.linalg.norm(centered - np.outer(projections, axis), axis=1).max()
+    if spread_along < 1e-9:
+        return uv_pts
+    if spread_perp / spread_along > tol:
+        return uv_pts  # genuinely 2-D shape, keep all points
+    # Degenerate: return the two extreme points
+    i_min = int(np.argmin(projections))
+    i_max = int(np.argmax(projections))
+    return [uv_pts[i_min], uv_pts[i_max]]
+
+
 class IncludeTool:
 
     @staticmethod
@@ -53,6 +95,7 @@ class IncludeTool:
 
             world_pts = mesh.topo_edges[es.edge_idx]          # (N,3) float32
             uv_pts    = [sketch.plane.project_point(p) for p in world_pts]
+            uv_pts    = _collapse_if_degenerate(uv_pts)
             if len(uv_pts) < 2:
                 continue
 
@@ -63,6 +106,12 @@ class IncludeTool:
                 edge_ref = EdgeRef.from_occ_edge(occ_edge)
                 if edge_ref is not None:
                     source = BodyEdgeSource(es.body_id, edge_ref)
+
+            # A circle viewed edge-on projects to a line — drop occ_edges so
+            # snap and face-building use the collapsed 2-point polyline instead
+            # of treating it as a circle.
+            if occ_edge is not None and _is_circle_edge_on(occ_edge, sketch.plane.normal):
+                occ_edge = None
 
             sketch.entities.append(
                 ReferenceEntity(

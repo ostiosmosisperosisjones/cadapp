@@ -38,7 +38,7 @@ class SketchPickMixin:
             if entry.operation != "sketch":
                 continue
             se = entry.params.get("sketch_entry")
-            if se is None or not se.visible or entry.error:
+            if se is None or entry.error:
                 continue
             try:
                 segs             = se.line_segments()
@@ -88,6 +88,9 @@ class SketchPickMixin:
 
         hits = []   # (t, hidx, fidx, outer_uvs, hole_uvs_list)
         for hidx, face_list in self._sketch_faces.items():
+            se = self.history.entries[hidx].params.get("sketch_entry")
+            if se is not None and not se.visible:
+                continue
             for fidx, (face, outer_uvs, hole_uvs) in enumerate(face_list):
                 try:
                     inter = BRepIntCurveSurface_Inter()
@@ -193,6 +196,9 @@ class SketchPickMixin:
 
         draw_list = []
         for hidx, face_list in self._sketch_faces.items():
+            se = self.history.entries[hidx].params.get("sketch_entry")
+            if se is not None and not se.visible:
+                continue
             for fidx, (face, outer_uvs, hole_uvs) in enumerate(face_list):
                 draw_list.append((hidx, fidx, face, _uv_area(outer_uvs)))
         draw_list.sort(key=lambda x: x[3], reverse=True)

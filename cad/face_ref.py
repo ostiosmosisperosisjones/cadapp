@@ -116,9 +116,11 @@ class FaceRef:
         ref_normal = np.array(self.normal)
         ref_perp   = np.array(self.centroid_perp)
 
-        best_idx   = None
-        best_face  = None
-        best_dist  = float("inf")
+        best_idx        = None
+        best_face       = None
+        best_perp_dist  = float("inf")
+        best_same_dir   = False      # prefer same-direction over opposite
+        best_along_dist = float("inf")
 
         for idx, face in enumerate(shape.faces()):
             occ = face.wrapped
@@ -130,6 +132,7 @@ class FaceRef:
             dot = float(np.dot(n, ref_normal))
             if abs(abs(dot) - 1.0) > normal_tol:
                 continue
+            same_dir = dot > 0.0
 
             centroid, area = _occ_face_props(occ)
 
@@ -140,14 +143,31 @@ class FaceRef:
             # Perpendicular centroid component must match
             along = float(np.dot(centroid, n))
             perp  = centroid - along * n
-            dist  = float(np.linalg.norm(perp - ref_perp))
-            if dist > perp_tol:
+            perp_dist = float(np.linalg.norm(perp - ref_perp))
+            if perp_dist > perp_tol:
                 continue
 
-            if dist < best_dist:
-                best_dist  = dist
-                best_idx   = idx
-                best_face  = face
+            along_dist = abs(along - self.centroid_along)
+
+            # Rank: same-direction normal wins over opposite; then closest
+            # centroid_along (face didn't move far); then closest perp dist.
+            better = False
+            if best_idx is None:
+                better = True
+            elif same_dir and not best_same_dir:
+                better = True
+            elif same_dir == best_same_dir:
+                if along_dist < best_along_dist - 1e-6:
+                    better = True
+                elif abs(along_dist - best_along_dist) < 1e-6 and perp_dist < best_perp_dist:
+                    better = True
+
+            if better:
+                best_idx        = idx
+                best_face       = face
+                best_perp_dist  = perp_dist
+                best_same_dir   = same_dir
+                best_along_dist = along_dist
 
         return best_idx, best_face
 

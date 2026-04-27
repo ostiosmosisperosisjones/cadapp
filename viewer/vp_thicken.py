@@ -186,11 +186,57 @@ class ThickenMixin:
     def _on_thicken_ok(self, thickness: float):
         body_id      = getattr(self, '_thicken_body_id', None)
         face_indices = getattr(self, '_thicken_face_indices', None)
+        editing_idx  = getattr(self, '_editing_thicken_idx', None)
+        if editing_idx is not None:
+            self._editing_thicken_idx = None  # prevent cancel on close
         self._close_thicken_panel()
         if body_id is None or not face_indices:
             return
         from cad.op_types import ThickenOp
+        if editing_idx is not None:
+            self._editing_thicken_idx = editing_idx  # restore for _commit
+            self._commit_thicken_edit(body_id, face_indices, thickness)
+            return
         ThickenOp(source_body_id=body_id, face_indices=face_indices, thickness=thickness).commit_async(self)
+
+    def _commit_thicken_edit(self, body_id: str, face_indices: list, thickness: float):
+        from cad.op_types import ThickenOp
+
+        idx = getattr(self, '_editing_thicken_idx', None)
+        if idx is None:
+            return
+        self._editing_thicken_idx = None
+
+        entries = self.history.entries
+        if idx >= len(entries):
+            return
+
+        entry = entries[idx]
+        entry.editing = False
+
+        # Collect the group: main entry + any split imports it produced.
+        entry_id      = entry.entry_id
+        group_indices = [idx]
+        group_body_ids = {entry.body_id}
+        for j in range(idx + 1, len(entries)):
+            if entries[j].params.get("source_entry_id") == entry_id:
+                group_indices.append(j)
+                group_body_ids.add(entries[j].body_id)
+
+        # Seek to state before the op.
+        self.history.seek(max(idx - 1, 0))
+
+        # Delete group entries back-to-front and remove created bodies.
+        removable_bodies = group_body_ids - {body_id}
+        for j in reversed(group_indices):
+            self.history.delete(j)
+        for bid in removable_bodies:
+            if bid in self.workspace.bodies:
+                self.workspace.remove_body(bid)
+
+        # Commit fresh — identical to a first-time thicken.
+        ThickenOp(source_body_id=body_id, face_indices=face_indices,
+                  thickness=thickness).commit_async(self)
 
     def reopen_thicken(self, history_idx: int):
         entries = self.history.entries

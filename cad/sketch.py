@@ -1097,6 +1097,34 @@ class SketchEntry:
             adp = _BAC(edge)
             if adp.GetType() == GeomAbs_Circle:
                 circ = adp.Circle()
+                # Check if circle is viewed edge-on (its normal is perpendicular
+                # to the sketch normal) — if so, project as a line segment.
+                circ_ax = circ.Axis().Direction()
+                circ_normal = np.array([circ_ax.X(), circ_ax.Y(), circ_ax.Z()])
+                dot_normals = abs(float(np.dot(circ_normal, self.plane_normal)))
+                if dot_normals < 1e-3:
+                    # Edge-on: the circle projects to a line of length 2*radius.
+                    # The axis of the projected line is the cross product of
+                    # circ_normal and sketch_normal, normalised to sketch UV.
+                    line_dir_3d = np.cross(circ_normal, self.plane_normal)
+                    ld_len = float(np.linalg.norm(line_dir_3d))
+                    if ld_len < 1e-9:
+                        return None
+                    line_dir_3d /= ld_len
+                    c3d = circ.Location()
+                    cw  = np.array([c3d.X(), c3d.Y(), c3d.Z()])
+                    delta = cw - self.plane_origin
+                    cu = float(np.dot(delta, self.plane_x_axis))
+                    cv = float(np.dot(delta, self.plane_y_axis))
+                    # line_dir in UV space
+                    ldu = float(np.dot(line_dir_3d, self.plane_x_axis))
+                    ldv = float(np.dot(line_dir_3d, self.plane_y_axis))
+                    r = circ.Radius()
+                    p0 = _uv3d(cu - r * ldu, cv - r * ldv)
+                    p1 = _uv3d(cu + r * ldu, cv + r * ldv)
+                    em = BRepBuilderAPI_MakeEdge(p0, p1)
+                    return em.Edge() if em.IsDone() else None
+
                 c3d  = circ.Location()
                 cw   = np.array([c3d.X(), c3d.Y(), c3d.Z()])
                 delta = cw - self.plane_origin

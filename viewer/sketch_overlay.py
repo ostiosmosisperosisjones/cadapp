@@ -583,8 +583,7 @@ class SketchOverlay:
         """Highlight the sub-piece that would be removed on click."""
         from cad.sketch_tools.trim import (TrimTool, _closest_entity,
                                            _gather_split_params,
-                                           _split_line, _split_arc,
-                                           _line_mid, _arc_mid)
+                                           _split_line, _split_arc)
         tool = sketch._active_tool
         if not isinstance(tool, TrimTool) or tool.cursor_2d is None:
             return
@@ -612,10 +611,28 @@ class SketchOverlay:
             if len(pieces) <= 1:
                 piece = target
             else:
-                def piece_mid(p):
-                    return _line_mid(p) if isinstance(p, LineEntity) else _arc_mid(p)
-                remove_idx = min(range(len(pieces)),
-                                 key=lambda i: np.linalg.norm(piece_mid(pieces[i]) - click_pt))
+                from cad.sketch_tools.snap import _nearest_on_arc
+                if isinstance(target, LineEntity):
+                    d = target.p1 - target.p0
+                    len_sq = float(np.dot(d, d))
+                    t_click = (float(np.dot(click_pt - target.p0, d)) / len_sq
+                               if len_sq > 1e-12 else 0.0)
+
+                    def piece_score_line(p):
+                        ta = float(np.dot(p.p0 - target.p0, d)) / len_sq
+                        tb = float(np.dot(p.p1 - target.p0, d)) / len_sq
+                        lo, hi = min(ta, tb), max(ta, tb)
+                        return max(0.0, lo - t_click, t_click - hi)
+
+                    remove_idx = min(range(len(pieces)),
+                                     key=lambda i: piece_score_line(pieces[i]))
+                else:
+                    def piece_nearest_dist(p):
+                        nearest, _ = _nearest_on_arc(click_pt, p)
+                        return float(np.linalg.norm(nearest - click_pt))
+
+                    remove_idx = min(range(len(pieces)),
+                                     key=lambda i: piece_nearest_dist(pieces[i]))
                 piece = pieces[remove_idx]
         glEnable(GL_BLEND)
         glColor4f(1.0, 0.25, 0.25, 0.85)

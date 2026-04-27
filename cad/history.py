@@ -212,20 +212,24 @@ class History:
         """
         cache = getattr(self, '_replay_shape_cache', None)
         if cache is not None:
-            result = cache.get(body_id)
-            if result is not None:
-                return result
-            # Not in cache — may be a force_new_body child; fall through to source_shape.
-        else:
-            # Fallback linear scan (used only outside of replay_from)
-            result = None
-            for i, entry in enumerate(self._entries):
-                if i >= before_index:
-                    break
-                if entry.body_id == body_id and entry.shape_after is not None:
-                    result = entry.shape_after
-            if result is not None:
-                return result
+            entry = cache.get(body_id)
+            if entry is not None:
+                cached_idx, cached_shape = entry
+                if cached_idx < before_index and cached_shape is not None:
+                    return cached_shape
+            # Cache miss or entry is at/after before_index — fall back to linear
+            # scan so before_index is respected (e.g. sketch plane resolve called
+            # with before_index < the current replay cursor).
+
+        # Linear scan: most-recent shape for body_id strictly before before_index.
+        result = None
+        for i, e in enumerate(self._entries):
+            if i >= before_index:
+                break
+            if e.body_id == body_id and e.shape_after is not None:
+                result = e.shape_after
+        if result is not None:
+            return result
 
         # Last resort: workspace.source_shape for force_new_body children.
         # Only return it if the body's creation entry is visible at before_index.
@@ -263,12 +267,13 @@ class History:
 
         # Build a shape cache from all entries before `index` so we can look up
         # any body's current shape in O(1) instead of scanning the list each time.
-        shape_cache: dict[str, Any] = {}
-        for e in self._entries[:index]:
+        # Stores (entry_index, shape) so before_index checks can be respected.
+        shape_cache: dict[str, tuple[int, Any]] = {}
+        for j, e in enumerate(self._entries[:index]):
             if e.shape_after is not None:
-                shape_cache[e.body_id] = e.shape_after
+                shape_cache[e.body_id] = (j, e.shape_after)
 
-        current_shape = shape_cache.get(target_body_id)
+        current_shape = shape_cache[target_body_id][1] if target_body_id in shape_cache else None
         mutated_bodies: set[str] = set()
 
         # Expose cache on self so plane_ref/edge_ref resolve() calls are O(1)
@@ -307,7 +312,7 @@ class History:
                     entry.shape_before is None
                     and entry.params.get("source_entry_id") is not None):
                 current_shape = entry.shape_after
-                shape_cache[entry.body_id] = entry.shape_after
+                shape_cache[entry.body_id] = (i, entry.shape_after)
                 continue
 
             # If a prior op in this chain failed, cascade-error everything else
@@ -375,7 +380,7 @@ class History:
             entry.shape_before = shape_before
             entry.shape_after  = new_shape
             current_shape      = new_shape
-            shape_cache[entry.body_id] = new_shape
+            shape_cache[entry.body_id] = (i, new_shape)
             entry.label        = _make_label(entry.operation, entry.params)
             mutated_bodies.add(entry.body_id)
 
