@@ -91,14 +91,20 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._extrude_pick_active  = False
         self._extrude_vtx_active   = False
         self._extrude_body_active  = False
+        self._extrude_face_active  = False
+        self._extrude_sketch_idx   = None
+        self._extrude_body_id      = None
+        self._extrude_face_idx     = None
         self._extrude_preview_mesh = None   # list of build123d solids | None
         self._extrude_preview_dist = 0.0
 
-        self._thicken_panel        = None
-        self._thicken_body_id      = None
-        self._thicken_preview_mesh = None
-        self._thicken_preview_dist = 0.0
-        self._editing_thicken_idx  = None
+        self._thicken_panel         = None
+        self._thicken_body_id       = None
+        self._thicken_preview_token = None
+        self._thicken_preview_tris  = None
+        self._thicken_preview_edges = None
+        self._thicken_preview_dist  = 0.0
+        self._editing_thicken_idx   = None
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
@@ -612,6 +618,13 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
     def mouseDoubleClickEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
             return
+        # Double-click on the view cube resets camera target to origin.
+        mx, my = int(e.position().x()), int(e.position().y())
+        if self._view_cube.is_over_cube(mx, my, self.width(), self.height(),
+                                        self.devicePixelRatio()):
+            self.camera.target = np.zeros(3)
+            self.update()
+            return
         if self._sketch is not None:
             return
         # Try solid face first — opens a fresh sketch
@@ -810,7 +823,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 mx, my, self.width(), self.height(), R, self.devicePixelRatio())
             if cube_hit is not None:
                 normal, is_corner = cube_hit
-                self.camera.snap_to_normal(*normal)
+                self.camera.snap_to_normal(*normal,
+                                           origin=tuple(self.camera.target))
                 self.update()
                 return
 
@@ -902,6 +916,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         return
 
                 body_id, idx = self._pick_at(e.position())
+                if idx is not None and self.route_face_pick_for_thicken(body_id, idx):
+                    return
+                if idx is not None and self.route_face_pick_for_extrude(body_id, idx):
+                    return
                 if idx is not None and self.route_body_pick_for_extrude(body_id):
                     return
                 if idx is not None:

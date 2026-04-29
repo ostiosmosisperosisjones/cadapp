@@ -465,15 +465,10 @@ def replay_all(workspace, history) -> list[str]:
         except Exception as ex:
             warnings.append(f"Could not load '{path}': {ex}")
 
-    # Step 2: replay each body chain from its first entry
-    replayed: set[str] = set()
-    for i, entry in enumerate(history._entries):
-        body_id = entry.body_id
-        if body_id in replayed:
-            continue
-        replayed.add(body_id)
-        ok, err, _ = history.replay_from(i)
-        if not ok:
-            warnings.append(f"Replay error for body '{body_id}': {err}")
+    # Step 2: replay all body chains in a single ordered pass so cross-body
+    # ops see up-to-date dependency shapes.
+    ok, err, _ = history.replay_all_from(0)
+    if not ok:
+        warnings.append(f"Replay error: {err}")
 
     return warnings

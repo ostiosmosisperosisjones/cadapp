@@ -9,7 +9,7 @@ import numpy as np
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QButtonGroup, QRadioButton, QFrame, QSizePolicy,
+    QButtonGroup, QRadioButton, QFrame, QSizePolicy, QScrollArea,
 )
 from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtGui import QKeyEvent
@@ -69,6 +69,11 @@ QPushButton#pick_body[active=true] {
     border-color: #4a90d9;
     color: #7ab3d4;
 }
+QPushButton#pick_face[active=true] {
+    background: #2a1e1e;
+    border-color: #d96a4a;
+    color: #ff9977;
+}
 QRadioButton {
     color: #d4d4d4;
     font-size: 12px;
@@ -95,10 +100,17 @@ class ExtrudePanel(QWidget):
     picking_edge_changed   = pyqtSignal(bool)
     picking_vertex_changed = pyqtSignal(bool)
     picking_body_changed   = pyqtSignal(bool)
+    picking_face_changed   = pyqtSignal(bool)
     preview_changed        = pyqtSignal(float, object)
+    face_entry_removed     = pyqtSignal(int)   # index in _face_entries that was removed
 
     def __init__(self, workspace, parent=None):
-        super().__init__(parent)
+        super().__init__(None)   # top-level so it's never clipped by the viewport
+        self.setWindowFlags(
+            Qt.WindowType.Tool |
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint)
+        self._viewport = parent  # keep reference for positioning
         self.setObjectName("ExtrudePanel")
         self.setStyleSheet(_PANEL_STYLE)
         self.setFixedWidth(260)
@@ -110,6 +122,9 @@ class ExtrudePanel(QWidget):
         self._picking_edge   : bool = False
         self._picking_vertex : bool = False
         self._picking_body   : bool = False
+        self._picking_face   : bool = False
+        self._has_face       : bool = False
+        self._face_entries   : list = []   # list of (body_id, face_idx, label)
 
         self._target_vertex  : np.ndarray | None = None
         self._face_origin    : np.ndarray | None = None
@@ -135,6 +150,31 @@ class ExtrudePanel(QWidget):
         title = QLabel("Extrude / Cut")
         title.setObjectName("title")
         root.addWidget(title)
+
+        root.addWidget(self._separator())
+
+        # ── Face ──────────────────────────────────────────────────────
+        face_header = QHBoxLayout()
+        face_header.setSpacing(6)
+        face_header.addWidget(self._section_label("Faces"))
+        face_header.addStretch()
+        self._pick_face_btn = QPushButton("+ Add Face")
+        self._pick_face_btn.setObjectName("pick_face")
+        self._pick_face_btn.setCheckable(True)
+        self._pick_face_btn.clicked.connect(self._on_pick_face_toggle)
+        face_header.addWidget(self._pick_face_btn)
+        root.addLayout(face_header)
+
+        # Scrollable list of picked faces
+        self._face_list_widget = QWidget()
+        self._face_list_layout = QVBoxLayout(self._face_list_widget)
+        self._face_list_layout.setContentsMargins(0, 0, 0, 0)
+        self._face_list_layout.setSpacing(2)
+        self._face_empty_label = QLabel("No faces selected")
+        self._face_empty_label.setStyleSheet(
+            "color: #555; font-size: 11px; font-family: monospace;")
+        self._face_list_layout.addWidget(self._face_empty_label)
+        root.addWidget(self._face_list_widget)
 
         root.addWidget(self._separator())
 
@@ -350,6 +390,69 @@ class ExtrudePanel(QWidget):
     def set_self_cut(self, is_self: bool):
         """Mark this panel as a same-body cut (no cross-body pick required)."""
         self._self_cut = is_self
+
+    def add_face_entry(self, body_id: str | None, face_idx: int | None,
+                       label: str, valid: bool = True):
+        """Add or update a face entry. If (body_id, face_idx) already exists, skip."""
+        if body_id is not None and face_idx is not None:
+            for entry in self._face_entries:
+                if entry[0] == body_id and entry[1] == face_idx:
+                    return  # already in list
+        self._face_entries.append((body_id, face_idx, label, valid))
+        self._rebuild_face_list()
+
+    def remove_face_entry(self, index: int):
+        if 0 <= index < len(self._face_entries):
+            self._face_entries.pop(index)
+            self._rebuild_face_list()
+            self.face_entry_removed.emit(index)
+
+    def clear_face_entries(self):
+        self._face_entries.clear()
+        self._rebuild_face_list()
+
+    def set_face_label(self, text: str, valid: bool = True):
+        """Compat: set a single face entry, replacing any existing entries."""
+        self._face_entries = [(None, None, text, valid)]
+        self._rebuild_face_list()
+
+    def _rebuild_face_list(self):
+        # Remove all widgets except the empty label
+        while self._face_list_layout.count():
+            item = self._face_list_layout.takeAt(0)
+            w = item.widget()
+            if w and w is not self._face_empty_label:
+                w.deleteLater()
+
+        self._has_face = bool(self._face_entries) and all(e[3] for e in self._face_entries)
+
+        if not self._face_entries:
+            self._face_list_layout.addWidget(self._face_empty_label)
+            self._face_empty_label.show()
+            return
+
+        self._face_empty_label.hide()
+        for i, (body_id, face_idx, label, valid) in enumerate(self._face_entries):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            lbl = QLabel(label)
+            color = "#d4d4d4" if valid else "#cc7744"
+            lbl.setStyleSheet(
+                f"color: {color}; font-size: 11px; font-family: monospace;")
+            lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            row_layout.addWidget(lbl)
+            rm_btn = QPushButton("✕")
+            rm_btn.setFixedWidth(22)
+            rm_btn.setStyleSheet(
+                "QPushButton { background: #2a2a2a; color: #666; border: none; "
+                "font-size: 10px; padding: 1px; } "
+                "QPushButton:hover { color: #cc4444; }")
+            idx_capture = i
+            rm_btn.clicked.connect(lambda _, idx=idx_capture: self.remove_face_entry(idx))
+            row_layout.addWidget(rm_btn)
+            self._face_list_layout.addWidget(row)
 
     def set_face_origin(self, origin: np.ndarray):
         self._face_origin = origin.copy()
@@ -590,6 +693,24 @@ class ExtrudePanel(QWidget):
             btn.style().polish(btn)
         self.picking_body_changed.emit(False)
 
+    def _on_pick_face_toggle(self, checked: bool):
+        if checked:
+            self._picking_face = True
+            self._pick_face_btn.setProperty("active", True)
+            self._pick_face_btn.style().unpolish(self._pick_face_btn)
+            self._pick_face_btn.style().polish(self._pick_face_btn)
+            self.picking_face_changed.emit(True)
+        else:
+            self._end_pick_face()
+
+    def _end_pick_face(self):
+        self._picking_face = False
+        self._pick_face_btn.setChecked(False)
+        self._pick_face_btn.setProperty("active", False)
+        self._pick_face_btn.style().unpolish(self._pick_face_btn)
+        self._pick_face_btn.style().polish(self._pick_face_btn)
+        self.picking_face_changed.emit(False)
+
     def _reset_vertex(self):
         self._target_vertex  = None
         self._vertex_dist_mm = None
@@ -610,6 +731,8 @@ class ExtrudePanel(QWidget):
         self._emit_preview()
 
     def _on_ok(self):
+        if not self._has_face:
+            return
         self._spinbox._on_commit()
         dist, direction = self._signed_dist_and_dir()
         if dist is None:
@@ -637,11 +760,17 @@ class ExtrudePanel(QWidget):
     # Keyboard
     # ------------------------------------------------------------------
 
+    def closeEvent(self, e):
+        self.cancelled.emit()
+        super().closeEvent(e)
+
     def keyPressEvent(self, e: QKeyEvent):
         if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             e.accept()   # consume — default button handles it, don't double-fire
         elif e.key() == Qt.Key.Key_Escape:
-            if self._picking_vertex:
+            if self._picking_face:
+                self._end_pick_face()
+            elif self._picking_vertex:
                 self._end_pick_vertex()
             elif self._picking_edge:
                 self._end_pick_edge()

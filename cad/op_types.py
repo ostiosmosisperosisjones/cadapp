@@ -113,28 +113,89 @@ class FaceExtrudeOp(Op):
     start_offset:   float = 0.0
     end_offset:     float = 0.0
     force_new_body: bool  = False
+    face_indices:   list  = None   # face indices (single body, compat)
+    face_refs:      list  = None   # FaceRef per face, built at commit
+    face_pairs:     list  = None   # list of (body_id, face_idx) — multi-body support
+
+    def __post_init__(self):
+        if self.face_pairs is None:
+            # Build from face_indices + source_body_id for backward compat
+            if self.face_indices:
+                self.face_pairs = [(self.source_body_id, fi) for fi in self.face_indices]
+            else:
+                self.face_pairs = [(self.source_body_id, self.face_idx)]
+        if self.face_indices is None:
+            self.face_indices = [fi for _, fi in self.face_pairs
+                                 if _ == self.source_body_id]
+        if self.face_refs is None:
+            self.face_refs = []
+
+    def _resolve_faces_on(self, shape, refs_subset, indices_subset):
+        """Resolve a subset of faces on a given shape. Returns list of (idx, b3d_face)."""
+        resolved = []
+        if refs_subset:
+            for ref in refs_subset:
+                idx, face = ref.find_in(shape)
+                if idx is None:
+                    raise RuntimeError(
+                        f"FaceExtrudeOp: could not re-locate face "
+                        f"(normal={ref.normal}, area={ref.area:.3f})")
+                resolved.append((idx, face))
+        else:
+            all_faces = list(shape.faces())
+            for fi in indices_subset:
+                if fi >= len(all_faces):
+                    raise RuntimeError(f"FaceExtrudeOp: face_idx {fi} out of range")
+                resolved.append((fi, all_faces[fi]))
+        return resolved
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
-        """Replay via face_ref resolution + extrude_face."""
+        """Replay via face_ref resolution + extrude."""
         import numpy as np
         from cad.operations.extrude import extrude_face, _do_extrude_solid
         from build123d import Compound
-        entry = history._entries[entry_index]
-        if entry.face_ref is None:
-            raise RuntimeError(f"FaceExtrudeOp at {entry_index} has no face_ref")
-        face_idx, face_obj = entry.face_ref.find_in(shape)
-        if face_idx is None:
-            raise RuntimeError(
-                f"Could not find face (normal={entry.face_ref.normal} "
-                f"area={entry.face_ref.area:.3f})")
         direction = (np.array(self.direction, dtype=float)
                      if self.direction is not None else None)
+
         if self.force_new_body:
-            extruded = _do_extrude_solid(face_obj, self.distance, direction,
-                                         start_offset=self.start_offset,
-                                         end_offset=self.end_offset)
-            result = Compound(extruded.wrapped)
-            # Update child body source_shapes from the workspace back-reference.
+            # Faces may be on multiple bodies — look up each body's shape.
+            from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+            from OCP.TopTools import TopTools_ListOfShape
+
+            # Group face_refs by their position in face_pairs.
+            result_solid = None
+            refs = self.face_refs if self.face_refs else []
+            for i, (bid, fi) in enumerate(self.face_pairs):
+                src_shape = history._shape_for_body_at(bid, entry_index)
+                if src_shape is None:
+                    raise RuntimeError(
+                        f"FaceExtrudeOp (force_new_body): no shape for body '{bid}'")
+                if i < len(refs):
+                    _, face_obj = refs[i].find_in(src_shape)
+                    if face_obj is None:
+                        raise RuntimeError(
+                            f"FaceExtrudeOp: could not re-locate face on body '{bid}'")
+                else:
+                    all_f = list(src_shape.faces())
+                    if fi >= len(all_f):
+                        raise RuntimeError(f"FaceExtrudeOp: face_idx {fi} out of range")
+                    face_obj = all_f[fi]
+                extruded = _do_extrude_solid(face_obj, self.distance, direction,
+                                             start_offset=self.start_offset,
+                                             end_offset=self.end_offset)
+                if result_solid is None:
+                    result_solid = extruded.wrapped
+                else:
+                    lst_a = TopTools_ListOfShape(); lst_a.Append(result_solid)
+                    lst_b = TopTools_ListOfShape(); lst_b.Append(extruded.wrapped)
+                    fuse = BRepAlgoAPI_Fuse()
+                    fuse.SetArguments(lst_a); fuse.SetTools(lst_b)
+                    fuse.SetRunParallel(True); fuse.Build()
+                    if fuse.IsDone():
+                        result_solid = fuse.Shape()
+
+            result = Compound(result_solid)
+            entry = history._entries[entry_index]
             child_body_ids = entry.params.get("child_body_ids", [])
             if child_body_ids and history._workspace is not None:
                 solids = list(result.solids())
@@ -142,9 +203,35 @@ class FaceExtrudeOp(Op):
                     body = history._workspace.bodies.get(bid)
                     if body is not None:
                         body.source_shape = Compound(solids[i].wrapped) if i < len(solids) else None
-            return shape  # source body is unchanged
-        return extrude_face(shape, face_idx, self.distance, direction=direction,
-                            start_offset=self.start_offset, end_offset=self.end_offset)
+            return shape  # source body (shape) is unchanged
+
+        # In-place extrude/self-cut (single body only).
+        # Apply each face sequentially; re-resolve refs on updated shape each time.
+        current = shape
+        refs = list(self.face_refs) if self.face_refs else []
+        # For in-place, all pairs must be on the same body (source_body_id).
+        same_body_indices = [fi for _, fi in self.face_pairs]
+        n = len(refs) if refs else len(same_body_indices)
+        for i in range(n):
+            if refs:
+                fi, _ = refs[i].find_in(current)
+                if fi is None:
+                    raise RuntimeError(
+                        f"FaceExtrudeOp: could not re-locate face "
+                        f"(normal={refs[i].normal}, area={refs[i].area:.3f})")
+                # Re-resolve remaining refs after this op shifts topology
+                if i + 1 < len(refs):
+                    refs = refs  # will be re-resolved on next iteration via find_in
+            else:
+                all_f = list(current.faces())
+                fi = same_body_indices[i]
+                if fi >= len(all_f):
+                    raise RuntimeError(f"FaceExtrudeOp: face_idx {fi} out of range")
+            current = extrude_face(current, fi, self.distance,
+                                   direction=direction,
+                                   start_offset=self.start_offset,
+                                   end_offset=self.end_offset)
+        return current
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         try:
@@ -164,36 +251,66 @@ class FaceExtrudeOp(Op):
         from cad.face_ref import FaceRef
         from build123d import Compound
 
+        # Validate source body (used for in-place ops and as primary body).
         mesh = viewport._meshes.get(self.source_body_id)
         if mesh is None:
             raise RuntimeError(f"[Extrude] No mesh for body {self.source_body_id}")
         shape_before = viewport.workspace.current_shape(self.source_body_id)
         if shape_before is None:
             raise RuntimeError(f"[Extrude] No shape for body {self.source_body_id}")
-        face_ref = FaceRef.from_b3d_face(mesh.occt_faces[self.face_idx])
-        if face_ref is None:
-            raise RuntimeError(f"[Extrude] Face {self.face_idx} is not planar.")
 
-        direction = (np.array(self.direction, dtype=float)
-                     if self.direction is not None else None)
-        op_str    = "cut" if self.distance < 0 else "extrude"
-        op_params = self.to_params()
+        # Build face_refs and face_objs for all (body_id, face_idx) pairs.
+        self.face_refs = []
+        face_objs = []
+        for bid, fi in self.face_pairs:
+            bshape = (shape_before if bid == self.source_body_id
+                      else viewport.workspace.current_shape(bid))
+            if bshape is None:
+                raise RuntimeError(f"[Extrude] No shape for body '{bid}'")
+            all_f = list(bshape.faces())
+            if fi >= len(all_f):
+                raise RuntimeError(f"[Extrude] face_idx {fi} out of range on body '{bid}'")
+            ref = FaceRef.from_b3d_face(all_f[fi])
+            if ref is None:
+                raise RuntimeError(f"[Extrude] Face {fi} on body '{bid}' is not planar.")
+            self.face_refs.append(ref)
+            face_objs.append(all_f[fi])
+        # first ref stored on entry for backward compat
+        face_ref = self.face_refs[0]
+
+        direction    = (np.array(self.direction, dtype=float)
+                        if self.direction is not None else None)
+        op_str       = "cut" if self.distance < 0 else "extrude"
+        op_params    = self.to_params()
         if extra_params:
             op_params.update(extra_params)
         original_solid_count = len(list(shape_before.solids()))
 
         if self.force_new_body:
-            face_obj     = list(shape_before.faces())[self.face_idx]
             distance     = self.distance
             body_id      = self.source_body_id
             start_offset = self.start_offset
             end_offset   = self.end_offset
 
             def compute():
-                extruded = _do_extrude_solid(face_obj, distance, direction,
-                                             start_offset=start_offset,
-                                             end_offset=end_offset)
-                return Compound(extruded.wrapped)
+                from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+                from OCP.TopTools import TopTools_ListOfShape
+                result_occ = None
+                for fo in face_objs:
+                    extruded = _do_extrude_solid(fo, distance, direction,
+                                                 start_offset=start_offset,
+                                                 end_offset=end_offset)
+                    if result_occ is None:
+                        result_occ = extruded.wrapped
+                    else:
+                        lst_a = TopTools_ListOfShape(); lst_a.Append(result_occ)
+                        lst_b = TopTools_ListOfShape(); lst_b.Append(extruded.wrapped)
+                        fuse = BRepAlgoAPI_Fuse()
+                        fuse.SetArguments(lst_a); fuse.SetTools(lst_b)
+                        fuse.SetRunParallel(True); fuse.Build()
+                        if fuse.IsDone():
+                            result_occ = fuse.Shape()
+                return Compound(result_occ)
 
             def finalize(shape_after):
                 from viewer.vp_extrude import _strip_split_suffix, _next_split_name
@@ -203,7 +320,7 @@ class FaceExtrudeOp(Op):
                 solids    = list(shape_after.solids())
                 op_params["child_body_ids"] = []
                 new_bodies = []
-                for i, solid in enumerate(solids):
+                for solid in solids:
                     new_name = _next_split_name(root_name, viewport.workspace)
                     new_body = viewport.workspace.add_body(new_name, Compound(solid.wrapped))
                     new_bodies.append(new_body)
@@ -222,17 +339,25 @@ class FaceExtrudeOp(Op):
 
             return compute, finalize
 
-        face_idx     = self.face_idx
+        # In-place: apply each face sequentially on a snapshot of shape_before.
         distance     = self.distance
         start_offset = self.start_offset
         end_offset   = self.end_offset
+        face_refs_snap = list(self.face_refs)
 
         def compute():
-            result = extrude_face(shape_before, face_idx, distance, direction=direction,
-                                  start_offset=start_offset, end_offset=end_offset)
-            if not list(result.solids()):
+            current = shape_before
+            for ref in face_refs_snap:
+                fi, _ = ref.find_in(current)
+                if fi is None:
+                    raise RuntimeError(
+                        f"FaceExtrudeOp compute: could not locate face "
+                        f"(normal={ref.normal}, area={ref.area:.3f})")
+                current = extrude_face(current, fi, distance, direction=direction,
+                                       start_offset=start_offset, end_offset=end_offset)
+            if not list(current.solids()):
                 raise RuntimeError("Boolean result has no solids.")
-            return result
+            return current
 
         def finalize(shape_after):
             _push_result(viewport, op_str, op_params, self.source_body_id,
@@ -254,12 +379,27 @@ class FaceExtrudeOp(Op):
         vp._show_extrude_panel(
             sketch_idx    = None,
             body_id       = self.source_body_id,
-            face_idx      = self.face_idx,
+            face_idx      = self.face_indices[0] if self.face_indices else self.face_idx,
             editing_entry = entry)
+
+        # Sync viewport face pair list and populate all face entries in panel.
+        vp._extrude_face_pairs   = list(self.face_pairs)
+        vp._extrude_face_indices = list(self.face_indices)
+        vp._extrude_face_idx     = self.face_pairs[0][1] if self.face_pairs else self.face_idx
+        vp._extrude_body_id      = self.face_pairs[0][0] if self.face_pairs else self.source_body_id
 
         panel = vp._extrude_panel
         if panel is None:
             return
+
+        # Re-populate face list for multi-face ops.
+        if len(self.face_pairs) > 1:
+            panel.clear_face_entries()
+            for bid, fi in self.face_pairs:
+                body = vp.workspace.bodies.get(bid)
+                name = body.name if body else bid
+                panel.add_face_entry(bid, fi, f"{name}  ·  face {fi}")
+            vp._update_panel_mode_lock(panel, self.face_pairs)
 
         if self.distance < 0:
             panel._radio_cut.setChecked(True)
@@ -286,8 +426,17 @@ class FaceExtrudeOp(Op):
         p: dict[str, Any] = {
             "distance":       abs(self.distance),
             "face_idx":       self.face_idx,
+            "face_indices":   list(self.face_indices),
+            "face_pairs":     [[bid, fi] for bid, fi in self.face_pairs],
             "source_body_id": self.source_body_id,
         }
+        if self.face_refs:
+            p["face_refs"] = [
+                {"normal": list(r.normal), "area": r.area,
+                 "centroid_perp": list(r.centroid_perp),
+                 "centroid_along": r.centroid_along}
+                for r in self.face_refs
+            ]
         if self.direction is not None:
             p["direction"] = self.direction
         if self.target_vertex is not None:
@@ -302,10 +451,32 @@ class FaceExtrudeOp(Op):
 
     @classmethod
     def _from_params(cls, params: dict, sign: int = 1) -> "FaceExtrudeOp":
-        dist = float(params.get("distance", 0)) * sign
+        from cad.face_ref import FaceRef
+        dist     = float(params.get("distance", 0)) * sign
+        fi       = int(params.get("face_idx", 0))
+        src_body = params.get("source_body_id", "")
+        raw_pairs   = params.get("face_pairs")
+        raw_indices = params.get("face_indices")
+        if raw_pairs:
+            face_pairs = [(str(p[0]), int(p[1])) for p in raw_pairs]
+        elif raw_indices:
+            face_pairs = [(src_body, int(i)) for i in raw_indices]
+        else:
+            face_pairs = [(src_body, fi)]
+        face_indices = [i for _, i in face_pairs if _ == src_body] or [fi]
+        raw_refs = params.get("face_refs", [])
+        face_refs = [
+            FaceRef(normal=tuple(r["normal"]), area=r["area"],
+                    centroid_perp=tuple(r["centroid_perp"]),
+                    centroid_along=r["centroid_along"])
+            for r in raw_refs
+        ]
         return cls(
-            source_body_id = params.get("source_body_id", ""),
-            face_idx       = int(params.get("face_idx", 0)),
+            source_body_id = src_body,
+            face_idx       = fi,
+            face_indices   = face_indices,
+            face_pairs     = face_pairs,
+            face_refs      = face_refs if face_refs else None,
             distance       = dist,
             direction      = params.get("direction"),
             target_vertex  = params.get("target_vertex"),
@@ -381,9 +552,19 @@ class CrossBodyCutOp(Op):
             if src_shape is None:
                 raise RuntimeError(
                     f"CrossBodyCutOp: no shape for source body '{self.source_body_id}'")
-            if self.source_face_idx is None:
-                raise RuntimeError("CrossBodyCutOp: no source_face_idx")
-            faces = [list(src_shape.faces())[self.source_face_idx]]
+            entry = history._entries[entry_index]
+            face_ref = getattr(entry, "face_ref", None)
+            if face_ref is not None:
+                _, face_obj = face_ref.find_in(src_shape)
+                if face_obj is None:
+                    raise RuntimeError(
+                        f"CrossBodyCutOp: could not locate source face "
+                        f"(normal={face_ref.normal}, area={face_ref.area:.3f})")
+                faces = [face_obj]
+            else:
+                if self.source_face_idx is None:
+                    raise RuntimeError("CrossBodyCutOp: no source_face_idx")
+                faces = [list(src_shape.faces())[self.source_face_idx]]
 
         tool_dist = self.distance + 0.01  # epsilon to avoid coincident-face issues
 
@@ -440,6 +621,7 @@ class CrossBodyCutOp(Op):
                      if self.direction is not None else None)
         tool_dir = -direction if direction is not None else None
 
+        source_face_ref = None
         if self.source_sketch_id is not None:
             sketch_idx = viewport.history.id_to_index(self.source_sketch_id)
             if sketch_idx is None:
@@ -456,10 +638,19 @@ class CrossBodyCutOp(Op):
                      if fidx is not None and 0 <= fidx < len(all_faces)
                      else [f[0] for f in all_faces])
         else:
+            from cad.face_ref import FaceRef, AnyFaceRef
             src_shape = viewport.workspace.current_shape(self.source_body_id)
             if src_shape is None:
                 raise RuntimeError("[Cut] Source body has no shape.")
-            faces = [list(src_shape.faces())[self.source_face_idx]]
+            if self.source_face_idx is None:
+                raise RuntimeError("[Cut] No source_face_idx.")
+            src_faces_list = list(src_shape.faces())
+            if self.source_face_idx >= len(src_faces_list):
+                raise RuntimeError("[Cut] source_face_idx out of range.")
+            src_face = src_faces_list[self.source_face_idx]
+            source_face_ref = (FaceRef.from_occ_face(src_face.wrapped)
+                               or AnyFaceRef.from_occ_face(src_face.wrapped))
+            faces = [src_face]
 
         target_shape = viewport.workspace.current_shape(self.cut_body_id)
         if target_shape is None:
@@ -505,7 +696,7 @@ class CrossBodyCutOp(Op):
 
         def finalize(result):
             _push_result(viewport, "cut", op_params, self.cut_body_id,
-                         None, target_shape, result, original_solid_count,
+                         source_face_ref, target_shape, result, original_solid_count,
                          split_key="split_from")
             viewport._selected_sketch_entry = None
             viewport._selected_sketch_face  = None
@@ -1149,6 +1340,12 @@ class ThickenOp(Op):
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         from cad.operations.thicken import thicken_face
+        if shape is None:
+            src = history._shape_for_body_at(self.source_body_id, entry_index)
+            if src is None:
+                raise RuntimeError(
+                    f"ThickenOp: no shape for source body '{self.source_body_id}'")
+            shape = src
         resolved = self._resolve_faces(shape)
         result = shape
         for _idx, face in resolved:

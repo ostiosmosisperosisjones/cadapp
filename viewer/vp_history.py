@@ -192,25 +192,11 @@ class HistoryMixin:
             self.workspace.remove_body(bid)
         self.history.delete(index)
 
-        # Replay all surviving body chains and cascade cross-body dependencies,
-        # same as do_reorder — deletion can break any downstream chain.
+        # Replay all surviving body chains in a single ordered pass so that
+        # cross-body ops see up-to-date dependency shapes.
         removed_body_ids = set(split_body_ids) | set(child_body_ids)
-        mutated = {body_id} | removed_body_ids
-
-        replayed_bodies: set[str] = set()
-        for i, e in enumerate(self.history.entries):
-            if e.body_id not in replayed_bodies:
-                _, _, replay_mutated = self.history.replay_from(i)
-                mutated |= replay_mutated
-                replayed_bodies.add(e.body_id)
-
-        from cad.op_types import SketchOp
-        seen_sketch_ids: set[str] = set()
-        for e in self.history.entries:
-            if isinstance(e.op, SketchOp) and e.entry_id not in seen_sketch_ids:
-                seen_sketch_ids.add(e.entry_id)
-                _, _, dep_mutated = self.history.replay_sketch_dependents(e.entry_id)
-                mutated |= dep_mutated
+        _, _, replay_mutated = self.history.replay_all_from(index)
+        mutated = ({body_id} | removed_body_ids) | replay_mutated
 
         self._rebuild_bodies(mutated)
         self.history_changed.emit()
@@ -224,24 +210,7 @@ class HistoryMixin:
         self.history.reorder(src, dst)
 
         lo = min(src, dst)
-        all_mutated: set[str] = set()
-        replayed_bodies: set[str] = set()
-
-        for i, e in enumerate(self.history.entries):
-            if i < lo:
-                continue
-            if e.body_id not in replayed_bodies:
-                _, _, mutated = self.history.replay_from(i)
-                all_mutated |= mutated
-                replayed_bodies.add(e.body_id)
-
-        from cad.op_types import SketchOp
-        seen_sketch_ids: set[str] = set()
-        for e in self.history.entries:
-            if isinstance(e.op, SketchOp) and e.entry_id not in seen_sketch_ids:
-                seen_sketch_ids.add(e.entry_id)
-                _, _, dep_mutated = self.history.replay_sketch_dependents(e.entry_id)
-                all_mutated |= dep_mutated
+        _, _, all_mutated = self.history.replay_all_from(lo)
 
         self._rebuild_bodies(all_mutated)
         self.history_changed.emit()

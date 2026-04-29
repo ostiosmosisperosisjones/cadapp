@@ -400,6 +400,128 @@ class History:
         return [(i, e) for i, e in enumerate(self._entries)
                 if e.body_id == body_id]
 
+    def replay_all_from(self, index: int) -> tuple[bool, str, set[str]]:
+        """
+        Re-execute ALL body chains from *index* onward in a single ordered pass.
+
+        Unlike replay_from() which replays one body chain, this method processes
+        every entry from index onward in list order, maintaining a single shared
+        shape cache.  This ensures cross-body ops (e.g. CrossBodyCutOp) always
+        see the up-to-date shape of dependency bodies that were already processed
+        earlier in the same pass.
+
+        Returns (all_ok, first_error_message, mutated_body_ids).
+        """
+        from cad.op_types import ImportOp, SketchOp
+
+        if index < 0 or index >= len(self._entries):
+            return True, "", set()
+
+        # Build shape cache from all entries strictly before index.
+        shape_cache: dict[str, tuple[int, Any]] = {}
+        for j, e in enumerate(self._entries[:index]):
+            if e.shape_after is not None:
+                shape_cache[e.body_id] = (j, e.shape_after)
+
+        # Per-body state: current_shape and chain_broken flag.
+        current_shapes: dict[str, Any]  = {bid: sv[1] for bid, sv in shape_cache.items()}
+        chain_broken:   dict[str, bool] = {}
+
+        first_error    = ""
+        mutated_bodies: set[str] = set()
+
+        self._replay_shape_cache = shape_cache
+        try:
+            for i in range(index, len(self._entries)):
+                entry  = self._entries[i]
+                bid    = entry.body_id
+                op     = entry.op
+                broken = chain_broken.get(bid, False)
+
+                entry.error     = False
+                entry.error_msg = ""
+
+                # Import / force_new_body child: shape is authoritative.
+                if isinstance(op, ImportOp) or (
+                        entry.shape_before is None
+                        and entry.params.get("source_entry_id") is not None):
+                    current_shapes[bid] = entry.shape_after
+                    shape_cache[bid]    = (i, entry.shape_after)
+                    continue
+
+                if broken:
+                    entry.error     = True
+                    entry.error_msg = "Dependency error: a prior operation in this chain failed"
+                    entry.shape_before = current_shapes.get(bid)
+                    entry.shape_after  = None
+                    _null_split_dependents(self._entries, i)
+                    continue
+
+                if op is None:
+                    err = f"Entry {i} '{entry.label}': unknown operation '{entry.operation}'"
+                    entry.error = True; entry.error_msg = err
+                    entry.shape_before = current_shapes.get(bid); entry.shape_after = None
+                    _null_split_dependents(self._entries, i)
+                    chain_broken[bid] = True
+                    if not first_error: first_error = err
+                    mutated_bodies.add(bid)
+                    continue
+
+                current_shape = current_shapes.get(bid)
+
+                if isinstance(op, SketchOp):
+                    try:
+                        op.execute(current_shape, self, i)
+                    except Exception as ex:
+                        entry.error = True; entry.error_msg = str(ex)
+                        entry.shape_before = current_shape; entry.shape_after = None
+                        chain_broken[bid] = True
+                        if not first_error: first_error = str(ex)
+                        mutated_bodies.add(bid)
+                        continue
+                    entry.shape_before = current_shape
+                    entry.shape_after  = current_shape
+                    continue
+
+                force_new = getattr(op, 'force_new_body', False)
+                if current_shape is None and not force_new:
+                    err = f"Entry {i} '{entry.label}': no input shape (prior operation failed)"
+                    entry.error = True; entry.error_msg = err
+                    entry.shape_before = None; entry.shape_after = None
+                    _null_split_dependents(self._entries, i)
+                    chain_broken[bid] = True
+                    if not first_error: first_error = err
+                    mutated_bodies.add(bid)
+                    continue
+
+                try:
+                    new_shape = op.execute(current_shape, self, i)
+                except Exception as ex:
+                    err = f"Entry {i} '{entry.label}' failed: {ex}"
+                    entry.error = True; entry.error_msg = err
+                    entry.shape_before = current_shape; entry.shape_after = None
+                    _null_split_dependents(self._entries, i)
+                    chain_broken[bid] = True
+                    if not first_error: first_error = err
+                    mutated_bodies.add(bid)
+                    continue
+
+                entry.shape_before = current_shape
+                entry.shape_after  = new_shape
+                current_shapes[bid] = new_shape
+                shape_cache[bid]    = (i, new_shape)
+                entry.label         = _make_label(entry.operation, entry.params)
+                mutated_bodies.add(bid)
+
+                child_body_ids = entry.params.get("child_body_ids", [])
+                for cbid in child_body_ids:
+                    mutated_bodies.add(cbid)
+
+        finally:
+            self._replay_shape_cache = None
+
+        return (not first_error), first_error, mutated_bodies
+
     def replay_sketch_dependents(self, sketch_entry_id: str) -> tuple[bool, str, set[str]]:
         """
         Replay all body chains that contain a SketchExtrudeOp referencing

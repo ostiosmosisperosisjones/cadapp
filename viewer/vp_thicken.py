@@ -5,6 +5,7 @@ ThickenMixin — uniform body offset panel, preview, and commit.
 """
 
 from __future__ import annotations
+from PyQt6.QtCore import pyqtSlot
 
 
 class ThickenMixin:
@@ -24,17 +25,34 @@ class ThickenMixin:
     def _show_thicken_panel(self, body_id: str, face_indices: list, editing_entry=None):
         from gui.thicken_panel import ThickenPanel
         if getattr(self, '_thicken_panel', None) is not None:
-            self._thicken_panel.close()
+            old = self._thicken_panel
+            old._preview_timer.stop()
+            try:
+                old.preview_changed.disconnect(self._update_thicken_preview)
+            except Exception:
+                pass
+            old.close()
+            self._thicken_panel = None
 
         self._thicken_body_id       = body_id
-        self._thicken_face_indices  = face_indices
+        self._thicken_face_indices  = list(face_indices)
+        self._thicken_preview_token = None
         self._thicken_preview_tris  = None
         self._thicken_preview_edges = None
+        self._thicken_picking_face  = False
 
         panel = ThickenPanel(parent=self)
         panel.thicken_requested.connect(self._on_thicken_ok)
         panel.cancelled.connect(self._close_thicken_panel)
         panel.preview_changed.connect(self._update_thicken_preview)
+        panel.face_entry_removed.connect(self._on_thicken_face_removed)
+
+        # Populate initial face entries
+        shape = self.workspace.current_shape(body_id)
+        all_faces = list(shape.faces()) if shape is not None else []
+        for fi in face_indices:
+            label = self._thicken_face_label(body_id, fi, all_faces)
+            panel.add_face_entry(body_id, fi, label)
 
         self._thicken_panel = panel
         self._position_thicken_panel()
@@ -42,15 +60,32 @@ class ThickenMixin:
         panel.setFocus()
         panel._emit_preview()
 
+    def _thicken_face_label(self, body_id: str, face_idx: int, all_faces: list) -> str:
+        body = self.workspace.bodies.get(body_id)
+        body_name = body.name if body else body_id
+        return f"{body_name} · face {face_idx}"
+
     def _position_thicken_panel(self):
         p = getattr(self, '_thicken_panel', None)
         if p is None:
             return
-        p.move(16, 16)
+        margin = 16
+        origin = self.mapToGlobal(self.rect().topLeft())
+        p.move(origin.x() + margin, origin.y() + margin)
 
     def _close_thicken_panel(self):
         panel = getattr(self, '_thicken_panel', None)
         if panel is not None:
+            panel._preview_timer.stop()
+            panel.end_pick_face()
+            try:
+                panel.preview_changed.disconnect(self._update_thicken_preview)
+            except Exception:
+                pass
+            try:
+                panel.face_entry_removed.disconnect(self._on_thicken_face_removed)
+            except Exception:
+                pass
             panel.close()
             self._thicken_panel = None
         if getattr(self, '_editing_thicken_idx', None) is not None:
@@ -58,7 +93,60 @@ class ThickenMixin:
         self._thicken_preview_token = None
         self._thicken_preview_tris  = None
         self._thicken_preview_edges = None
+        self._thicken_pending_errors = None
         self.update()
+
+    # ------------------------------------------------------------------
+    # Face picking for thicken panel
+    # ------------------------------------------------------------------
+
+    def _on_thicken_face_removed(self, index: int):
+        indices = getattr(self, '_thicken_face_indices', [])
+        if 0 <= index < len(indices):
+            indices.pop(index)
+            self._thicken_face_indices = indices
+        self._thicken_preview_tris  = None
+        self._thicken_preview_edges = None
+        panel = getattr(self, '_thicken_panel', None)
+        if panel is not None:
+            panel._emit_preview()
+        self.update()
+
+    def route_face_pick_for_thicken(self, body_id: str, face_idx: int) -> bool:
+        """
+        Called by the viewport face-pick path when a thicken panel is open
+        and the pick_face button is active.  Returns True if consumed.
+        """
+        panel = getattr(self, '_thicken_panel', None)
+        if panel is None or not panel._picking_face:
+            return False
+
+        # Thicken only supports a single body — reject different body.
+        thicken_body = getattr(self, '_thicken_body_id', None)
+        if thicken_body is not None and body_id != thicken_body:
+            print("[Thicken] All faces must be on the same body.")
+            return True
+
+        indices = getattr(self, '_thicken_face_indices', [])
+
+        if face_idx in indices:
+            # Toggle off — remove
+            idx = indices.index(face_idx)
+            panel.remove_face_entry(idx)   # emits face_entry_removed → _on_thicken_face_removed
+        else:
+            indices.append(face_idx)
+            self._thicken_face_indices = indices
+            shape = self.workspace.current_shape(body_id)
+            all_faces = list(shape.faces()) if shape is not None else []
+            label = self._thicken_face_label(body_id, face_idx, all_faces)
+            panel.add_face_entry(body_id, face_idx, label)
+            panel._emit_preview()
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Preview
+    # ------------------------------------------------------------------
 
     def _update_thicken_preview(self, thickness: float):
         from cad.operations.thicken import thicken_face_preview
@@ -81,16 +169,21 @@ class ThickenMixin:
         if not face_occs:
             self._thicken_preview_tris = None; self.update(); return
 
+        # face_indices snapshot for error reporting back to panel
+        face_indices_snap = list(face_indices)
+
         def _compute():
-            try:
-                # Preview each face independently and collect geometry.
-                results = [thicken_face_preview(fo, thickness) for fo in face_occs]
-            except Exception as ex:
-                print(f"[Thicken preview] {ex}")
-                results = []
+            # Compute per-face: (result_or_None, error_str_or_None)
+            per_face = []
+            for fo in face_occs:
+                try:
+                    per_face.append((thicken_face_preview(fo, thickness), None))
+                except Exception as ex:
+                    per_face.append((None, str(ex)))
 
             tris = []
             edges = []
+            face_errors: dict[int, str] = {}   # face_indices_snap index → error msg
             from OCP.BRep import BRep_Tool
             from OCP.BRepMesh import BRepMesh_IncrementalMesh
             from OCP.TopExp import TopExp_Explorer
@@ -98,7 +191,10 @@ class ThickenMixin:
             from OCP.TopoDS import TopoDS
             from OCP.BRepAdaptor import BRepAdaptor_Curve
             from OCP.GCPnts import GCPnts_UniformAbscissa
-            for result in results:
+            for i, (result, err) in enumerate(per_face):
+                if err is not None:
+                    face_errors[i] = err
+                    continue
                 wrapped = result.wrapped
                 BRepMesh_IncrementalMesh(wrapped, 0.15)
                 exp = TopExp_Explorer(wrapped, TopAbs_FACE)
@@ -106,8 +202,8 @@ class ThickenMixin:
                     face = TopoDS.Face_s(exp.Current())
                     tri = BRep_Tool.Triangulation_s(face, face.Location())
                     if tri is not None:
-                        for i in range(1, tri.NbTriangles() + 1):
-                            n1, n2, n3 = tri.Triangle(i).Get()
+                        for j in range(1, tri.NbTriangles() + 1):
+                            n1, n2, n3 = tri.Triangle(j).Get()
                             for ni in (n1, n2, n3):
                                 p = tri.Node(ni)
                                 tris.extend((p.X(), p.Y(), p.Z()))
@@ -132,6 +228,12 @@ class ThickenMixin:
                 self._thicken_preview_tris  = tris
                 self._thicken_preview_edges = edges
                 self._thicken_preview_dist  = thickness
+                # Store errors for the main-thread slot to pick up, then invoke it.
+                self._thicken_pending_errors = (dict(face_errors), list(face_indices_snap))
+                from PyQt6.QtCore import QMetaObject, Qt as _Qt
+                QMetaObject.invokeMethod(
+                    self, "_apply_thicken_face_errors",
+                    _Qt.ConnectionType.QueuedConnection)
                 self.update()
 
         threading.Thread(target=_compute, daemon=True).start()
@@ -183,6 +285,21 @@ class ThickenMixin:
         glEnable(GL_CULL_FACE)
         glEnable(GL_LIGHTING)
 
+    @pyqtSlot()
+    def _apply_thicken_face_errors(self):
+        pending = getattr(self, '_thicken_pending_errors', None)
+        if pending is None:
+            return
+        face_errors, face_indices_snap = pending
+        self._thicken_pending_errors = None
+        p = getattr(self, '_thicken_panel', None)
+        if p is None:
+            return
+        p.clear_face_errors()
+        for i, msg in face_errors.items():
+            if i < len(face_indices_snap):
+                p.set_face_entry_error(i, msg)
+
     def _on_thicken_ok(self, thickness: float):
         body_id      = getattr(self, '_thicken_body_id', None)
         face_indices = getattr(self, '_thicken_face_indices', None)
@@ -214,7 +331,6 @@ class ThickenMixin:
         entry = entries[idx]
         entry.editing = False
 
-        # Collect the group: main entry + any split imports it produced.
         entry_id      = entry.entry_id
         group_indices = [idx]
         group_body_ids = {entry.body_id}
@@ -223,10 +339,17 @@ class ThickenMixin:
                 group_indices.append(j)
                 group_body_ids.add(entries[j].body_id)
 
-        # Seek to state before the op.
         self.history.seek(max(idx - 1, 0))
 
-        # Delete group entries back-to-front and remove created bodies.
+        if self.workspace.current_shape(body_id) is None:
+            print(f"[Edit] Cannot commit thicken: source body '{body_id}' has no "
+                  f"valid shape at this point. Fix upstream errors first.")
+            self.history.seek(idx)
+            entry.editing = False
+            self._rebuild_body_mesh(body_id)
+            self.history_changed.emit()
+            return
+
         removable_bodies = group_body_ids - {body_id}
         for j in reversed(group_indices):
             self.history.delete(j)
@@ -234,7 +357,6 @@ class ThickenMixin:
             if bid in self.workspace.bodies:
                 self.workspace.remove_body(bid)
 
-        # Commit fresh — identical to a first-time thicken.
         ThickenOp(source_body_id=body_id, face_indices=face_indices,
                   thickness=thickness).commit_async(self)
 

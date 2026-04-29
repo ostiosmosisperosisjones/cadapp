@@ -460,11 +460,11 @@ class HistoryPanel(QWidget):
         cursor  = self._history.cursor
 
         for i, entry in enumerate(entries):
-            # Hide split-body import entries whose solid was nullified by replay
+            # Hide all split-body import entries — they are tracked internally
+            # but not exposed in the history panel.
             if (entry.operation == "import"
                     and ("split_from" in entry.params
-                         or "source_entry_id" in entry.params)
-                    and entry.shape_after is None):
+                         or "source_entry_id" in entry.params)):
                 continue
 
             body      = self._workspace.bodies.get(entry.body_id)

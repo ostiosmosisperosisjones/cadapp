@@ -158,7 +158,33 @@ class SketchPickMixin:
         if best_hidx is None and hits:
             _, best_hidx, best_fidx, _, _ = min(hits, key=lambda h: h[0])
 
+        if best_hidx is None:
+            return None, None
+
+        # Occlusion check: reject if any mesh is closer along the ray than
+        # the sketch plane (coplanar face-level sketches are allowed through).
+        if self._sketch_plane_occluded(o, d, best_t):
+            return None, None
+
         return best_hidx, best_fidx
+
+    def _sketch_plane_occluded(self, ray_origin: np.ndarray,
+                               ray_dir: np.ndarray, plane_t: float) -> bool:
+        """
+        Return True if any visible body mesh has a ray hit closer than
+        plane_t (i.e. solid geometry is between the camera and the plane).
+        A small epsilon allows coplanar face-level sketches through.
+        """
+        from cad.picker import pick_face
+        _COPLANAR_EPS = 1e-3
+        for body_id, mesh in self._meshes.items():
+            body = self.workspace.bodies.get(body_id)
+            if body and not body.visible:
+                continue
+            result = pick_face(mesh, ray_origin, ray_dir, return_t=True)
+            if result and result[1] < plane_t - _COPLANAR_EPS:
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Draw
@@ -167,7 +193,14 @@ class SketchPickMixin:
     def _draw_sketch_faces(self):
         """
         Draw committed sketch faces as semi-transparent filled polygons
-        with boundary outlines.  Selected entry is drawn more opaque.
+        with boundary outlines.
+
+        Each face is drawn twice:
+          1. GL_LEQUAL  — pixels that pass the depth test (visible part),
+             at normal alpha.
+          2. GL_GREATER — pixels that fail (occluded by geometry), at
+             greatly reduced alpha so the plane ghost is visible but
+             clearly behind the object.
         """
         if not self._sketch_faces:
             return
@@ -180,13 +213,18 @@ class SketchPickMixin:
         from OCP.GCPnts import GCPnts_UniformAbscissa
 
         glDisable(GL_LIGHTING)
-        glDisable(GL_DEPTH_TEST)
-        glDisable(GL_CULL_FACE)   # draw both sides
+        glEnable(GL_DEPTH_TEST)
+        glDepthMask(GL_FALSE)      # never write sketch planes into depth buffer
+        glDisable(GL_CULL_FACE)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        # Shift the sketch plane slightly toward the camera so it wins over a
+        # coplanar body face without z-fighting.  Only applies to the visible
+        # pass (GL_LEQUAL) where depth comparison matters.
+        glEnable(GL_POLYGON_OFFSET_FILL)
+        glEnable(GL_POLYGON_OFFSET_LINE)
+        glPolygonOffset(-1.0, -1.0)
 
-        # Build a flat draw list sorted largest→smallest so inner faces
-        # paint on top and alpha doesn't compound across nested regions.
         def _uv_area(uvs):
             a = 0.0
             for k in range(len(uvs)):
@@ -203,6 +241,36 @@ class SketchPickMixin:
                 draw_list.append((hidx, fidx, face, _uv_area(outer_uvs)))
         draw_list.sort(key=lambda x: x[3], reverse=True)
 
+        def _draw_tris(facing, alpha):
+            glBegin(GL_TRIANGLES)
+            for tri_idx in range(1, facing.NbTriangles() + 1):
+                tri = facing.Triangle(tri_idx)
+                n1, n2, n3 = tri.Get()
+                for ni in (n1, n2, n3):
+                    node = facing.Node(ni)
+                    glVertex3f(node.X(), node.Y(), node.Z())
+            glEnd()
+
+        def _draw_edges(face_wrapped, line_alpha, line_width):
+            glLineWidth(line_width)
+            exp = TopExp_Explorer(face_wrapped, TopAbs_EDGE)
+            while exp.More():
+                edge = exp.Current()
+                try:
+                    adaptor = BRepAdaptor_Curve(edge)
+                    disc    = GCPnts_UniformAbscissa()
+                    disc.Initialize(adaptor, 32)
+                    if disc.IsDone() and disc.NbPoints() >= 2:
+                        glBegin(GL_LINE_STRIP)
+                        for pi in range(1, disc.NbPoints() + 1):
+                            p = adaptor.Value(disc.Parameter(pi))
+                            glVertex3f(p.X(), p.Y(), p.Z())
+                        glEnd()
+                except Exception:
+                    pass
+                exp.Next()
+            glLineWidth(1.0)
+
         for hidx, fidx, face, _ in draw_list:
             entry_selected = (hidx == self._selected_sketch_entry)
             is_selected = entry_selected and (
@@ -216,47 +284,43 @@ class SketchPickMixin:
                 if facing is None:
                     continue
 
-                glColor4f(0.29, 0.43, 0.54, 0.45 if is_selected else 0.20)
-                glBegin(GL_TRIANGLES)
-                for tri_idx in range(1, facing.NbTriangles() + 1):
-                    tri = facing.Triangle(tri_idx)
-                    n1, n2, n3 = tri.Get()
-                    for ni in (n1, n2, n3):
-                        node = facing.Node(ni)
-                        glVertex3f(node.X(), node.Y(), node.Z())
-                glEnd()
+                fill_alpha  = 0.45 if is_selected else 0.20
+                edge_alpha  = 0.90 if is_selected else 0.50
+                line_width  = 1.8  if is_selected else 1.2
+                occ_scale   = 0.18  # occluded regions are much dimmer
+
+                # --- Pass 1: visible (in front of or at geometry depth) ------
+                glDepthFunc(GL_LEQUAL)
+                glColor4f(0.29, 0.43, 0.54, fill_alpha)
+                _draw_tris(facing, fill_alpha)
 
                 if is_selected:
-                    glColor4f(0.48, 0.70, 0.84, 0.90)
-                    glLineWidth(1.8)
+                    glColor4f(0.48, 0.70, 0.84, edge_alpha)
                 else:
-                    glColor4f(0.29, 0.43, 0.54, 0.50)
-                    glLineWidth(1.2)
+                    glColor4f(0.29, 0.43, 0.54, edge_alpha)
+                _draw_edges(face.wrapped, edge_alpha, line_width)
 
-                exp = TopExp_Explorer(face.wrapped, TopAbs_EDGE)
-                while exp.More():
-                    edge = exp.Current()
-                    try:
-                        adaptor = BRepAdaptor_Curve(edge)
-                        disc    = GCPnts_UniformAbscissa()
-                        disc.Initialize(adaptor, 32)
-                        if disc.IsDone() and disc.NbPoints() >= 2:
-                            glBegin(GL_LINE_STRIP)
-                            for pi in range(1, disc.NbPoints() + 1):
-                                p = adaptor.Value(disc.Parameter(pi))
-                                glVertex3f(p.X(), p.Y(), p.Z())
-                            glEnd()
-                    except Exception:
-                        pass
-                    exp.Next()
-                glLineWidth(1.0)
+                # --- Pass 2: occluded (behind geometry) ----------------------
+                glDepthFunc(GL_GREATER)
+                glColor4f(0.29, 0.43, 0.54, fill_alpha * occ_scale)
+                _draw_tris(facing, fill_alpha * occ_scale)
+
+                occ_edge_alpha = edge_alpha * occ_scale
+                if is_selected:
+                    glColor4f(0.48, 0.70, 0.84, occ_edge_alpha)
+                else:
+                    glColor4f(0.29, 0.43, 0.54, occ_edge_alpha)
+                _draw_edges(face.wrapped, occ_edge_alpha, max(line_width - 0.4, 0.8))
 
             except Exception as ex:
                 print(f"[Sketch] draw_sketch_faces error: {ex}")
 
+        glDepthFunc(GL_LESS)
+        glDepthMask(GL_TRUE)
+        glDisable(GL_POLYGON_OFFSET_FILL)
+        glDisable(GL_POLYGON_OFFSET_LINE)
         glDisable(GL_BLEND)
         glEnable(GL_CULL_FACE)
-        glEnable(GL_DEPTH_TEST)
         glEnable(GL_LIGHTING)
 
     def _draw_extrude_preview(self):

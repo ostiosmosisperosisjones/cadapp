@@ -52,14 +52,15 @@ class ExtrudeMixin:
         if self._selected_sketch_entry is not None:
             self._show_extrude_panel(sketch_idx=self._selected_sketch_entry)
             return
-        if self.selection.face_count == 0:
-            print("[Extrude] No face or sketch selected."); return
-        sf = self.selection.single_face or self.selection.faces[0]
-        cb = self.request_extrude_distance
-        if cb:
-            cb(sf.body_id, sf.face_idx)
-        else:
+        if self.selection.face_count > 0:
+            sf = self.selection.single_face or self.selection.faces[0]
+            cb = self.request_extrude_distance
+            if cb:
+                cb(sf.body_id, sf.face_idx)
+                return
             self._show_extrude_panel(body_id=sf.body_id, face_idx=sf.face_idx)
+        else:
+            self._show_extrude_panel()
 
     def _show_extrude_panel(self, sketch_idx: int | None = None,
                              body_id: str | None = None,
@@ -71,6 +72,16 @@ class ExtrudeMixin:
         if hasattr(self, '_extrude_panel') and self._extrude_panel is not None:
             self._extrude_panel.close()
 
+        # Store face target as mutable viewport state so face-pick routing
+        # can update it live while the panel is open.
+        # _extrude_face_pairs: list of (body_id, face_idx) — supports multi-body.
+        self._extrude_sketch_idx  = sketch_idx
+        self._extrude_body_id     = body_id      # first body (compat / single-body)
+        self._extrude_face_idx    = face_idx     # first face index (compat)
+        self._extrude_face_pairs  = ([(body_id, face_idx)]
+                                     if body_id is not None and face_idx is not None
+                                     else [])
+
         panel = ExtrudePanel(self.workspace, parent=self)
 
         origin, normal = self._face_origin_and_normal(
@@ -80,21 +91,30 @@ class ExtrudeMixin:
         if normal is not None:
             panel.set_face_normal(normal)
 
-        panel.extrude_requested.connect(
-            lambda dist, direction, merge_id: self._on_extrude_panel_ok(
-                dist, direction, merge_id, sketch_idx, body_id, face_idx))
+        # Populate initial face entries if we already have a face.
+        if body_id is not None and face_idx is not None:
+            body = self.workspace.bodies.get(body_id)
+            if body is not None:
+                panel.add_face_entry(body_id, face_idx, f"{body.name}  ·  face {face_idx}")
+            else:
+                panel.set_face_label("⚠  face lost — pick again", valid=False)
+        elif sketch_idx is not None:
+            panel.add_face_entry(None, None, f"Sketch {sketch_idx}")
+
+        panel.extrude_requested.connect(self._on_extrude_panel_ok_live)
         panel.cancelled.connect(self._close_extrude_panel)
         panel.picking_edge_changed.connect(self._on_extrude_pick_edge)
         panel.picking_vertex_changed.connect(self._on_extrude_pick_vertex)
         panel.picking_body_changed.connect(self._on_extrude_pick_body)
-        panel.preview_changed.connect(
-            lambda dist, direction: self._update_extrude_preview(
-                dist, direction, sketch_idx, body_id, face_idx))
+        panel.picking_face_changed.connect(self._on_extrude_pick_face)
+        panel.preview_changed.connect(self._on_extrude_preview_live)
+        panel.face_entry_removed.connect(self._on_extrude_face_removed)
 
         self._extrude_panel        = panel
         self._extrude_pick_active  = False
         self._extrude_vtx_active   = False
         self._extrude_body_active  = False
+        self._extrude_face_active  = False
         self._extrude_preview_mesh = None
         self._position_extrude_panel()
         panel.show()
@@ -148,11 +168,12 @@ class ExtrudeMixin:
         return None, None
 
     def _position_extrude_panel(self):
-        if not hasattr(self, '_extrude_panel') or self._extrude_panel is None:
+        p = getattr(self, '_extrude_panel', None)
+        if p is None:
             return
-        p = self._extrude_panel
         margin = 16
-        p.move(margin, margin)
+        origin = self.mapToGlobal(self.rect().topLeft())
+        p.move(origin.x() + margin, origin.y() + margin)
 
     def _close_extrude_panel(self):
         if hasattr(self, '_extrude_panel') and self._extrude_panel is not None:
@@ -161,6 +182,7 @@ class ExtrudeMixin:
         self._extrude_pick_active  = False
         self._extrude_vtx_active   = False
         self._extrude_body_active  = False
+        self._extrude_face_active  = False
         self._extrude_preview_mesh = None
         if getattr(self, '_editing_history_idx', None) is not None:
             self._cancel_extrude_edit()
@@ -171,7 +193,7 @@ class ExtrudeMixin:
     # ------------------------------------------------------------------
 
     def _update_extrude_preview(self, dist: float, direction,
-                                 sketch_idx, body_id, face_idx):
+                                 sketch_idx, face_pairs):
         """Compute the preview solid and trigger a repaint."""
         from cad.operations.extrude import _do_extrude_solid
         panel        = getattr(self, '_extrude_panel', None)
@@ -179,26 +201,26 @@ class ExtrudeMixin:
         end_offset   = (panel._end_offset.mm_value()   or 0.0) if panel else 0.0
         try:
             if sketch_idx is not None:
-                all_faces = self._sketch_faces.get(sketch_idx, [])
-                if not all_faces:
+                all_sketch = self._sketch_faces.get(sketch_idx, [])
+                if not all_sketch:
                     self._extrude_preview_mesh = None
                     self.update(); return
                 fidx_sel = self._selected_sketch_face
-                if fidx_sel is not None and 0 <= fidx_sel < len(all_faces):
-                    preview_faces = [all_faces[fidx_sel][0]]
-                else:
-                    preview_faces = [f[0] for f in all_faces]
-            elif body_id is not None and face_idx is not None:
-                mesh = self._meshes.get(body_id)
-                if mesh is None:
+                preview_faces = ([all_sketch[fidx_sel][0]]
+                                 if fidx_sel is not None and 0 <= fidx_sel < len(all_sketch)
+                                 else [f[0] for f in all_sketch])
+            elif face_pairs:
+                preview_faces = []
+                for bid, fi in face_pairs:
+                    shape = self.workspace.current_shape(bid)
+                    if shape is None:
+                        continue
+                    all_f = list(shape.faces())
+                    if fi < len(all_f):
+                        preview_faces.append(all_f[fi])
+                if not preview_faces:
                     self._extrude_preview_mesh = None
                     self.update(); return
-                shape = self.workspace.current_shape(body_id)
-                faces = list(shape.faces())
-                if face_idx >= len(faces):
-                    self._extrude_preview_mesh = None
-                    self.update(); return
-                preview_faces = [faces[face_idx]]
             else:
                 self._extrude_preview_mesh = None
                 self.update(); return
@@ -218,6 +240,20 @@ class ExtrudeMixin:
     # Pick routing (called by viewport mouse handler)
     # ------------------------------------------------------------------
 
+    def _on_extrude_preview_live(self, dist: float, direction):
+        self._update_extrude_preview(
+            dist, direction,
+            getattr(self, '_extrude_sketch_idx', None),
+            getattr(self, '_extrude_face_pairs', []),
+        )
+
+    def _on_extrude_panel_ok_live(self, dist: float, direction, merge_body_id):
+        self._on_extrude_panel_ok(
+            dist, direction, merge_body_id,
+            getattr(self, '_extrude_sketch_idx', None),
+            getattr(self, '_extrude_face_pairs', []),
+        )
+
     def _on_extrude_pick_edge(self, active: bool):
         self._extrude_pick_active = active
 
@@ -226,6 +262,81 @@ class ExtrudeMixin:
 
     def _on_extrude_pick_body(self, active: bool):
         self._extrude_body_active = active
+
+    def _on_extrude_pick_face(self, active: bool):
+        self._extrude_face_active = active
+
+    def _on_extrude_face_removed(self, index: int):
+        pairs = getattr(self, '_extrude_face_pairs', [])
+        if 0 <= index < len(pairs):
+            pairs = [p for i, p in enumerate(pairs) if i != index]
+            self._extrude_face_pairs = pairs
+            self._extrude_body_id  = pairs[0][0] if pairs else None
+            self._extrude_face_idx = pairs[0][1] if pairs else None
+            panel = getattr(self, '_extrude_panel', None)
+            if panel is not None:
+                self._update_panel_mode_lock(panel, pairs)
+                panel._emit_preview()
+
+    def route_face_pick_for_extrude(self, body_id: str, face_idx: int) -> bool:
+        if not getattr(self, '_extrude_face_active', False):
+            return False
+        panel = getattr(self, '_extrude_panel', None)
+        pairs = getattr(self, '_extrude_face_pairs', [])
+
+        # Toggle: clicking an already-picked face removes it.
+        if (body_id, face_idx) in pairs:
+            pairs = [p for p in pairs if p != (body_id, face_idx)]
+            self._extrude_face_pairs = pairs
+            self._extrude_body_id    = pairs[0][0] if pairs else None
+            self._extrude_face_idx   = pairs[0][1] if pairs else None
+            if panel is not None:
+                panel.clear_face_entries()
+                for bid, fi in pairs:
+                    b = self.workspace.bodies.get(bid)
+                    name = b.name if b else bid
+                    panel.add_face_entry(bid, fi, f"{name}  ·  face {fi}")
+                self._update_panel_mode_lock(panel, pairs)
+                panel._emit_preview()
+            return True
+
+        self._extrude_sketch_idx = None
+        pairs = pairs + [(body_id, face_idx)]
+        self._extrude_face_pairs = pairs
+        self._extrude_body_id    = pairs[0][0]
+        self._extrude_face_idx   = pairs[0][1]
+
+        if panel is not None:
+            body = self.workspace.bodies.get(body_id)
+            name = body.name if body else body_id
+            panel.add_face_entry(body_id, face_idx, f"{name}  ·  face {face_idx}")
+            # Use the last-picked face for origin/normal hint
+            origin, normal = self._face_origin_and_normal(None, body_id, face_idx)
+            if origin is not None:
+                panel.set_face_origin(origin)
+            if normal is not None:
+                panel.set_face_normal(normal)
+            self._update_panel_mode_lock(panel, pairs)
+            panel._emit_preview()
+        return True
+
+    def _update_panel_mode_lock(self, panel, face_pairs):
+        """Lock out merge/cut modes when faces span multiple bodies."""
+        bodies = {bid for bid, _ in face_pairs}
+        multi_body = len(bodies) > 1
+        if multi_body:
+            # Force new-body mode, disable merge and cut options
+            panel._radio_extrude.setChecked(True)
+            panel._on_mode_changed(0)
+            panel._radio_new.setChecked(True)
+            panel._op_group.button(0).setChecked(True)
+            panel._on_op_changed(0)
+            panel._radio_cut.setEnabled(False)
+            panel._radio_merge.setEnabled(False)
+            panel._radio_extrude.setEnabled(True)
+        else:
+            panel._radio_cut.setEnabled(True)
+            panel._radio_merge.setEnabled(True)
 
     def route_body_pick_for_extrude(self, body_id: str) -> bool:
         if not getattr(self, '_extrude_body_active', False):
@@ -319,7 +430,7 @@ class ExtrudeMixin:
         self.history_changed.emit()
 
     def _commit_extrude_edit(self, dist, direction, merge_body_id,
-                              sketch_idx, body_id, face_idx, extra,
+                              sketch_idx, face_pairs, extra,
                               target_vertex, start_off, end_off):
         """
         Commit an edit by:
@@ -369,22 +480,34 @@ class ExtrudeMixin:
                 group_indices.append(j)
                 group_body_ids.add(e.body_id)
 
-        # Determine which body is the "source" that should NOT be removed —
-        # it existed before this op and must persist after we delete the group.
+        # Determine which bodies are "sources" that should NOT be removed.
+        body_id  = face_pairs[0][0] if face_pairs else None
+        face_idx = face_pairs[0][1] if face_pairs else None
         if sketch_idx is not None:
             se_entry = entries[sketch_idx] if sketch_idx < len(entries) else None
             se = se_entry.params.get("sketch_entry") if se_entry else None
-            src_body = se.body_id if se else body_id
+            src_bodies = {se.body_id if se else body_id}
         else:
-            src_body = body_id  # FaceExtrudeOp: source body is always preserved
+            src_bodies = {bid for bid, _ in face_pairs} if face_pairs else {body_id}
 
         # --- Step 2: seek to idx-1 so commit() sees the pre-op state. --------
         self.history.seek(max(idx - 1, 0))
 
+        # Guard: abort if any source body has no valid shape at idx-1.
+        if sketch_idx is None and src_bodies:
+            for sbid in src_bodies:
+                if sbid and self.workspace.current_shape(sbid) is None:
+                    print(f"[Edit] Cannot commit: source body '{sbid}' has no "
+                          f"valid shape at this point in history.")
+                    self.history.seek(idx)
+                    entry.editing = False
+                    self._rebuild_body_mesh(sbid)
+                    self.history_changed.emit()
+                    return
+
         # --- Step 3: delete group entries back-to-front + remove created bodies.
-        # Also remove any force_new_body child bodies stored in params.
         child_body_ids = entry.params.get("child_body_ids", [])
-        removable_bodies = (group_body_ids - {src_body}) | set(child_body_ids)
+        removable_bodies = (group_body_ids - src_bodies) | set(child_body_ids)
         for j in reversed(group_indices):
             self.history.delete(j)
         for bid in removable_bodies:
@@ -392,8 +515,8 @@ class ExtrudeMixin:
                 self.workspace.remove_body(bid)
 
         # --- Step 4: build the new op and commit it fresh. -------------------
-        dir_list = direction.tolist() if direction is not None else None
-        is_cut   = dist < 0
+        dir_list  = direction.tolist() if direction is not None else None
+        is_cut    = dist < 0
 
         sketch_id = (self.history.index_to_id(sketch_idx)
                      if sketch_idx is not None else None)
@@ -431,6 +554,8 @@ class ExtrudeMixin:
             new_op = FaceExtrudeOp(
                 source_body_id = body_id,
                 face_idx       = face_idx,
+                face_pairs     = list(face_pairs),
+                face_indices   = [fi for _, fi in face_pairs],
                 distance       = dist,
                 direction      = dir_list,
                 target_vertex  = (extra or {}).get('target_vertex'),
@@ -441,18 +566,13 @@ class ExtrudeMixin:
 
         new_op.commit(self, extra or None)
 
-        # Cascade: replay every body chain that has entries after the newly
-        # inserted group so downstream ops receive updated shapes.
-        new_idx     = self.history.cursor
-        all_entries = self.history.entries
-        replayed    : set[str] = set()
-        for i in range(new_idx + 1, len(all_entries)):
-            bid = all_entries[i].body_id
-            if bid not in replayed:
-                replayed.add(bid)
-                ok, err, _ = self.history.replay_from(i)
-                if not ok:
-                    print(f"[Edit] Downstream replay failed: {err}")
+        # Cascade: replay all body chains after the newly inserted group so
+        # downstream ops receive updated shapes (single ordered pass handles
+        # cross-body dependencies correctly).
+        new_idx = self.history.cursor
+        ok, err, _ = self.history.replay_all_from(new_idx + 1)
+        if not ok:
+            print(f"[Edit] Downstream replay failed: {err}")
 
         # Full mesh rebuild — cheaper than tracking exactly what changed, and
         # ensures stale GL buffers for removed/replaced bodies are purged.
@@ -464,7 +584,7 @@ class ExtrudeMixin:
     # ------------------------------------------------------------------
 
     def _on_extrude_panel_ok(self, dist: float, direction, merge_body_id,
-                              sketch_idx, body_id, face_idx):
+                              sketch_idx, face_pairs):
         # Guard against double-fire (e.g. Enter key + default button both firing).
         if not getattr(self, '_extrude_panel', None) and \
                 getattr(self, '_editing_history_idx', None) is None:
@@ -495,11 +615,15 @@ class ExtrudeMixin:
         if editing_idx is not None:
             self._editing_history_idx = editing_idx  # restore for _commit
             self._commit_extrude_edit(dist, direction, merge_body_id,
-                                      sketch_idx, body_id, face_idx, extra,
+                                      sketch_idx, face_pairs, extra,
                                       target_vertex, start_off, end_off)
             return
 
         is_cut = dist < 0
+        # Multi-body always forces new-body — use first pair for cut/sketch compat
+        body_id  = face_pairs[0][0] if face_pairs else None
+        face_idx = face_pairs[0][1] if face_pairs else None
+
         if is_cut and merge_body_id not in (None, "__new_body__"):
             self._do_cut_from_body(dist, direction, merge_body_id,
                                    sketch_idx, body_id, face_idx, extra)
@@ -514,8 +638,8 @@ class ExtrudeMixin:
                                    merge_body_id=real_merge_id,
                                    force_new_body=force_new_body,
                                    extra_params=extra)
-        elif body_id is not None and face_idx is not None:
-            self.do_extrude(body_id, face_idx, dist,
+        elif face_pairs:
+            self.do_extrude(face_pairs, dist,
                             direction=direction,
                             merge_body_id=real_merge_id,
                             force_new_body=force_new_body,
@@ -555,13 +679,33 @@ class ExtrudeMixin:
         )
         op.commit_async(self, extra)
 
-    def do_extrude(self, body_id: str, face_idx: int, distance: float,
+    def do_extrude(self, face_pairs, distance: float,
                    direction=None, merge_body_id: str | None = None,
                    force_new_body: bool = False,
                    extra_params: dict | None = None):
-        """Build FaceExtrudeOp (or delegate to merge path) and commit."""
-        import numpy as np
+        """Build FaceExtrudeOp (or delegate to merge path) and commit.
+
+        face_pairs: list of (body_id, face_idx) tuples, or a single body_id str
+                    for backward compat (combined with face_idx below).
+        """
         from cad.op_types import FaceExtrudeOp
+
+        # Normalise: accept list of (body_id, face_idx) pairs
+        if isinstance(face_pairs, str):
+            # Legacy: do_extrude(body_id, face_idx, ...) — shouldn't happen anymore
+            # but guard just in case
+            face_pairs = [(face_pairs, 0)]
+        pairs = list(face_pairs)
+        if not pairs:
+            return
+        body_id  = pairs[0][0]
+        face_idx = pairs[0][1]
+
+        # Multi-body: always force_new_body, skip merge path
+        multi_body = len({bid for bid, _ in pairs}) > 1
+        if multi_body:
+            force_new_body = True
+            merge_body_id  = None
 
         if merge_body_id is not None and not force_new_body:
             from cad.operations.extrude import _do_extrude_solid
@@ -571,11 +715,14 @@ class ExtrudeMixin:
             from cad.op_types import _push_result
             shape_before = self.workspace.current_shape(body_id)
             target_shape = self.workspace.current_shape(merge_body_id)
-            face_obj     = list(shape_before.faces())[face_idx]
+            all_src_faces = list(shape_before.faces())
+            face_objs = [all_src_faces[fi] for _, fi in pairs
+                         if fi < len(all_src_faces)]
             target_occ   = target_shape.wrapped
             original_solid_count = len(list(target_shape.solids()))
             op_params = {"distance": abs(distance), "merged_from": body_id,
-                         "face_idx": face_idx, "source_body_id": body_id}
+                         "face_pairs": [(bid, fi) for bid, fi in pairs],
+                         "source_body_id": body_id}
             if direction is not None:
                 op_params["direction"] = direction.tolist()
             if extra_params:
@@ -583,15 +730,21 @@ class ExtrudeMixin:
             _merge_body_id = merge_body_id
 
             def _compute():
-                tool = _do_extrude_solid(face_obj, distance, direction)
-                lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
-                lst_b = TopTools_ListOfShape(); lst_b.Append(tool.wrapped)
-                fuse = BRepAlgoAPI_Fuse()
-                fuse.SetArguments(lst_a); fuse.SetTools(lst_b)
-                fuse.SetRunParallel(True); fuse.Build()
-                if not fuse.IsDone():
-                    raise RuntimeError("Fuse failed.")
-                return Compound(fuse.Shape())
+                from build123d import Compound as _C
+                from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse as _F
+                from OCP.TopTools import TopTools_ListOfShape as _L
+                result = target_occ
+                for fo in face_objs:
+                    tool = _do_extrude_solid(fo, distance, direction)
+                    lst_a = _L(); lst_a.Append(result)
+                    lst_b = _L(); lst_b.Append(tool.wrapped)
+                    fuse = _F()
+                    fuse.SetArguments(lst_a); fuse.SetTools(lst_b)
+                    fuse.SetRunParallel(True); fuse.Build()
+                    if not fuse.IsDone():
+                        raise RuntimeError("Fuse failed.")
+                    result = fuse.Shape()
+                return _C(result)
 
             def _finalize(merged):
                 _push_result(self, "extrude", op_params, _merge_body_id,
@@ -604,6 +757,8 @@ class ExtrudeMixin:
         op = FaceExtrudeOp(
             source_body_id = body_id,
             face_idx       = face_idx,
+            face_pairs     = pairs,
+            face_indices   = [fi for _, fi in pairs],
             distance       = distance,
             direction      = dir_list,
             target_vertex  = (extra_params or {}).get('target_vertex'),

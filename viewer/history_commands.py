@@ -103,15 +103,7 @@ class DeleteCommand(HistoryCommand):
         # Replay from the earliest restored position to recompute shapes.
         if self.entries_snapshot:
             lo = min(idx for idx, _ in self.entries_snapshot)
-            replayed: set[str] = set()
-            all_mutated: set[str] = set()
-            for i, e in enumerate(vp.history._entries):
-                if i < lo:
-                    continue
-                if e.body_id not in replayed:
-                    _, _, mut = vp.history.replay_from(i)
-                    all_mutated |= mut
-                    replayed.add(e.body_id)
+            _, _, all_mutated = vp.history.replay_all_from(lo)
             vp._rebuild_bodies(all_mutated)
         else:
             vp._rebuild_all_meshes()
