@@ -192,16 +192,15 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         else:
             mesh = None
         self.makeCurrent()
-        old = self._meshes.get(body_id)
-        if old:
-            for buf in (old.vbo_verts, old.vbo_normals, old.vbo_edges, old.ebo):
-                if buf is not None:
-                    glDeleteBuffers(1, [buf])
         if mesh is not None:
+            old = self._meshes.get(body_id)
+            if old:
+                for buf in (old.vbo_verts, old.vbo_normals, old.vbo_edges, old.ebo):
+                    if buf is not None:
+                        glDeleteBuffers(1, [buf])
             mesh.upload()
             self._meshes[body_id] = mesh
-        else:
-            self._meshes.pop(body_id, None)
+        # If shape is None (failed op), keep the existing mesh so the body stays visible.
         self.selection.clear_for_body(body_id)
         if self._hovered_vertex[0] == body_id:
             self._hovered_vertex = (None, None)

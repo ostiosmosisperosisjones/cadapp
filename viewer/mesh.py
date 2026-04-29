@@ -16,23 +16,31 @@ class Mesh:
         # Use a stable cache key based on the shape's OCCT hash so the
         # tessellator can reuse cached results for identical shapes (e.g. undo/redo).
         cache_key = f"mesh_{hash(shape.wrapped)}"
-        tess = tessellate(
-            shape.wrapped,
-            cache_key=cache_key,
-            deviation=0.01,
-            quality=0.01,
-            angular_tolerance=0.1,
-        )
-
-        self.triangles_per_face = np.array(tess['triangles_per_face'], dtype=np.int32)
-        self.shape      = shape
         self.occt_faces = list(shape.faces())
+        self.shape      = shape
 
-        if len(self.occt_faces) != len(self.triangles_per_face):
+        # Retry with progressively looser tolerances if the tessellator returns
+        # a face count that doesn't match shape.faces() (ocp_tessellate bug).
+        _attempts = [
+            dict(deviation=0.01,  quality=0.01,  angular_tolerance=0.1),
+            dict(deviation=0.05,  quality=0.05,  angular_tolerance=0.3),
+            dict(deviation=0.1,   quality=0.1,   angular_tolerance=0.5),
+        ]
+        tess = None
+        for attempt in _attempts:
+            t = tessellate(shape.wrapped, cache_key=cache_key, **attempt)
+            tri_per_face = np.array(t['triangles_per_face'], dtype=np.int32)
+            if len(tri_per_face) == len(self.occt_faces):
+                tess = t
+                self.triangles_per_face = tri_per_face
+                break
+            # bust the cache key so next attempt re-tessellates
+            cache_key = cache_key + "_r"
+
+        if tess is None:
             raise RuntimeError(
-                f"Face count mismatch: tessellator gave "
-                f"{len(self.triangles_per_face)} faces but "
-                f"shape.faces() gave {len(self.occt_faces)}."
+                f"Face count mismatch after all retry attempts: tessellator gave "
+                f"{len(tri_per_face)} faces but shape.faces() gave {len(self.occt_faces)}."
             )
 
         self.verts   = np.array(tess['vertices'], dtype=np.float32).reshape(-1, 3)

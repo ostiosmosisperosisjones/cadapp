@@ -9,10 +9,12 @@ import numpy as np
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QButtonGroup, QRadioButton, QFrame, QSizePolicy, QScrollArea,
+    QButtonGroup, QRadioButton, QFrame, QSizePolicy,
 )
 from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtGui import QKeyEvent
+
+from gui.selection_list import SelectionList
 
 
 _PANEL_STYLE = """
@@ -102,7 +104,7 @@ class ExtrudePanel(QWidget):
     picking_body_changed   = pyqtSignal(bool)
     picking_face_changed   = pyqtSignal(bool)
     preview_changed        = pyqtSignal(float, object)
-    face_entry_removed     = pyqtSignal(int)   # index in _face_entries that was removed
+    face_entry_removed     = pyqtSignal(int)   # index of removed entry (forwarded from SelectionList)
 
     def __init__(self, workspace, parent=None):
         super().__init__(None)   # top-level so it's never clipped by the viewport
@@ -123,8 +125,6 @@ class ExtrudePanel(QWidget):
         self._picking_vertex : bool = False
         self._picking_body   : bool = False
         self._picking_face   : bool = False
-        self._has_face       : bool = False
-        self._face_entries   : list = []   # list of (body_id, face_idx, label)
 
         self._target_vertex  : np.ndarray | None = None
         self._face_origin    : np.ndarray | None = None
@@ -165,16 +165,9 @@ class ExtrudePanel(QWidget):
         face_header.addWidget(self._pick_face_btn)
         root.addLayout(face_header)
 
-        # Scrollable list of picked faces
-        self._face_list_widget = QWidget()
-        self._face_list_layout = QVBoxLayout(self._face_list_widget)
-        self._face_list_layout.setContentsMargins(0, 0, 0, 0)
-        self._face_list_layout.setSpacing(2)
-        self._face_empty_label = QLabel("No faces selected")
-        self._face_empty_label.setStyleSheet(
-            "color: #555; font-size: 11px; font-family: monospace;")
-        self._face_list_layout.addWidget(self._face_empty_label)
-        root.addWidget(self._face_list_widget)
+        self._face_list = SelectionList(empty_text="No faces selected")
+        self._face_list.entry_removed.connect(self.face_entry_removed)
+        root.addWidget(self._face_list)
 
         root.addWidget(self._separator())
 
@@ -391,68 +384,26 @@ class ExtrudePanel(QWidget):
         """Mark this panel as a same-body cut (no cross-body pick required)."""
         self._self_cut = is_self
 
+    @property
+    def _has_face(self) -> bool:
+        return self._face_list.has_valid_entries
+
     def add_face_entry(self, body_id: str | None, face_idx: int | None,
                        label: str, valid: bool = True):
-        """Add or update a face entry. If (body_id, face_idx) already exists, skip."""
-        if body_id is not None and face_idx is not None:
-            for entry in self._face_entries:
-                if entry[0] == body_id and entry[1] == face_idx:
-                    return  # already in list
-        self._face_entries.append((body_id, face_idx, label, valid))
-        self._rebuild_face_list()
+        key = (body_id, face_idx) if body_id is not None else label
+        self._face_list.add(key, label, valid=valid)
 
     def remove_face_entry(self, index: int):
-        if 0 <= index < len(self._face_entries):
-            self._face_entries.pop(index)
-            self._rebuild_face_list()
-            self.face_entry_removed.emit(index)
+        self._face_list.remove_at(index)   # emits entry_removed → face_entry_removed
 
     def clear_face_entries(self):
-        self._face_entries.clear()
-        self._rebuild_face_list()
+        self._face_list.clear()
 
-    def set_face_label(self, text: str, valid: bool = True):
-        """Compat: set a single face entry, replacing any existing entries."""
-        self._face_entries = [(None, None, text, valid)]
-        self._rebuild_face_list()
+    def set_face_entry_error(self, index: int, error_msg: str):
+        self._face_list.set_error(index, error_msg)
 
-    def _rebuild_face_list(self):
-        # Remove all widgets except the empty label
-        while self._face_list_layout.count():
-            item = self._face_list_layout.takeAt(0)
-            w = item.widget()
-            if w and w is not self._face_empty_label:
-                w.deleteLater()
-
-        self._has_face = bool(self._face_entries) and all(e[3] for e in self._face_entries)
-
-        if not self._face_entries:
-            self._face_list_layout.addWidget(self._face_empty_label)
-            self._face_empty_label.show()
-            return
-
-        self._face_empty_label.hide()
-        for i, (body_id, face_idx, label, valid) in enumerate(self._face_entries):
-            row = QWidget()
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.setSpacing(4)
-            lbl = QLabel(label)
-            color = "#d4d4d4" if valid else "#cc7744"
-            lbl.setStyleSheet(
-                f"color: {color}; font-size: 11px; font-family: monospace;")
-            lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-            row_layout.addWidget(lbl)
-            rm_btn = QPushButton("✕")
-            rm_btn.setFixedWidth(22)
-            rm_btn.setStyleSheet(
-                "QPushButton { background: #2a2a2a; color: #666; border: none; "
-                "font-size: 10px; padding: 1px; } "
-                "QPushButton:hover { color: #cc4444; }")
-            idx_capture = i
-            rm_btn.clicked.connect(lambda _, idx=idx_capture: self.remove_face_entry(idx))
-            row_layout.addWidget(rm_btn)
-            self._face_list_layout.addWidget(row)
+    def clear_face_errors(self):
+        self._face_list.clear_errors()
 
     def set_face_origin(self, origin: np.ndarray):
         self._face_origin = origin.copy()
@@ -731,7 +682,7 @@ class ExtrudePanel(QWidget):
         self._emit_preview()
 
     def _on_ok(self):
-        if not self._has_face:
+        if not len(self._face_list):
             return
         self._spinbox._on_commit()
         dist, direction = self._signed_dist_and_dir()

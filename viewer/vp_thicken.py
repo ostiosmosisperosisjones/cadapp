@@ -12,17 +12,19 @@ class ThickenMixin:
 
     def _try_thicken(self):
         faces = self.selection.faces
-        if not faces:
-            print("[Thicken] Select a face first."); return
-        body_id = faces[0].body_id
-        if any(f.body_id != body_id for f in faces):
-            print("[Thicken] All selected faces must be on the same body."); return
-        if self.workspace.current_shape(body_id) is None:
-            print("[Thicken] Active body has no shape."); return
-        face_indices = [f.face_idx for f in faces]
+        if faces:
+            body_id = faces[0].body_id
+            if any(f.body_id != body_id for f in faces):
+                print("[Thicken] All selected faces must be on the same body."); return
+            if self.workspace.current_shape(body_id) is None:
+                print("[Thicken] Active body has no shape."); return
+            face_indices = [f.face_idx for f in faces]
+        else:
+            body_id      = None
+            face_indices = []
         self._show_thicken_panel(body_id, face_indices)
 
-    def _show_thicken_panel(self, body_id: str, face_indices: list, editing_entry=None):
+    def _show_thicken_panel(self, body_id: str | None, face_indices: list, editing_entry=None):
         from gui.thicken_panel import ThickenPanel
         if getattr(self, '_thicken_panel', None) is not None:
             old = self._thicken_panel
@@ -121,9 +123,13 @@ class ThickenMixin:
         if panel is None or not panel._picking_face:
             return False
 
-        # Thicken only supports a single body — reject different body.
+        # Thicken only supports a single body.
+        # If none locked yet (panel opened with no selection), lock to first picked body.
         thicken_body = getattr(self, '_thicken_body_id', None)
-        if thicken_body is not None and body_id != thicken_body:
+        if thicken_body is None:
+            self._thicken_body_id = body_id
+            thicken_body = body_id
+        elif body_id != thicken_body:
             print("[Thicken] All faces must be on the same body.")
             return True
 

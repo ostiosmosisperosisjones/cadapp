@@ -8,12 +8,13 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QButtonGroup, QRadioButton, QFrame, QSizePolicy,
+    QButtonGroup, QRadioButton, QFrame,
 )
 from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QKeyEvent
 
 from gui.expr_spinbox import ExprSpinBox
+from gui.selection_list import SelectionList
 from cad.prefs import prefs
 
 
@@ -82,10 +83,10 @@ _SEP_STYLE = "background: #333;"
 
 
 class ThickenPanel(QWidget):
-    thicken_requested = pyqtSignal(float)   # thickness_mm (signed: positive=grow, negative=cut)
-    cancelled         = pyqtSignal()
-    preview_changed   = pyqtSignal(float)   # thickness_mm for live preview
-    face_entry_removed = pyqtSignal(int)    # index of removed face entry
+    thicken_requested  = pyqtSignal(float)  # thickness_mm (signed)
+    cancelled          = pyqtSignal()
+    preview_changed    = pyqtSignal(float)  # thickness_mm for live preview
+    face_entry_removed = pyqtSignal(int)    # index of removed face entry (forwarded from SelectionList)
 
     def __init__(self, parent=None):
         super().__init__(None)   # top-level so it's never clipped by the viewport
@@ -99,8 +100,6 @@ class ThickenPanel(QWidget):
         self.setFixedWidth(240)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
-        self._has_face     = False
-        self._face_entries : list = []   # list of (body_id, face_idx, label, valid)
         self._picking_face : bool = False
 
         layout = QVBoxLayout(self)
@@ -125,15 +124,9 @@ class ThickenPanel(QWidget):
         face_header.addWidget(self._pick_face_btn)
         layout.addLayout(face_header)
 
-        self._face_list_widget = QWidget()
-        self._face_list_layout = QVBoxLayout(self._face_list_widget)
-        self._face_list_layout.setContentsMargins(0, 0, 0, 0)
-        self._face_list_layout.setSpacing(2)
-        self._face_empty_label = QLabel("No faces selected")
-        self._face_empty_label.setStyleSheet(
-            "color: #555; font-size: 11px; font-family: monospace;")
-        self._face_list_layout.addWidget(self._face_empty_label)
-        layout.addWidget(self._face_list_widget)
+        self._face_list = SelectionList(empty_text="No faces selected")
+        self._face_list.entry_removed.connect(self.face_entry_removed)
+        layout.addWidget(self._face_list)
 
         layout.addWidget(self._separator())
 
@@ -204,81 +197,27 @@ class ThickenPanel(QWidget):
         return lbl
 
     # ------------------------------------------------------------------
-    # Face list API
+    # Face list API (delegated to SelectionList)
     # ------------------------------------------------------------------
 
+    @property
+    def _has_face(self) -> bool:
+        return self._face_list.has_valid_entries
+
     def add_face_entry(self, body_id: str, face_idx: int, label: str, valid: bool = True):
-        for entry in self._face_entries:
-            if entry[0] == body_id and entry[1] == face_idx:
-                return
-        self._face_entries.append((body_id, face_idx, label, valid, ""))
-        self._rebuild_face_list()
+        self._face_list.add((body_id, face_idx), label, valid=valid)
 
     def remove_face_entry(self, index: int):
-        if 0 <= index < len(self._face_entries):
-            self._face_entries.pop(index)
-            self._rebuild_face_list()
-            self.face_entry_removed.emit(index)
+        self._face_list.remove_at(index)   # emits entry_removed → face_entry_removed
 
     def clear_face_entries(self):
-        self._face_entries.clear()
-        self._rebuild_face_list()
+        self._face_list.clear()
 
     def set_face_entry_error(self, index: int, error_msg: str):
-        """Mark a face entry as invalid with a tooltip error message."""
-        if 0 <= index < len(self._face_entries):
-            body_id, face_idx, label, _valid, _tip = self._face_entries[index]
-            self._face_entries[index] = (body_id, face_idx, label, False, error_msg)
-            self._rebuild_face_list()
+        self._face_list.set_error(index, error_msg)
 
     def clear_face_errors(self):
-        """Reset all face entries to valid state."""
-        changed = False
-        for i, (body_id, face_idx, label, valid, tip) in enumerate(self._face_entries):
-            if not valid:
-                self._face_entries[i] = (body_id, face_idx, label, True, "")
-                changed = True
-        if changed:
-            self._rebuild_face_list()
-
-    def _rebuild_face_list(self):
-        while self._face_list_layout.count():
-            item = self._face_list_layout.takeAt(0)
-            w = item.widget()
-            if w and w is not self._face_empty_label:
-                w.deleteLater()
-
-        self._has_face = bool(self._face_entries) and all(e[3] for e in self._face_entries)
-
-        if not self._face_entries:
-            self._face_list_layout.addWidget(self._face_empty_label)
-            self._face_empty_label.show()
-            return
-
-        self._face_empty_label.hide()
-        for i, (body_id, face_idx, label, valid, tooltip) in enumerate(self._face_entries):
-            row = QWidget()
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.setSpacing(4)
-            lbl = QLabel(label)
-            color = "#d4d4d4" if valid else "#cc4444"
-            lbl.setStyleSheet(
-                f"color: {color}; font-size: 11px; font-family: monospace;")
-            lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-            if tooltip:
-                lbl.setToolTip(tooltip)
-            row_layout.addWidget(lbl)
-            rm_btn = QPushButton("✕")
-            rm_btn.setFixedWidth(22)
-            rm_btn.setStyleSheet(
-                "QPushButton { background: #2a2a2a; color: #666; border: none; "
-                "font-size: 10px; padding: 1px; } "
-                "QPushButton:hover { color: #cc4444; }")
-            idx_capture = i
-            rm_btn.clicked.connect(lambda _, idx=idx_capture: self.remove_face_entry(idx))
-            row_layout.addWidget(rm_btn)
-            self._face_list_layout.addWidget(row)
+        self._face_list.clear_errors()
 
     # ------------------------------------------------------------------
     # Pick face toggle
@@ -317,7 +256,7 @@ class ThickenPanel(QWidget):
         return val
 
     def _on_ok(self):
-        if not self._has_face:
+        if not len(self._face_list):
             return
         val = self._signed_value()
         if val is not None and val != 0:

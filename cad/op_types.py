@@ -51,7 +51,41 @@ class Op:
         except NotImplementedError:
             self.commit(viewport, extra_params)
             return
+        except Exception as ex:
+            # _split_commit failed before producing a finalize — push a failed
+            # entry directly so the op appears red in history instead of vanishing.
+            print(f"[Op] FAILED: {ex}")
+            self._push_failed_entry(viewport, str(ex), extra_params)
+            return
         viewport.run_op_async(type(self).__name__.replace("Op", ""), compute_fn, finalize_fn)
+
+    def _push_failed_entry(self, viewport: Any, error_msg: str,
+                           extra_params: dict | None = None) -> None:
+        """Push a red history entry when the op fails before compute starts."""
+        try:
+            # FaceExtrudeOp uses "cut" or "extrude" based on distance sign
+            dist = getattr(self, 'distance', None)
+            if dist is not None:
+                op_str = "cut" if dist < 0 else "extrude"
+            else:
+                op_str = getattr(self, '_op_str', None) or type(self).__name__.replace("Op", "").lower()
+            body_id   = getattr(self, 'source_body_id', None) or getattr(self, 'body_id', None)
+            op_params = self.to_params()
+            if extra_params:
+                op_params.update(extra_params)
+            shape_before = viewport.workspace.current_shape(body_id) if body_id else None
+            from cad.units import format_op_label as _lbl
+            label = _lbl(op_str, op_params)
+            entry = viewport.history.push(
+                label=label, operation=op_str, params=op_params,
+                body_id=body_id, face_ref=None,
+                shape_before=shape_before, shape_after=None)
+            entry.error     = True
+            entry.error_msg = error_msg
+            viewport._post_push_cascade(body_id)
+            viewport.history_changed.emit()
+        except Exception as ex2:
+            print(f"[Op] Could not push failed entry: {ex2}")
 
     def _split_commit(self, viewport: Any, extra_params: dict | None):
         """
@@ -236,13 +270,22 @@ class FaceExtrudeOp(Op):
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         try:
             compute, finalize = self._split_commit(viewport, extra_params)
-        except RuntimeError as ex:
-            print(ex); return None
+        except Exception as ex:
+            print(f"[Op] FAILED: {ex}")
+            self._push_failed_entry(viewport, str(ex), extra_params)
+            return None
         try:
             shape_after = compute()
         except Exception as ex:
-            print(f"[Extrude] FAILED: {ex}"); return None
-        finalize(shape_after)
+            print(f"[Op] FAILED: {ex}")
+            shape_after = None
+            viewport._pending_op_error = str(ex)
+        else:
+            viewport._pending_op_error = None
+        try:
+            finalize(shape_after)
+        finally:
+            viewport._pending_op_error = None
         return shape_after
 
     def _split_commit(self, viewport: Any, extra_params: dict | None = None):
@@ -601,13 +644,22 @@ class CrossBodyCutOp(Op):
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         try:
             compute, finalize = self._split_commit(viewport, extra_params)
-        except RuntimeError as ex:
-            print(ex); return None
+        except Exception as ex:
+            print(f"[Op] FAILED: {ex}")
+            self._push_failed_entry(viewport, str(ex), extra_params)
+            return None
         try:
             shape_after = compute()
         except Exception as ex:
-            print(f"[Cut] FAILED: {ex}"); return None
-        finalize(shape_after)
+            print(f"[Op] FAILED: {ex}")
+            shape_after = None
+            viewport._pending_op_error = str(ex)
+        else:
+            viewport._pending_op_error = None
+        try:
+            finalize(shape_after)
+        finally:
+            viewport._pending_op_error = None
         return shape_after
 
     def _split_commit(self, viewport: Any, extra_params: dict | None = None):
@@ -908,13 +960,22 @@ class SketchExtrudeOp(Op):
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         try:
             compute, finalize = self._split_commit(viewport, extra_params)
-        except RuntimeError as ex:
-            print(ex); return None
+        except Exception as ex:
+            print(f"[Op] FAILED: {ex}")
+            self._push_failed_entry(viewport, str(ex), extra_params)
+            return None
         try:
             shape_after = compute()
         except Exception as ex:
-            print(f"[Extrude] FAILED: {ex}"); return None
-        finalize(shape_after)
+            print(f"[Op] FAILED: {ex}")
+            shape_after = None
+            viewport._pending_op_error = str(ex)
+        else:
+            viewport._pending_op_error = None
+        try:
+            finalize(shape_after)
+        finally:
+            viewport._pending_op_error = None
         return shape_after
 
     def _split_commit(self, viewport: Any, extra_params: dict | None = None):
@@ -1239,6 +1300,9 @@ def _push_result(viewport, op_str: str, op_params: dict, body_id: str,
     """
     Push history entry/entries for a boolean result and trigger mesh rebuild.
 
+    If shape_after is None the op failed — push a single diverged entry so it
+    appears red in the history panel instead of silently disappearing.
+
     If the result has more solids than the original (a split), each extra solid
     gets its own 'import' entry and workspace body.  Otherwise a single entry
     is pushed and _post_push_cascade handles mid-history replay.
@@ -1248,7 +1312,20 @@ def _push_result(viewport, op_str: str, op_params: dict, body_id: str,
     from cad.units import format_op_label as _lbl
     from viewer.vp_extrude import _strip_split_suffix, _next_split_name
 
-    label  = _lbl(op_str, op_params)
+    label = _lbl(op_str, op_params)
+
+    if shape_after is None:
+        err_msg = getattr(viewport, '_pending_op_error', None) or "Operation failed"
+        entry = viewport.history.push(
+            label=label, operation=op_str, params=op_params,
+            body_id=body_id, face_ref=face_ref,
+            shape_before=shape_before, shape_after=None)
+        entry.error     = True
+        entry.error_msg = err_msg
+        viewport._post_push_cascade(body_id)
+        viewport.history_changed.emit()
+        return {body_id}
+
     solids = list(shape_after.solids())
     solids.sort(key=lambda s: s.volume, reverse=True)
     did_split = len(solids) > original_solid_count
@@ -1357,8 +1434,15 @@ class ThickenOp(Op):
         try:
             shape_after = compute()
         except Exception as ex:
-            print(f"[Thicken] FAILED: {ex}"); return None
-        finalize(shape_after)
+            print(f"[Op] FAILED: {ex}")
+            shape_after = None
+            viewport._pending_op_error = str(ex)
+        else:
+            viewport._pending_op_error = None
+        try:
+            finalize(shape_after)
+        finally:
+            viewport._pending_op_error = None
         return shape_after
 
     def _split_commit(self, viewport: Any, extra_params: dict | None = None):

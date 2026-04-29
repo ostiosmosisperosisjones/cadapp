@@ -97,7 +97,7 @@ class ExtrudeMixin:
             if body is not None:
                 panel.add_face_entry(body_id, face_idx, f"{body.name}  ·  face {face_idx}")
             else:
-                panel.set_face_label("⚠  face lost — pick again", valid=False)
+                panel.add_face_entry(None, None, "⚠  face lost — pick again", valid=False)
         elif sketch_idx is not None:
             panel.add_face_entry(None, None, f"Sketch {sketch_idx}")
 

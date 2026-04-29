@@ -74,28 +74,30 @@ class AsyncOpMixin:
     @pyqtSlot(object, object, object, object)
     def _async_done(self, finalize, shape_after, mesh, err):
         if err is not None:
-            self._async_set_busy(False)
             print(f"[Op] FAILED: {err}")
-            return
-        # Temporarily override _rebuild_body_mesh so that when finalize calls
-        # it, we skip re-tessellating and just do the GL upload with the mesh
-        # we already built in the worker thread.
+        # Always call finalize — on failure shape_after is None and _push_result
+        # will push an error (red) history entry instead of silently dropping it.
+        # Store the error string so _push_result can attach it to the entry.
+        self._pending_op_error = str(err) if err is not None else None
         _orig = self._rebuild_body_mesh
         _used = {}
 
         def _fast_rebuild(body_id: str):
             if body_id in _used:
-                # Already handled — fall back to normal rebuild for any extras.
                 _orig(body_id)
                 return
             _used[body_id] = True
-            _upload_mesh(self, body_id, mesh)
+            if mesh is not None:
+                _upload_mesh(self, body_id, mesh)
+            else:
+                _orig(body_id)
 
         self._rebuild_body_mesh = _fast_rebuild
         try:
             finalize(shape_after)
         finally:
             self._rebuild_body_mesh = _orig
+            self._pending_op_error  = None
             self._async_set_busy(False)
 
     def _async_set_busy(self, busy: bool, label: str = ""):
