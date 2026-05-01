@@ -530,7 +530,7 @@ class History:
 
         Returns (all_ok, first_error, mutated_body_ids).
         """
-        from cad.op_types import SketchExtrudeOp
+        from cad.op_types import SketchExtrudeOp, SketchRevolveOp
         all_ok   = True
         first_err = ""
         mutated: set[str] = set()
@@ -538,7 +538,7 @@ class History:
 
         for i, entry in enumerate(self._entries):
             op = entry.op
-            if not isinstance(op, SketchExtrudeOp):
+            if not isinstance(op, (SketchExtrudeOp, SketchRevolveOp)):
                 continue
             if op.from_sketch_id != sketch_entry_id:
                 continue

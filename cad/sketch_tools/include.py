@@ -139,25 +139,53 @@ class IncludeTool:
             if se.entity_idx >= len(sketch_entry.entities):
                 continue
 
-            from cad.sketch import LineEntity
+            from cad.sketch import LineEntity, ArcEntity
+
+            def _uv_to_world(uv, se):
+                return (se.plane_origin
+                        + float(uv[0]) * se.plane_x_axis
+                        + float(uv[1]) * se.plane_y_axis)
+
             ent = sketch_entry.entities[se.entity_idx]
-            if not isinstance(ent, LineEntity):
+            occ_edge = None
+            if isinstance(ent, LineEntity):
+                p0_world = _uv_to_world(ent.p0, sketch_entry)
+                p1_world = _uv_to_world(ent.p1, sketch_entry)
+                uv_pts = [sketch.plane.project_point(p0_world),
+                          sketch.plane.project_point(p1_world)]
+            elif isinstance(ent, ArcEntity):
+                import math
+                from OCP.gp import gp_Pnt, gp_Dir, gp_Ax2
+                from OCP.Geom import Geom_Circle
+                from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+                c3d = _uv_to_world(ent.center, sketch_entry)
+                ax2 = gp_Ax2(
+                    gp_Pnt(*c3d.tolist()),
+                    gp_Dir(float(sketch_entry.plane_normal[0]),
+                           float(sketch_entry.plane_normal[1]),
+                           float(sketch_entry.plane_normal[2])),
+                    gp_Dir(float(sketch_entry.plane_x_axis[0]),
+                           float(sketch_entry.plane_x_axis[1]),
+                           float(sketch_entry.plane_x_axis[2])),
+                )
+                geom_circ = Geom_Circle(ax2, ent.radius)
+                span = ent.end_angle - ent.start_angle
+                if abs(span - 2 * math.pi) < 1e-9 or abs(span) < 1e-9:
+                    occ_edge = BRepBuilderAPI_MakeEdge(geom_circ).Edge()
+                else:
+                    occ_edge = BRepBuilderAPI_MakeEdge(
+                        geom_circ, ent.start_angle, ent.end_angle).Edge()
+                p0_world = _uv_to_world(ent.p0, sketch_entry)
+                p1_world = _uv_to_world(ent.p1, sketch_entry)
+                uv_pts = [sketch.plane.project_point(p0_world),
+                          sketch.plane.project_point(p1_world)]
+            else:
                 continue
-
-            # World coords from source sketch's current plane cache
-            p0_world = (sketch_entry.plane_origin
-                        + float(ent.p0[0]) * sketch_entry.plane_x_axis
-                        + float(ent.p0[1]) * sketch_entry.plane_y_axis)
-            p1_world = (sketch_entry.plane_origin
-                        + float(ent.p1[0]) * sketch_entry.plane_x_axis
-                        + float(ent.p1[1]) * sketch_entry.plane_y_axis)
-
-            uv0 = sketch.plane.project_point(p0_world)
-            uv1 = sketch.plane.project_point(p1_world)
 
             source = SketchEdgeSource(se.history_idx, se.entity_idx)
             sketch.entities.append(
-                ReferenceEntity([uv0, uv1], source_type='sketch_edge',
+                ReferenceEntity(uv_pts, source_type='sketch_edge',
+                                occ_edges=[occ_edge] if occ_edge is not None else None,
                                 source=source))
             added += 1
 

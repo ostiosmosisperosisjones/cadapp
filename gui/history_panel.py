@@ -371,6 +371,7 @@ class HistoryPanel(QWidget):
     reenter_sketch_requested = pyqtSignal(int)
     reopen_extrude_requested  = pyqtSignal(int)
     reopen_thicken_requested  = pyqtSignal(int)
+    reopen_revolve_requested  = pyqtSignal(int)
     delete_requested         = pyqtSignal(int)
     reorder_requested        = pyqtSignal(int, int)
 
@@ -542,6 +543,16 @@ class HistoryPanel(QWidget):
                     "Single-click to seek here first, then double-click to edit.")
                 return
             self.reopen_thicken_requested.emit(index)
+            return
+
+        # Revolve: reopen RevolvePanel
+        if entry.operation == "revolve":
+            if index > self._history.cursor:
+                QMessageBox.information(
+                    self, "Can't edit future entry",
+                    "Single-click to seek here first, then double-click to edit.")
+                return
+            self.reopen_revolve_requested.emit(index)
             return
 
         if entry.operation not in EDIT_SCHEMA:

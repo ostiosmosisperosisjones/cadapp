@@ -36,6 +36,7 @@ class MainWindow(QMainWindow):
         self._ops_toolbar.extrude_requested.connect(self._toolbar_extrude)
         self._ops_toolbar.thicken_requested.connect(self._toolbar_thicken)
         self._ops_toolbar.sketch_requested.connect(self._toolbar_sketch)
+        self._ops_toolbar.revolve_requested.connect(self._toolbar_revolve)
         self.addToolBar(self._ops_toolbar)
 
         self._sketch_toolbar = SketchToolbar(self)
@@ -129,6 +130,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Select a face first.", 3000)
             return
         self._viewport._try_thicken()
+
+    def _toolbar_revolve(self):
+        if not self._viewport:
+            return
+        vp = self._viewport
+        if vp.selection.face_count == 0 and vp._selected_sketch_entry is None:
+            self.statusBar().showMessage("Select a sketch first.", 3000)
+            return
+        vp._try_revolve()
 
     def _build_statusbar(self):
         sb = self.statusBar()
@@ -497,6 +507,7 @@ class MainWindow(QMainWindow):
         sidebar.history_panel.reenter_sketch_requested.connect(vp._reenter_sketch)
         sidebar.history_panel.reopen_extrude_requested.connect(vp.reopen_extrude)
         sidebar.history_panel.reopen_thicken_requested.connect(vp.reopen_thicken)
+        sidebar.history_panel.reopen_revolve_requested.connect(vp.reopen_revolve)
         sidebar.history_panel.delete_requested.connect(vp.do_delete)
         sidebar.history_panel.reorder_requested.connect(vp.do_reorder)
         sidebar.plane_visibility_changed.connect(vp.set_world_plane_visible)

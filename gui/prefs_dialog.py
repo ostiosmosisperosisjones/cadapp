@@ -49,6 +49,7 @@ _LABELS = {
     'edge_selected_color':     ('Selection', 'Selected edge color'),
     'vertex_hovered_color':    ('Selection', 'Hovered vertex color'),
     'vertex_selected_color':   ('Selection', 'Selected vertex color'),
+    'op_preview_color':        ('Operations', '3D operation preview color'),
     'sketch_line_color':       ('Sketch',    'Sketch line color'),
     'sketch_reference_color':  ('Sketch',    'Reference geometry color'),
     'sketch_preview_color':    ('Sketch',    'Preview line color'),

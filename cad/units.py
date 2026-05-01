@@ -17,6 +17,7 @@ UNITS: dict[str, float] = {
     "m":   1000.0,
     "in":  25.4,
     "ft":  304.8,
+    "deg": 1.0,   # dimensionless pass-through for angle inputs
 }
 
 # Display labels for the prefs combo
@@ -54,4 +55,7 @@ def format_op_label(operation: str, params: dict) -> str:
     if operation == "cut":
         dist = abs(params.get("distance", 0))
         return f"Cut  -{format_value(dist, unit, decimals)}"
+    if operation == "revolve":
+        angle = params.get("angle_deg", 360)
+        return f"Revolve  {angle:.1f}°"
     return operation.capitalize()

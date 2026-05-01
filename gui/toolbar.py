@@ -137,14 +137,14 @@ _SVG_SKETCH = """
 # Revolve: profile arc rotating around an axis
 _SVG_REVOLVE = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
-  <line x1="18" y1="4" x2="18" y2="32" stroke="#888" stroke-width="1.2"
-        stroke-dasharray="2,2" opacity="0.5"/>
-  <path d="M18,8 Q30,18 18,28" fill="none" stroke="#888" stroke-width="1.4"
-        stroke-dasharray="3,2" opacity="0.55"/>
-  <path d="M18,8 Q6,18 18,28" fill="#888" fill-opacity="0.08" stroke="#888"
+  <line x1="18" y1="4" x2="18" y2="32" stroke="#ce93d8" stroke-width="1.4"
+        stroke-dasharray="3,2" opacity="0.7"/>
+  <path d="M18,8 Q30,18 18,28" fill="none" stroke="#ce93d8" stroke-width="1.6"
+        opacity="0.8"/>
+  <path d="M18,8 Q6,18 18,28" fill="#ce93d8" fill-opacity="0.12" stroke="#ce93d8"
         stroke-width="1.4" stroke-dasharray="3,2" opacity="0.55"/>
-  <polyline points="13,12 18,8 23,12" fill="none" stroke="#888" stroke-width="1.4"
-            stroke-linejoin="round" stroke-linecap="round" opacity="0.5"/>
+  <polyline points="13,12 18,8 23,12" fill="none" stroke="#ce93d8" stroke-width="1.6"
+            stroke-linejoin="round" stroke-linecap="round" opacity="0.85"/>
 </svg>
 """
 
@@ -225,6 +225,7 @@ class OpsToolbar(QToolBar):
     extrude_requested = pyqtSignal()
     thicken_requested = pyqtSignal()
     sketch_requested  = pyqtSignal()
+    revolve_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__("Operations", parent)
@@ -250,8 +251,10 @@ class OpsToolbar(QToolBar):
 
         self._add_separator()
 
-        # --- stubs ---
-        self._btn_revolve  = self._add_stub("Revolve",  _SVG_REVOLVE,  "Revolve a profile around an axis  [not yet implemented]")
+        # --- revolve (wired) ---
+        self._btn_revolve = self._add_op_button(
+            "Revolve", _SVG_REVOLVE, self.revolve_requested,
+            "Revolve a sketch profile around an axis")
         self._btn_loft     = self._add_stub("Loft",     _SVG_LOFT,     "Loft between two or more profiles  [not yet implemented]")
         self._btn_draft    = self._add_stub("Draft",    _SVG_DRAFT,    "Apply a draft angle to faces  [not yet implemented]")
 
@@ -295,7 +298,8 @@ class OpsToolbar(QToolBar):
         self._btn_sketch.setEnabled(enabled)
         self._btn_extrude.setEnabled(enabled)
         self._btn_thicken.setEnabled(enabled)
-        # stubs stay disabled always
+        self._btn_revolve.setEnabled(enabled)
+        # other stubs stay disabled always
 
 
 # ---------------------------------------------------------------------------

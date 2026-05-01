@@ -44,7 +44,8 @@ def _choose_spacing(camera_distance: float) -> float:
 class SketchOverlay:
     """Stateless helper — call draw() every paintGL when in sketch mode."""
 
-    def draw(self, sketch: SketchMode, camera_distance: float) -> list[dict]:
+    def draw(self, sketch: SketchMode, camera_distance: float,
+             hovered_edge=None, selection=None) -> list[dict]:
         """Returns list of label descriptors for QPainter text pass."""
         glPushAttrib(GL_ALL_ATTRIB_BITS)
         glDisable(GL_LIGHTING)
@@ -54,10 +55,17 @@ class SketchOverlay:
         spacing = _choose_spacing(camera_distance)
         extent  = camera_distance * 2.0
 
+        sel_indices = set()
+        if selection is not None:
+            for se in selection.sketch_edges:
+                if se.history_idx == -1:
+                    sel_indices.add(se.entity_idx)
+
         self._draw_grid(sketch.plane, spacing, extent)
         self._draw_axes(sketch.plane, extent)
         self._draw_references(sketch)
-        self._draw_entities(sketch)
+        self._draw_entities(sketch, hovered_edge=hovered_edge,
+                            selected_indices=sel_indices)
         self._draw_preview(sketch)
         self._draw_cursor(sketch, camera_distance)
         self._draw_snap_indicator(sketch, camera_distance)
@@ -70,7 +78,9 @@ class SketchOverlay:
         glPopAttrib()
         return labels
 
-    def draw_committed(self, entry, camera_distance: float) -> list[dict]:
+    def draw_committed(self, entry, camera_distance: float,
+                       hovered_edge=None, history_idx=None,
+                       selection=None) -> list[dict]:
         """
         Draw a committed SketchEntry as a persistent overlay.
         No grid, no axes, no cursor — just the entities, slightly dimmed.
@@ -86,8 +96,16 @@ class SketchOverlay:
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
+        sel_indices = set()
+        if selection is not None and history_idx is not None:
+            for se in selection.sketch_edges:
+                if se.history_idx == history_idx:
+                    sel_indices.add(se.entity_idx)
+
         self._draw_committed_references(entry)
-        self._draw_committed_lines(entry)
+        self._draw_committed_lines(entry, hovered_edge=hovered_edge,
+                                   history_idx=history_idx,
+                                   selected_indices=sel_indices)
 
         labels = self._draw_dimension_constraints(
             entry.entities,
@@ -175,14 +193,45 @@ class SketchOverlay:
                 glVertex3f(*self._pt(sketch.plane, p[0], p[1] + cr))
                 glEnd()
             else:
+                # If we have an OCC edge (e.g. arc from another sketch), tessellate
+                # it in world space and project — ref.points only has endpoints.
+                occ_pts = None
+                if ref.occ_edges:
+                    try:
+                        from OCP.BRepAdaptor import BRepAdaptor_Curve
+                        from OCP.GCPnts import GCPnts_QuasiUniformAbscissa
+                        pts_3d = []
+                        for occ_edge in ref.occ_edges:
+                            adp = BRepAdaptor_Curve(occ_edge)
+                            sampler = GCPnts_QuasiUniformAbscissa()
+                            sampler.Initialize(adp, 65)
+                            for k in range(1, sampler.NbPoints() + 1):
+                                p3 = adp.Value(sampler.Parameter(k))
+                                pts_3d.append(sketch.plane.project_point(
+                                    np.array([p3.X(), p3.Y(), p3.Z()])))
+                        occ_pts = pts_3d
+                    except Exception:
+                        pass
+                draw_pts = occ_pts if occ_pts else ref.points
                 glBegin(GL_LINE_STRIP)
-                for p in ref.points:
+                for p in draw_pts:
                     glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
                 glEnd()
         glLineWidth(1.0)
         glDisable(GL_BLEND)
 
-    def _draw_entities(self, sketch: SketchMode):
+    def _draw_entities(self, sketch: SketchMode, hovered_edge=None,
+                       selected_indices=None):
+        from viewer.hover import parse_sketch_key
+        hov_entity_idx = None
+        if hovered_edge is not None:
+            hov_body, _ = hovered_edge
+            if hov_body is not None:
+                sk = parse_sketch_key(hov_body)
+                if sk is not None and sk[0] == -1:
+                    hov_entity_idx = sk[1]
+        sel = selected_indices or set()
+
         # Draw construction points
         points = [e for e in sketch.entities if isinstance(e, PointEntity)]
         if points:
@@ -203,22 +252,25 @@ class SketchOverlay:
                 glEnd()
                 glPointSize(1.0)
 
-        glColor3f(*prefs.sketch_line_color)
         glLineWidth(prefs.sketch_line_width)
-        lines = [e for e in sketch.entities if isinstance(e, LineEntity)]
-        if lines:
-            glBegin(GL_LINES)
-            for ent in lines:
+        for j, ent in enumerate(sketch.entities):
+            if j in sel:
+                glColor3f(*prefs.edge_selected_color)
+            elif j == hov_entity_idx:
+                glColor3f(*prefs.edge_hovered_color)
+            else:
+                glColor3f(*prefs.sketch_line_color)
+            if isinstance(ent, LineEntity):
+                glBegin(GL_LINES)
                 glVertex3f(*self._pt(sketch.plane, ent.p0[0], ent.p0[1]))
                 glVertex3f(*self._pt(sketch.plane, ent.p1[0], ent.p1[1]))
-            glEnd()
-        arcs = [e for e in sketch.entities if isinstance(e, ArcEntity)]
-        for arc in arcs:
-            pts = arc.tessellate(64)
-            glBegin(GL_LINE_STRIP)
-            for p in pts:
-                glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
-            glEnd()
+                glEnd()
+            elif isinstance(ent, ArcEntity):
+                pts = ent.tessellate(64)
+                glBegin(GL_LINE_STRIP)
+                for p in pts:
+                    glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
+                glEnd()
         glLineWidth(1.0)
 
     def _draw_preview(self, sketch: SketchMode):
@@ -801,25 +853,39 @@ class SketchOverlay:
     # Committed sketch rendering (SketchEntry)
     # ------------------------------------------------------------------
 
-    def _draw_committed_lines(self, entry):
+    def _draw_committed_lines(self, entry, hovered_edge=None, history_idx=None,
+                              selected_indices=None):
         from cad.sketch import ArcEntity
+        from viewer.hover import parse_sketch_key
+        hov_entity_idx = None
+        if hovered_edge is not None and history_idx is not None:
+            hov_body, _ = hovered_edge
+            if hov_body is not None:
+                sk = parse_sketch_key(hov_body)
+                if sk is not None and sk[0] == history_idx:
+                    hov_entity_idx = sk[1]
+
+        sel = selected_indices or set()
         r, g, b = prefs.sketch_line_color
-        glColor4f(r, g, b, 0.55)
         glLineWidth(prefs.sketch_line_width)
-        lines = [e for e in entry.entities if isinstance(e, LineEntity)]
-        if lines:
-            glBegin(GL_LINES)
-            for ent in lines:
+        for j, ent in enumerate(entry.entities):
+            if j in sel:
+                glColor4f(*prefs.edge_selected_color, 1.0)
+            elif j == hov_entity_idx:
+                glColor4f(*prefs.edge_hovered_color, 1.0)
+            else:
+                glColor4f(r, g, b, 0.55)
+            if isinstance(ent, LineEntity):
+                glBegin(GL_LINES)
                 glVertex3f(*self._pt_from_entry(entry, ent.p0[0], ent.p0[1]))
                 glVertex3f(*self._pt_from_entry(entry, ent.p1[0], ent.p1[1]))
-            glEnd()
-        arcs = [e for e in entry.entities if isinstance(e, ArcEntity)]
-        for arc in arcs:
-            pts = arc.tessellate(64)
-            glBegin(GL_LINE_STRIP)
-            for p in pts:
-                glVertex3f(*self._pt_from_entry(entry, p[0], p[1]))
-            glEnd()
+                glEnd()
+            elif isinstance(ent, ArcEntity):
+                pts = ent.tessellate(64)
+                glBegin(GL_LINE_STRIP)
+                for p in pts:
+                    glVertex3f(*self._pt_from_entry(entry, p[0], p[1]))
+                glEnd()
         glLineWidth(1.0)
 
     def _draw_committed_references(self, entry):

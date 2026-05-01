@@ -353,8 +353,10 @@ class SketchPickMixin:
             fill_color   = (0.75, 0.18, 0.18, 0.28)
             edge_color   = (1.00, 0.35, 0.35, 0.75)
         else:
-            fill_color   = (0.22, 0.55, 0.85, 0.22)
-            edge_color   = (0.48, 0.75, 1.00, 0.80)
+            from cad.prefs import prefs as _prefs
+            r, g, b = _prefs.op_preview_color
+            fill_color   = (r, g, b, 0.22)
+            edge_color   = (min(r + 0.23, 1.0), min(g + 0.30, 1.0), min(b + 0.15, 1.0), 0.80)
 
         for solid in solids:
             try:

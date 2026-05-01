@@ -234,18 +234,47 @@ class SketchEdgeSource(EdgeSource):
             raise RuntimeError(
                 f"SketchEdgeSource: entity_idx {self.entity_idx} out of range")
         ent = se.entities[self.entity_idx]
-        if not isinstance(ent, LineEntity):
-            raise RuntimeError(
-                f"SketchEdgeSource: entity {self.entity_idx} is not a LineEntity")
 
-        # UV → world using the source entry's (possibly updated) plane cache
-        p0 = (se.plane_origin
-              + float(ent.p0[0]) * se.plane_x_axis
-              + float(ent.p0[1]) * se.plane_y_axis)
-        p1 = (se.plane_origin
-              + float(ent.p1[0]) * se.plane_x_axis
-              + float(ent.p1[1]) * se.plane_y_axis)
-        return [p0.tolist(), p1.tolist()], None
+        def _uv_to_world(uv):
+            return (se.plane_origin
+                    + float(uv[0]) * se.plane_x_axis
+                    + float(uv[1]) * se.plane_y_axis)
+
+        from cad.sketch import ArcEntity
+        if isinstance(ent, LineEntity):
+            p0 = _uv_to_world(ent.p0)
+            p1 = _uv_to_world(ent.p1)
+            return [p0.tolist(), p1.tolist()], None
+        elif isinstance(ent, ArcEntity):
+            import math
+            from OCP.gp import gp_Pnt, gp_Dir, gp_Ax2
+            from OCP.Geom import Geom_Circle
+            from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+            cx, cy = float(ent.center[0]), float(ent.center[1])
+            c3d = _uv_to_world(ent.center)
+            ax2 = gp_Ax2(
+                gp_Pnt(*c3d.tolist()),
+                gp_Dir(float(se.plane_normal[0]),
+                       float(se.plane_normal[1]),
+                       float(se.plane_normal[2])),
+                gp_Dir(float(se.plane_x_axis[0]),
+                       float(se.plane_x_axis[1]),
+                       float(se.plane_x_axis[2])),
+            )
+            geom_circ = Geom_Circle(ax2, ent.radius)
+            span = ent.end_angle - ent.start_angle
+            if abs(span - 2 * math.pi) < 1e-9 or abs(span) < 1e-9:
+                occ_edge = BRepBuilderAPI_MakeEdge(geom_circ).Edge()
+            else:
+                occ_edge = BRepBuilderAPI_MakeEdge(
+                    geom_circ, ent.start_angle, ent.end_angle).Edge()
+            p0 = _uv_to_world(ent.p0)
+            p1 = _uv_to_world(ent.p1)
+            return [p0.tolist(), p1.tolist()], [occ_edge]
+        else:
+            raise RuntimeError(
+                f"SketchEdgeSource: entity {self.entity_idx} has unsupported type "
+                f"{type(ent).__name__}")
 
     def to_dict(self) -> dict:
         return {

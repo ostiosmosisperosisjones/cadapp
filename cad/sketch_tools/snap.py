@@ -205,6 +205,68 @@ class SnapEngine:
         from OCP.BRepAdaptor import BRepAdaptor_Curve
         return BRepAdaptor_Curve(occ_edge)
 
+    def _ref_to_proxy_entities(self, ref, plane) -> list:
+        """
+        Convert a ReferenceEntity's occ_edges into UV-space ArcEntity /
+        LineEntity proxies so intersection and tangent snap can reuse the
+        same math as for drawn entities.
+        """
+        from cad.sketch import ArcEntity, LineEntity
+        from OCP.GeomAbs import GeomAbs_Circle, GeomAbs_Line
+        import math
+        proxies = []
+        # Fallback for refs with no OCC edge (e.g. included sketch lines)
+        if not ref.occ_edges:
+            pts = ref.points
+            if len(pts) >= 2:
+                proxies.append(LineEntity(pts[0], pts[-1]))
+            return proxies
+        try:
+            for occ_edge in ref.occ_edges:
+                a = self._occ_adaptor(occ_edge)
+                gt = a.GetType()
+                if gt == GeomAbs_Circle:
+                    circ = a.Circle()
+                    loc  = circ.Location()
+                    c_world = np.array([loc.X(), loc.Y(), loc.Z()], dtype=np.float64)
+                    c_uv    = self._world_to_uv(c_world, plane)
+                    # radius in UV space — use distance from center to start point
+                    p0_3d    = a.Value(a.FirstParameter())
+                    p0_world = np.array([p0_3d.X(), p0_3d.Y(), p0_3d.Z()], dtype=np.float64)
+                    r_uv = float(np.linalg.norm(p0_world - c_world))
+                    u0, u1 = a.FirstParameter(), a.LastParameter()
+                    # Map OCC circle parameter (measured from x_axis in 3D) to
+                    # UV-plane angle using start/end points
+                    def _angle(t):
+                        p3 = a.Value(t)
+                        w  = np.array([p3.X(), p3.Y(), p3.Z()], dtype=np.float64)
+                        uv = self._world_to_uv(w, plane)
+                        d  = uv - c_uv
+                        return math.atan2(float(d[1]), float(d[0]))
+                    sa = _angle(u0)
+                    ea = _angle(u1)
+                    if abs(u1 - u0 - 2 * math.pi) < 1e-9:
+                        ea = sa + 2 * math.pi
+                    elif ea <= sa:
+                        ea += 2 * math.pi
+                    proxies.append(ArcEntity(
+                        center=(float(c_uv[0]), float(c_uv[1])),
+                        radius=r_uv,
+                        start_angle=sa,
+                        end_angle=ea,
+                    ))
+                elif gt == GeomAbs_Line:
+                    p0_3d = a.Value(a.FirstParameter())
+                    p1_3d = a.Value(a.LastParameter())
+                    uv0 = self._world_to_uv(
+                        np.array([p0_3d.X(), p0_3d.Y(), p0_3d.Z()], dtype=np.float64), plane)
+                    uv1 = self._world_to_uv(
+                        np.array([p1_3d.X(), p1_3d.Y(), p1_3d.Z()], dtype=np.float64), plane)
+                    proxies.append(LineEntity(uv0, uv1))
+        except Exception:
+            pass
+        return proxies
+
     def _curve_endpoints_uv(self, ref, plane) -> list[np.ndarray]:
         """True start/end UV points from OCC curve parameters."""
         results = []
@@ -433,13 +495,16 @@ class SnapEngine:
 
     def _snap_intersection(self, cursor, entities, radius, plane):
         """Snap to the nearest intersection between any two entities."""
-        from cad.sketch import LineEntity, ArcEntity
+        from cad.sketch import LineEntity, ArcEntity, ReferenceEntity
         from cad.sketch_tools.trim import (
             _line_line_intersect, _line_arc_intersect, _arc_arc_intersect)
         best_d = radius
         best_p = None
 
         drawn = [e for e in entities if isinstance(e, (LineEntity, ArcEntity))]
+        for e in entities:
+            if isinstance(e, ReferenceEntity):
+                drawn.extend(self._ref_to_proxy_entities(e, plane))
         for i, a in enumerate(drawn):
             for b in drawn[i+1:]:
                 pts = []
@@ -487,9 +552,17 @@ class SnapEngine:
             return self._snap_nearest(cursor, entities, radius, plane)
         ref_pt = self.anchor_pt
 
+        from cad.sketch import ReferenceEntity
+        arc_entities = []
         for ei, ent in enumerate(entities):
-            if not isinstance(ent, ArcEntity):
-                continue
+            if isinstance(ent, ArcEntity):
+                arc_entities.append((ei, ent))
+            elif isinstance(ent, ReferenceEntity) and ent.occ_edges:
+                for proxy in self._ref_to_proxy_entities(ent, plane):
+                    if isinstance(proxy, ArcEntity):
+                        arc_entities.append((ei, proxy))
+
+        for ei, ent in arc_entities:
             cx, cy = float(ent.center[0]), float(ent.center[1])
             r      = ent.radius
 

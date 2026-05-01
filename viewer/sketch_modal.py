@@ -169,12 +169,9 @@ class SketchModalMixin:
         arcs  = [e for e in sketch.entities if isinstance(e, ArcEntity)]
         refs  = [e for e in sketch.entities if isinstance(e, ReferenceEntity)]
         editing_idx = self._editing_sketch_history_idx
-        if not lines and not arcs and not refs:
-            if editing_idx is not None:
-                # Empty sketch on re-edit — delete the entry and cascade
-                self._complete_sketch_delete(editing_idx)
-            else:
-                print("[Sketch] Nothing to commit — draw lines or include geometry first.")
+        if not lines and not arcs and not refs and editing_idx is not None:
+            # Empty sketch on re-edit — delete the entry and cascade
+            self._complete_sketch_delete(editing_idx)
             return
         entity_count = len(lines) + len(arcs) + len(refs)
         new_se = SketchEntry.from_sketch_mode(sketch)

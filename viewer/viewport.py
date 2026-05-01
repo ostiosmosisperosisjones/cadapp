@@ -29,6 +29,7 @@ from viewer.sketch_modal import SketchModalMixin
 from viewer.vp_history import HistoryMixin
 from viewer.vp_extrude import ExtrudeMixin
 from viewer.vp_thicken import ThickenMixin
+from viewer.vp_revolve import RevolveMixin
 from viewer.vp_async import AsyncOpMixin
 from viewer.vp_offset import VpOffsetMixin
 from viewer.vp_fillet import VpFilletMixin
@@ -37,7 +38,7 @@ from cad.history import History
 from cad.selection import SelectionSet
 
 
-class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, ExtrudeMixin, ThickenMixin, VpOffsetMixin, VpFilletMixin, QOpenGLWidget):
+class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, ExtrudeMixin, ThickenMixin, RevolveMixin, VpOffsetMixin, VpFilletMixin, QOpenGLWidget):
     history_changed     = pyqtSignal()
     selection_changed   = pyqtSignal()
     sketch_mode_changed = pyqtSignal(bool)
@@ -97,6 +98,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._extrude_face_idx     = None
         self._extrude_preview_mesh = None   # list of build123d solids | None
         self._extrude_preview_dist = 0.0
+        self._revolve_preview_mesh = None   # list of build123d solids | None
 
         self._thicken_panel         = None
         self._thicken_body_id       = None
@@ -315,6 +317,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._draw_sketch_faces()
         self._draw_extrude_preview()
         self._draw_thicken_preview()
+        self._draw_revolve_preview()
 
         self._dim_labels = draw_overlays(visible, self.selection,
                       self._hovered_vertex, self._hovered_edge,
@@ -879,6 +882,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 sk = parse_sketch_key(hov_ebody)
                 if sk is not None:
                     history_idx, entity_idx = sk
+                    # Route to revolve axis-pick if active
+                    if history_idx != -1 and self.route_sketch_edge_pick_for_revolve(
+                            history_idx, entity_idx):
+                        return
                     self.selection.select_sketch_edge(
                         history_idx, entity_idx, additive=additive)
                     if history_idx == -1:
@@ -887,6 +894,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         print(f"Picked sketch edge | entry {history_idx} "
                               f"entity {entity_idx}")
                 else:
+                    # Route to revolve axis-pick (body edge) if active
+                    if self.route_edge_pick_for_revolve(hov_eidx, hov_ebody):
+                        return
                     # Route to extrude panel pick-edge mode if active
                     if self.route_edge_pick_for_extrude(hov_eidx, hov_ebody):
                         return
@@ -920,6 +930,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 if idx is not None and self.route_face_pick_for_extrude(body_id, idx):
                     return
                 if idx is not None and self.route_body_pick_for_extrude(body_id):
+                    return
+                if idx is not None and self.route_face_pick_for_revolve(body_id, idx):
+                    return
+                if idx is not None and self.route_body_pick_for_revolve(body_id):
                     return
                 if idx is not None:
                     self._selected_sketch_entry = None
