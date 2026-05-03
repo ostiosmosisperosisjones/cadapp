@@ -118,9 +118,6 @@ class MainWindow(QMainWindow):
         if not self._viewport:
             return
         vp = self._viewport
-        if vp.selection.face_count == 0 and vp._selected_sketch_entry is None:
-            self.statusBar().showMessage("Select a face or sketch first.", 3000)
-            return
         vp._try_extrude()
 
     def _toolbar_thicken(self):

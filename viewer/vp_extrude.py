@@ -76,8 +76,6 @@ class ExtrudeMixin:
         # can update it live while the panel is open.
         # _extrude_face_pairs: list of (body_id, face_idx) — supports multi-body.
         self._extrude_sketch_idx  = sketch_idx
-        self._extrude_body_id     = body_id      # first body (compat / single-body)
-        self._extrude_face_idx    = face_idx     # first face index (compat)
         self._extrude_face_pairs  = ([(body_id, face_idx)]
                                      if body_id is not None and face_idx is not None
                                      else [])
@@ -210,9 +208,11 @@ class ExtrudeMixin:
                     self._extrude_preview_mesh = None
                     self.update(); return
                 fidx_sel = self._selected_sketch_face
-                preview_faces = ([all_sketch[fidx_sel][0]]
-                                 if fidx_sel is not None and 0 <= fidx_sel < len(all_sketch)
-                                 else [f[0] for f in all_sketch])
+                if fidx_sel is not None:
+                    preview_faces = [all_sketch[i][0] for i in fidx_sel
+                                     if 0 <= i < len(all_sketch)]
+                else:
+                    preview_faces = [f[0] for f in all_sketch]
             elif face_pairs:
                 preview_faces = []
                 for bid, fi in face_pairs:
@@ -336,12 +336,21 @@ class ExtrudeMixin:
         self._extrude_face_active = active
 
     def _on_extrude_face_removed(self, index: int):
+        sketch_idx = getattr(self, '_extrude_sketch_idx', None)
+        if sketch_idx is not None:
+            # Sketch-face mode: remove from _selected_sketch_face list.
+            faces = list(self._selected_sketch_face or [])
+            if 0 <= index < len(faces):
+                faces.pop(index)
+            self._selected_sketch_face = faces if faces else None
+            panel = getattr(self, '_extrude_panel', None)
+            if panel is not None:
+                panel._emit_preview()
+            return
         pairs = getattr(self, '_extrude_face_pairs', [])
         if 0 <= index < len(pairs):
             pairs = [p for i, p in enumerate(pairs) if i != index]
             self._extrude_face_pairs = pairs
-            self._extrude_body_id  = pairs[0][0] if pairs else None
-            self._extrude_face_idx = pairs[0][1] if pairs else None
             panel = getattr(self, '_extrude_panel', None)
             if panel is not None:
                 self._update_panel_mode_lock(panel, pairs)
@@ -357,8 +366,6 @@ class ExtrudeMixin:
         if (body_id, face_idx) in pairs:
             pairs = [p for p in pairs if p != (body_id, face_idx)]
             self._extrude_face_pairs = pairs
-            self._extrude_body_id    = pairs[0][0] if pairs else None
-            self._extrude_face_idx   = pairs[0][1] if pairs else None
             if panel is not None:
                 panel.clear_face_entries()
                 for bid, fi in pairs:
@@ -372,9 +379,6 @@ class ExtrudeMixin:
         self._extrude_sketch_idx = None
         pairs = pairs + [(body_id, face_idx)]
         self._extrude_face_pairs = pairs
-        self._extrude_body_id    = pairs[0][0]
-        self._extrude_face_idx   = pairs[0][1]
-
         if panel is not None:
             body = self.workspace.bodies.get(body_id)
             name = body.name if body else body_id
@@ -406,6 +410,42 @@ class ExtrudeMixin:
         else:
             panel._radio_cut.setEnabled(True)
             panel._radio_merge.setEnabled(True)
+
+    def route_sketch_face_pick_for_extrude(self, sketch_idx: int, face_idx: int) -> bool:
+        """Route a sketch face click to the extrude panel when face picking is active."""
+        if not getattr(self, '_extrude_face_active', False):
+            return False
+        panel = getattr(self, '_extrude_panel', None)
+
+        current_indices = list(self._selected_sketch_face or []) \
+            if self._extrude_sketch_idx == sketch_idx else []
+
+        # Toggle: clicking an already-selected face removes it.
+        if face_idx in current_indices:
+            current_indices.remove(face_idx)
+        else:
+            current_indices.append(face_idx)
+
+        self._extrude_sketch_idx    = sketch_idx
+        self._extrude_face_pairs    = []
+        self._selected_sketch_entry = sketch_idx
+        self._selected_sketch_face  = current_indices if current_indices else None
+
+        if panel is not None:
+            panel.clear_face_entries()
+            if current_indices:
+                for i in current_indices:
+                    panel.add_face_entry(None, None, f"Sketch {sketch_idx}  ·  face {i}")
+            else:
+                panel.add_face_entry(None, None, f"Sketch {sketch_idx}")
+            origin, normal = self._face_origin_and_normal(sketch_idx, None, None)
+            if origin is not None:
+                panel.set_face_origin(origin)
+            if normal is not None:
+                panel.set_face_normal(normal)
+            self._update_panel_mode_lock(panel, [])
+            panel._emit_preview()
+        return True
 
     def route_body_pick_for_extrude(self, body_id: str) -> bool:
         if not getattr(self, '_extrude_body_active', False):
@@ -605,14 +645,13 @@ class ExtrudeMixin:
                 end_offset       = float((extra or {}).get('end_offset', 0.0)),
             )
         elif sketch_idx is not None:
-            preserved = (original_op.face_indices
-                         if hasattr(original_op, 'face_indices') else None)
+            live_faces = self._selected_sketch_face
             new_op = SketchExtrudeOp(
                 from_sketch_id = sketch_id,
                 distance       = dist,
                 merge_body_id  = (None if merge_body_id in (None, "__new_body__")
                                   else merge_body_id),
-                face_indices   = preserved,
+                face_indices   = live_faces,
                 direction      = dir_list,
                 target_vertex  = (extra or {}).get('target_vertex'),
                 start_offset   = float((extra or {}).get('start_offset', 0.0)),

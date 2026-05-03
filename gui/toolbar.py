@@ -60,8 +60,6 @@ def _svg_icon(svg: str) -> QIcon:
     renderer.render(painter)
     painter.end()
     return QIcon(pixmap)
-
-
 def _stub_icon(letter: str, color: str = "#666") -> QIcon:
     """Minimal placeholder: a faint rounded square with a letter."""
     svg = f"""

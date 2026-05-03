@@ -39,7 +39,6 @@ class RevolveMixin:
             self._revolve_panel.close()
 
         self._revolve_sketch_idx = sketch_idx
-        self._revolve_body_id    = body_id
         self._revolve_face_pairs = ([(body_id, face_idx)]
                                     if body_id is not None and face_idx is not None
                                     else [])
@@ -124,9 +123,11 @@ class RevolveMixin:
                     self._revolve_arrow_dir    = None
                     self.update(); return
                 fidx_sel = self._selected_sketch_face
-                faces = ([all_sketch[fidx_sel][0]]
-                         if fidx_sel is not None and 0 <= fidx_sel < len(all_sketch)
-                         else [f[0] for f in all_sketch])
+                if fidx_sel is not None:
+                    faces = [all_sketch[i][0] for i in fidx_sel
+                             if 0 <= i < len(all_sketch)]
+                else:
+                    faces = [f[0] for f in all_sketch]
             elif face_pairs:
                 for bid, fi in face_pairs:
                     shape = self.workspace.current_shape(bid)

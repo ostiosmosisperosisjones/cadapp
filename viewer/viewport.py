@@ -81,7 +81,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._sketch = None                              # SketchMode | None
         self._sketch_faces: dict[int, list] = {}        # history_idx → [Face]
         self._selected_sketch_entry: int | None = None  # history_idx
-        self._selected_sketch_face: int | None = None   # face_idx within entry
+        self._selected_sketch_face: list[int] | None = None   # face indices within entry
         self._editing_sketch_history_idx: int | None = None  # set during re-entry
 
         self.camera_projection_changed = None
@@ -94,8 +94,6 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._extrude_body_active  = False
         self._extrude_face_active  = False
         self._extrude_sketch_idx   = None
-        self._extrude_body_id      = None
-        self._extrude_face_idx     = None
         self._extrude_preview_mesh = None   # list of build123d solids | None
         self._extrude_preview_dist = 0.0
         self._extrude_arrow_origin = None
@@ -1228,8 +1226,11 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 if origin is not None and self._sketch_faces:
                     hidx, fidx = self._pick_sketch_face(origin, direction)
                     if hidx is not None:
+                        if self.route_sketch_face_pick_for_extrude(hidx, fidx):
+                            self.update()
+                            return
                         self._selected_sketch_entry = hidx
-                        self._selected_sketch_face  = fidx
+                        self._selected_sketch_face  = [fidx]
                         self.selection.clear()
                         self.body_selected.emit(None)
                         self.selection_changed.emit()

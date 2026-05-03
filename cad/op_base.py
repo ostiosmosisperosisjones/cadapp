@@ -1,0 +1,165 @@
+"""
+cad/op_base.py
+
+Base Op class and shared _push_result() commit helper.
+"""
+
+from __future__ import annotations
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cad.history import History
+
+
+class Op:
+    """Marker base class for all operation types."""
+
+    def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
+        raise NotImplementedError
+
+    def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
+        """
+        Run the operation for the first time (or after an edit), push history
+        entries, and trigger mesh rebuild.  Returns result shape or None.
+        """
+        raise NotImplementedError
+
+    def commit_async(self, viewport: Any, extra_params: dict | None = None) -> None:
+        """
+        Async variant of commit: run the heavy OCC compute in a background
+        thread, then push history and rebuild on the main thread.
+
+        Subclasses override _compute_shape() and _finalize() to opt in.
+        Falls back to synchronous commit() if not overridden.
+        """
+        try:
+            compute_fn, finalize_fn = self._split_commit(viewport, extra_params)
+        except NotImplementedError:
+            self.commit(viewport, extra_params)
+            return
+        except Exception as ex:
+            print(f"[Op] FAILED: {ex}")
+            self._push_failed_entry(viewport, str(ex), extra_params)
+            return
+        viewport.run_op_async(type(self).__name__.replace("Op", ""), compute_fn, finalize_fn)
+
+    def _push_failed_entry(self, viewport: Any, error_msg: str,
+                           extra_params: dict | None = None) -> None:
+        """Push a red history entry when the op fails before compute starts."""
+        try:
+            dist = getattr(self, 'distance', None)
+            if dist is not None:
+                op_str = "cut" if dist < 0 else "extrude"
+            else:
+                op_str = getattr(self, '_op_str', None) or type(self).__name__.replace("Op", "").lower()
+            body_id   = getattr(self, 'source_body_id', None) or getattr(self, 'body_id', None)
+            op_params = self.to_params()
+            if extra_params:
+                op_params.update(extra_params)
+            shape_before = viewport.workspace.current_shape(body_id) if body_id else None
+            from cad.units import format_op_label as _lbl
+            label = _lbl(op_str, op_params)
+            entry = viewport.history.push(
+                label=label, operation=op_str, params=op_params,
+                body_id=body_id, face_ref=None,
+                shape_before=shape_before, shape_after=None)
+            entry.error     = True
+            entry.error_msg = error_msg
+            viewport._post_push_cascade(body_id)
+            viewport.history_changed.emit()
+        except Exception as ex2:
+            print(f"[Op] Could not push failed entry: {ex2}")
+
+    def _split_commit(self, viewport: Any, extra_params: dict | None):
+        """
+        Return (compute_fn, finalize_fn) where:
+          compute_fn()             — pure OCC, runs in thread, returns shape_after
+          finalize_fn(shape_after) — Qt/history, runs on main thread
+        Raise NotImplementedError to fall back to synchronous commit().
+        """
+        raise NotImplementedError
+
+    def reopen(self, viewport: Any, history_idx: int) -> None:
+        """
+        Restore panel UI state for editing this entry.
+        Called by reopen_extrude() after seek/rebuild; op-specific branching
+        lives here rather than in the viewport.
+        """
+        raise NotImplementedError
+
+    def to_params(self) -> dict:
+        raise NotImplementedError
+
+    @classmethod
+    def from_params(cls, operation: str, params: dict) -> "Op | None":
+        """
+        Reconstruct the correct Op subclass from an operation string + params
+        dict.  Returns None if the operation type is not recognised.
+        """
+        from cad.op_types import _FROM_PARAMS
+        factory = _FROM_PARAMS.get(operation)
+        if factory is None:
+            return None
+        return factory(operation, params)
+
+
+def _push_result(viewport, op_str: str, op_params: dict, body_id: str,
+                 face_ref: Any, shape_before: Any, shape_after: Any,
+                 original_solid_count: int, split_key: str = "split_from"):
+    """
+    Push history entry/entries for a boolean result and trigger mesh rebuild.
+
+    If shape_after is None the op failed — push a single diverged entry so it
+    appears red in the history panel instead of silently disappearing.
+
+    If the result has more solids than the original (a split), each extra solid
+    gets its own 'import' entry and workspace body.  Otherwise a single entry
+    updates the source body.
+    """
+    from cad.units import format_op_label as _lbl
+    from build123d import Compound
+
+    label = _lbl(op_str, op_params)
+
+    if shape_after is None:
+        err = getattr(viewport, '_pending_op_error', None) or f"{op_str} failed"
+        entry = viewport.history.push(
+            label=label, operation=op_str, params=op_params,
+            body_id=body_id, face_ref=face_ref,
+            shape_before=shape_before, shape_after=None)
+        entry.error     = True
+        entry.error_msg = err
+        viewport._post_push_cascade(body_id)
+        viewport.history_changed.emit()
+        return set()
+
+    solids = list(shape_after.solids())
+    parent_entry = viewport.history.push(
+        label=label, operation=op_str, params=op_params,
+        body_id=body_id, face_ref=face_ref,
+        shape_before=shape_before, shape_after=shape_after)
+
+    if len(solids) > original_solid_count:
+        # New solids produced — add import entries for extras.
+        from cad.op_types import ImportOp
+        extra_solids = solids[original_solid_count:]
+        for i, solid in enumerate(extra_solids):
+            ws   = viewport.workspace
+            name = ws.bodies[body_id].name + f"  [{i + 2}]"
+            new_body = ws.add_body(name, Compound(solid.wrapped))
+            new_body.created_at_entry_id = parent_entry.entry_id
+            imp_params = {
+                "source_entry_id": parent_entry.entry_id,
+                split_key:         body_id,
+                "solid_index":     original_solid_count + i,
+            }
+            viewport.history.push(
+                label=f"import  {name}", operation="import",
+                params=imp_params, body_id=new_body.id, face_ref=None,
+                shape_before=None, shape_after=Compound(solid.wrapped))
+
+    viewport._post_push_cascade(body_id)
+    print(f"[{op_str.capitalize()}] body='{viewport.workspace.bodies[body_id].name}' "
+          f"({len(solids)} solid(s))")
+    viewport.history_changed.emit()
+    return {body_id}

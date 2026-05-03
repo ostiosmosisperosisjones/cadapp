@@ -41,8 +41,6 @@ class ThickenMixin:
         self._thicken_preview_token = None
         self._thicken_preview_tris  = None
         self._thicken_preview_edges = None
-        self._thicken_picking_face  = False
-
         panel = ThickenPanel(parent=self)
         panel.thicken_requested.connect(self._on_thicken_ok)
         panel.cancelled.connect(self._close_thicken_panel)

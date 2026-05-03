@@ -273,9 +273,10 @@ class SketchPickMixin:
 
         for hidx, fidx, face, _ in draw_list:
             entry_selected = (hidx == self._selected_sketch_entry)
+            sel_faces = self._selected_sketch_face
             is_selected = entry_selected and (
-                self._selected_sketch_face is None or
-                fidx == self._selected_sketch_face
+                sel_faces is None or
+                fidx in sel_faces
             )
             try:
                 BRepMesh_IncrementalMesh(face.wrapped, 0.1)
