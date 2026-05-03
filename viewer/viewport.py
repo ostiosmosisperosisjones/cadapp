@@ -122,6 +122,39 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
 
+        from PyQt6.QtWidgets import QApplication
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, e):
+        from PyQt6.QtCore import QEvent
+        from PyQt6.QtWidgets import QLineEdit, QTextEdit
+        if e.type() == QEvent.Type.KeyPress:
+            focused = self.__class__._focused_widget()
+            # Don't intercept Tab while the line HUD is visible
+            if (e.key() == Qt.Key.Key_Tab and
+                    getattr(self, '_line_hud', None) is not None and
+                    self._line_hud.isVisible()):
+                return False
+            # Only intercept if the key matches a bound action
+            from cad.prefs import prefs, KEYBIND_DEFAULTS
+            if not any(prefs.matches(action, e) for action in KEYBIND_DEFAULTS):
+                return False
+            # Don't steal bound keys from actual text fields (HUD fields, search bars)
+            if isinstance(focused, (QLineEdit, QTextEdit)):
+                hud_visible = (getattr(self, '_line_hud', None) is not None and
+                               self._line_hud.isVisible())
+                if hud_visible and focused in (self._line_hud._len_field,
+                                               self._line_hud._ang_field):
+                    return False
+            self.keyPressEvent(e)
+            return True
+        return False
+
+    @staticmethod
+    def _focused_widget():
+        from PyQt6.QtWidgets import QApplication
+        return QApplication.focusWidget()
+
     # ------------------------------------------------------------------
     # Backward-compat shims
     # ------------------------------------------------------------------
@@ -1056,6 +1089,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         return None
 
     def mousePressEvent(self, e):
+        self.setFocus()
         if e.button() == Qt.MouseButton.LeftButton:
             mx, my = int(e.position().x()), int(e.position().y())
 
