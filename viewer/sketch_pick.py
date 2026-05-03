@@ -408,6 +408,8 @@ class SketchPickMixin:
         glEnable(GL_CULL_FACE)
         glEnable(GL_LIGHTING)
 
+        self._draw_extrude_arrow()
+
     # ------------------------------------------------------------------
     # Screen-space snap radius
     # ------------------------------------------------------------------

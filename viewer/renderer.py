@@ -70,7 +70,7 @@ def draw_opaque(meshes, workspace, selection):
 
 def draw_overlays(meshes, selection, hovered_vertex, hovered_edge,
                   sketch=None, camera_distance: float = 1.0,
-                  history=None, editing_sketch_idx=None):
+                  history=None, editing_sketch_idx=None, in_sketch: bool = False):
     """
     Phase 2: hover/selection overlays + sketch overlays.
 
@@ -161,7 +161,8 @@ def draw_overlays(meshes, selection, hovered_vertex, hovered_edge,
             if se is not None and se.visible:
                 all_labels.extend(overlay.draw_committed(
                     se, camera_distance, hovered_edge=hovered_edge,
-                    history_idx=i, selection=selection))
+                    history_idx=i, selection=selection,
+                    dim_dimensions=not in_sketch))
 
     # Active sketch session (grid + axes + live entities + cursor)
     if sketch is not None:

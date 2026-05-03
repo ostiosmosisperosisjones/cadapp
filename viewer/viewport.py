@@ -98,7 +98,16 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._extrude_face_idx     = None
         self._extrude_preview_mesh = None   # list of build123d solids | None
         self._extrude_preview_dist = 0.0
-        self._revolve_preview_mesh = None   # list of build123d solids | None
+        self._extrude_arrow_origin = None
+        self._extrude_arrow_dir    = None
+        self._drag_arrow_active      = False  # True while dragging any op arrow
+        self._drag_arrow_axis_origin = None  # world point on drag axis
+        self._drag_arrow_op          = None  # 'extrude' | 'thicken' | 'revolve'
+        self._revolve_preview_mesh   = None  # list of build123d solids | None
+        self._revolve_arrow_origin   = None
+        self._revolve_arrow_dir      = None
+        self._revolve_axis_point     = None  # stored for drag projection
+        self._revolve_axis_dir       = None
 
         self._thicken_panel         = None
         self._thicken_body_id       = None
@@ -106,6 +115,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._thicken_preview_tris  = None
         self._thicken_preview_edges = None
         self._thicken_preview_dist  = 0.0
+        self._thicken_arrow_origin  = None
+        self._thicken_arrow_dir     = None
         self._editing_thicken_idx   = None
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -324,11 +335,61 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                       sketch=self._sketch,
                       camera_distance=self.camera.distance,
                       history=self.history,
-                      editing_sketch_idx=self._editing_sketch_history_idx) or []
+                      editing_sketch_idx=self._editing_sketch_history_idx,
+                      in_sketch=self._sketch is not None) or []
+
+        self._draw_sketch_vertex_overlays()
 
         R = _quat_to_matrix(self.camera.rotation)
         self._view_cube.draw(R, self.width(), self.height(),
                              self.devicePixelRatio())
+
+    def _draw_sketch_vertex_overlays(self):
+        """Draw selected and hovered sketch vertex points (not in real mesh)."""
+        from viewer.hover import parse_sketch_vtx_key
+        from cad.prefs import prefs
+        from OpenGL.GL import (glDisable, glEnable, glBegin, glEnd, glVertex3f,
+                                glColor3f, glPointSize, GL_POINTS,
+                                GL_DEPTH_TEST, GL_LIGHTING, GL_BLEND,
+                                GL_POINT_SMOOTH, GL_SRC_ALPHA,
+                                GL_ONE_MINUS_SRC_ALPHA, glBlendFunc)
+        has_sel = any(parse_sketch_vtx_key(v.body_id) is not None
+                      for v in self.selection.vertices)
+        hov_body, hov_idx = self._hovered_vertex
+        has_hov = hov_body is not None and parse_sketch_vtx_key(hov_body) is not None
+
+        if not has_sel and not has_hov:
+            return
+
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_LIGHTING)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glEnable(GL_POINT_SMOOTH)
+
+        if has_sel:
+            glPointSize(10.0)
+            glColor3f(*prefs.vertex_selected_color)
+            glBegin(GL_POINTS)
+            for v in self.selection.vertices:
+                if parse_sketch_vtx_key(v.body_id) is None:
+                    continue
+                p = self.hover.vertex_world_pos(v.body_id, v.vertex_idx)
+                if p is not None:
+                    glVertex3f(float(p[0]), float(p[1]), float(p[2]))
+            glEnd()
+
+        if has_hov:
+            p = self.hover.vertex_world_pos(hov_body, hov_idx)
+            if p is not None:
+                glPointSize(12.0)
+                glColor3f(*prefs.vertex_hovered_color)
+                glBegin(GL_POINTS)
+                glVertex3f(float(p[0]), float(p[1]), float(p[2]))
+                glEnd()
+
+        glPointSize(1.0)
+        glEnable(GL_DEPTH_TEST)
 
     def paintEvent(self, event):
         """GL content first, then QPainter for dimension text labels."""
@@ -369,13 +430,17 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             th    = fm.height() + 6
             rect  = QRect(sx - tw // 2, sy - th // 2, tw, th)
 
+            dimmed = lbl.get('dimmed', False)
+            bg_alpha  = 60  if dimmed else 200
+            txt_alpha = 80  if dimmed else 255
+
             # Background pill
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor(20, 60, 120, 200)))
+            painter.setBrush(QBrush(QColor(20, 60, 120, bg_alpha)))
             painter.drawRoundedRect(rect, 4, 4)
 
             # Text
-            painter.setPen(QPen(QColor(140, 200, 255)))
+            painter.setPen(QPen(QColor(140, 200, 255, txt_alpha)))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
         painter.end()
@@ -412,6 +477,203 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             if result and result[1] < best_t:
                 best_t, best_body, best_face = result[1], body_id, result[0]
         return best_body, best_face
+
+    # ------------------------------------------------------------------
+    # Drag-arrow interaction (shared by extrude, thicken, revolve)
+    # ------------------------------------------------------------------
+
+    def _arrow_scale(self, dist: float) -> float:
+        scale = self.camera.distance * 0.10
+        return max(scale, abs(dist) * 0.18) if dist != 0.0 else scale
+
+    @staticmethod
+    def _closest_point_on_axis(ray_o, ray_d, axis_o, axis_d):
+        """
+        Return s = signed distance along axis_d from axis_o at the closest
+        approach between the ray and the axis line. Returns None if parallel.
+        """
+        import numpy as np
+        w   = np.asarray(ray_o,  dtype=float) - np.asarray(axis_o, dtype=float)
+        rd  = np.asarray(ray_d,  dtype=float)
+        ad  = np.asarray(axis_d, dtype=float)
+        a11 = float(np.dot(rd, rd))
+        a12 = -float(np.dot(rd, ad))
+        a21 = -a12
+        a22 = -1.0
+        b1  = -float(np.dot(rd, w))
+        b2  = -float(np.dot(ad, w))
+        det = a11 * a22 - a12 * a21
+        if abs(det) < 1e-10:
+            return None
+        return (a11 * b2 - a21 * b1) / det
+
+    def _hit_extrude_arrow(self, mx: int, my: int) -> bool:
+        if getattr(self, '_extrude_panel', None) is None:
+            return False
+        arrow_origin = getattr(self, '_extrude_arrow_origin', None)
+        arrow_dir    = getattr(self, '_extrude_arrow_dir',    None)
+        if arrow_origin is None or arrow_dir is None:
+            return False
+        ray_o, ray_d = self.get_ray(mx, my)
+        if ray_o is None:
+            return False
+        from viewer.drag_arrow import DragArrow
+        dist = getattr(self, '_extrude_preview_dist', 0.0)
+        if DragArrow().hit_test(ray_o, ray_d, arrow_origin, arrow_dir,
+                                self._arrow_scale(dist)) is None:
+            return False
+        import numpy as np
+        panel     = self._extrude_panel
+        start_off = (panel._start_offset.mm_value() or 0.0) if panel else 0.0
+        face_origin = panel._face_origin if panel else None
+        if face_origin is not None:
+            self._drag_arrow_axis_origin = (np.asarray(face_origin, dtype=float)
+                                            + np.asarray(arrow_dir, dtype=float) * start_off)
+        else:
+            self._drag_arrow_axis_origin = np.asarray(arrow_origin, dtype=float)
+        self._drag_arrow_active = True
+        self._drag_arrow_op     = 'extrude'
+        return True
+
+    def _hit_thicken_arrow(self, mx: int, my: int) -> bool:
+        if getattr(self, '_thicken_panel', None) is None:
+            return False
+        arrow_origin = getattr(self, '_thicken_arrow_origin', None)
+        arrow_dir    = getattr(self, '_thicken_arrow_dir',    None)
+        if arrow_origin is None or arrow_dir is None:
+            return False
+        ray_o, ray_d = self.get_ray(mx, my)
+        if ray_o is None:
+            return False
+        from viewer.drag_arrow import DragArrow
+        dist = getattr(self, '_thicken_preview_dist', 0.0)
+        if DragArrow().hit_test(ray_o, ray_d, arrow_origin, arrow_dir,
+                                self._arrow_scale(dist)) is None:
+            return False
+        import numpy as np
+        # axis_origin = face centroid (zero-thickness base)
+        self._drag_arrow_axis_origin = (np.asarray(arrow_origin, dtype=float)
+                                        - np.asarray(arrow_dir, dtype=float) * abs(dist))
+        self._drag_arrow_active = True
+        self._drag_arrow_op     = 'thicken'
+        return True
+
+    def _hit_revolve_arrow(self, mx: int, my: int) -> bool:
+        if getattr(self, '_revolve_panel', None) is None:
+            return False
+        arrow_origin = getattr(self, '_revolve_arrow_origin', None)
+        arrow_dir    = getattr(self, '_revolve_arrow_dir',    None)
+        if arrow_origin is None or arrow_dir is None:
+            return False
+        ray_o, ray_d = self.get_ray(mx, my)
+        if ray_o is None:
+            return False
+        from viewer.drag_arrow import DragArrow
+        angle = getattr(self, '_revolve_preview_angle', 0.0)
+        scale = self._arrow_scale(angle)  # angle used as proxy for size feel
+        if DragArrow().hit_test(ray_o, ray_d, arrow_origin, arrow_dir, scale) is None:
+            return False
+        import numpy as np
+        # For revolve the drag is angular — store the arrow tip as drag origin.
+        self._drag_arrow_axis_origin = np.asarray(arrow_origin, dtype=float)
+        self._drag_arrow_active      = True
+        self._drag_arrow_op          = 'revolve'
+        return True
+
+    def _hit_any_arrow(self, mx: int, my: int) -> bool:
+        return (self._hit_extrude_arrow(mx, my) or
+                self._hit_thicken_arrow(mx, my) or
+                self._hit_revolve_arrow(mx, my))
+
+    def _update_arrow_drag(self, mx: int, my: int):
+        import numpy as np
+        op          = getattr(self, '_drag_arrow_op', None)
+        axis_origin = getattr(self, '_drag_arrow_axis_origin', None)
+        if op is None or axis_origin is None:
+            return
+        ray_o, ray_d = self.get_ray(mx, my)
+        if ray_o is None:
+            return
+
+        if op == 'extrude':
+            arrow_dir = getattr(self, '_extrude_arrow_dir', None)
+            if arrow_dir is None:
+                return
+            s = self._closest_point_on_axis(ray_o, ray_d, axis_origin, arrow_dir)
+            if s is None:
+                return
+            s = max(0.001, min(10000.0, s))
+            panel = getattr(self, '_extrude_panel', None)
+            if panel is None:
+                return
+            panel._spinbox.set_mm(s)
+            panel._emit_preview()
+
+        elif op == 'thicken':
+            arrow_dir = getattr(self, '_thicken_arrow_dir', None)
+            if arrow_dir is None:
+                return
+            s = self._closest_point_on_axis(ray_o, ray_d, axis_origin, arrow_dir)
+            if s is None:
+                return
+            s = max(0.001, min(10000.0, s))
+            panel = getattr(self, '_thicken_panel', None)
+            if panel is None:
+                return
+            panel._spinbox.set_mm(s)
+            panel._emit_preview()
+
+        elif op == 'revolve':
+            # Project mouse onto the tangent plane at the arrow tip to get angle delta.
+            # axis_origin = arrow tip = rotated face centroid.
+            # _revolve_axis_point / _revolve_axis_dir define the rotation axis.
+            # arrow_dir = tangent direction at the tip.
+            arrow_dir  = getattr(self, '_revolve_arrow_dir',   None)
+            axis_pt    = getattr(self, '_revolve_axis_point',  None)
+            axis_dir   = getattr(self, '_revolve_axis_dir',    None)
+            if arrow_dir is None or axis_pt is None or axis_dir is None:
+                return
+            # Radial vector from axis to arrow tip
+            tip = np.asarray(axis_origin, dtype=float)
+            ap  = np.asarray(axis_pt,     dtype=float)
+            ad  = np.asarray(axis_dir,    dtype=float)
+            radial = tip - ap - np.dot(tip - ap, ad) * ad
+            r = np.linalg.norm(radial)
+            if r < 1e-10:
+                return
+            radial /= r
+            # Project mouse ray onto the plane spanned by tangent and radial at tip.
+            # s along the tangent = arc length, angle = s / r (radians).
+            tangent = np.asarray(arrow_dir, dtype=float)
+            s_tan = self._closest_point_on_axis(ray_o, ray_d, tip, tangent)
+            if s_tan is None:
+                return
+            delta_angle_rad = s_tan / r
+            # Current angle (in degrees) + delta
+            panel = getattr(self, '_revolve_panel', None)
+            if panel is None:
+                return
+            cur = panel._angle_spinbox.mm_value() or 0.0
+            new_angle = max(0.1, min(360.0, cur + float(np.degrees(delta_angle_rad))))
+            # Reset drag origin to current tip so incremental deltas don't accumulate
+            import math
+            new_angle_rad = math.radians(new_angle)
+            base_pt = getattr(self, '_revolve_face_centroid', None)
+            if base_pt is not None:
+                c   = math.cos(new_angle_rad)
+                s_r = math.sin(new_angle_rad)
+                bp  = np.asarray(base_pt, dtype=float)
+                bp_proj = bp - np.dot(bp - ap, ad) * ad
+                r_vec   = bp_proj - ap
+                r_perp  = r_vec - np.dot(r_vec, ad) * ad
+                rn      = np.linalg.norm(r_perp)
+                if rn > 1e-10:
+                    r_perp /= rn
+                    tan_vec = np.cross(ad, r_perp)
+                    new_tip = ap + np.dot(bp - ap, ad) * ad + rn * (c * r_perp + s_r * tan_vec)
+                    self._drag_arrow_axis_origin = new_tip
+            panel._angle_spinbox.set_mm(new_angle)
+            panel._emit_preview()
 
     # ------------------------------------------------------------------
     # Keyboard
@@ -796,13 +1058,24 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             mx, my = int(e.position().x()), int(e.position().y())
+
+            # Drag-arrow hit test — takes priority when any op panel is open.
+            if self._hit_any_arrow(mx, my):
+                return
+
             # Shift+click a constraint label to delete it.
             shift = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             lbl = self._hit_dim_label(mx, my)
             if lbl is not None and shift:
+                # Only allow deleting constraints when inside sketch mode.
+                if self._sketch is None:
+                    return
                 self._delete_constraint_label(lbl)
                 return
             if lbl is not None:
+                # Only allow dragging constraints when inside sketch mode.
+                if self._sketch is None:
+                    return
                 constraints = lbl.get('constraints')
                 ci = lbl['constraint_idx']
                 con = constraints[ci] if constraints and ci < len(constraints) else None
@@ -865,17 +1138,25 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             hov_ebody, hov_eidx = self._hovered_edge
 
             if hov_body is not None:
-                # Route to extrude panel pick-vertex mode if active
-                if self.route_vertex_pick_for_extrude(hov_body, hov_idx):
+                from viewer.hover import parse_sketch_vtx_key
+                is_sketch_vtx = parse_sketch_vtx_key(hov_body) is not None
+                # Route to extrude panel pick-vertex mode if active (only real verts)
+                if not is_sketch_vtx and self.route_vertex_pick_for_extrude(hov_body, hov_idx):
                     return
                 self.selection.select_vertex(hov_body, hov_idx,
                                              additive=additive)
-                self.workspace.set_active_body(hov_body)
-                self.body_selected.emit(hov_body)
-                p = self._meshes[hov_body].topo_verts[hov_idx]
-                print(f"Picked vertex {hov_idx} | "
-                      f"{self.workspace.bodies[hov_body].name} | "
-                      f"pos=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})")
+                if is_sketch_vtx:
+                    p = self.hover.vertex_world_pos(hov_body, hov_idx)
+                    if p is not None:
+                        print(f"Picked sketch vertex {hov_idx} | "
+                              f"pos=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})")
+                else:
+                    self.workspace.set_active_body(hov_body)
+                    self.body_selected.emit(hov_body)
+                    p = self._meshes[hov_body].topo_verts[hov_idx]
+                    print(f"Picked vertex {hov_idx} | "
+                          f"{self.workspace.bodies[hov_body].name} | "
+                          f"pos=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})")
 
             elif hov_ebody is not None:
                 from viewer.hover import parse_sketch_key
@@ -982,6 +1263,11 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
     def mouseMoveEvent(self, e):
         buttons = e.buttons()
 
+        # Extrude arrow drag.
+        if (buttons & Qt.MouseButton.LeftButton) and self._drag_arrow_active:
+            self._update_arrow_drag(int(e.position().x()), int(e.position().y()))
+            return
+
         # Dimension label drag.
         if (buttons & Qt.MouseButton.LeftButton) and self._drag_constraint is not None:
             self._update_dim_drag(int(e.position().x()), int(e.position().y()))
@@ -1028,6 +1314,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             self.update()
 
     def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self._drag_arrow_active:
+            self._drag_arrow_active      = False
+            self._drag_arrow_axis_origin = None
+            return
         if e.button() == Qt.MouseButton.LeftButton and self._dragging_label is not None:
             mx, my = int(e.position().x()), int(e.position().y())
             dx = mx - self._drag_start_screen[0]

@@ -116,6 +116,8 @@ class ExtrudeMixin:
         self._extrude_body_active  = False
         self._extrude_face_active  = False
         self._extrude_preview_mesh = None
+        self._extrude_arrow_origin = None   # np.ndarray | None
+        self._extrude_arrow_dir    = None   # np.ndarray | None  (signed, cut=negative)
         self._position_extrude_panel()
         panel.show()
         panel.setFocus()
@@ -184,6 +186,8 @@ class ExtrudeMixin:
         self._extrude_body_active  = False
         self._extrude_face_active  = False
         self._extrude_preview_mesh = None
+        self._extrude_arrow_origin = None
+        self._extrude_arrow_dir    = None
         if getattr(self, '_editing_history_idx', None) is not None:
             self._cancel_extrude_edit()
         self.update()
@@ -231,10 +235,75 @@ class ExtrudeMixin:
                 for f in preview_faces
             ]
             self._extrude_preview_dist = dist
+            self._update_extrude_arrow(dist, direction, sketch_idx, face_pairs,
+                                       start_offset)
         except Exception as ex:
             print(f"[Preview] {ex}")
             self._extrude_preview_mesh = None
         self.update()
+
+    def _update_extrude_arrow(self, dist: float, direction,
+                               sketch_idx, face_pairs, start_offset: float):
+        """Store the world-space arrow base and direction for rendering."""
+        import numpy as np
+        panel = getattr(self, '_extrude_panel', None)
+        if panel is None:
+            self._extrude_arrow_origin = None
+            self._extrude_arrow_dir    = None
+            return
+
+        origin = panel._face_origin
+        normal = panel._face_normal
+        if origin is None or normal is None:
+            self._extrude_arrow_origin = None
+            self._extrude_arrow_dir    = None
+            return
+
+        # direction from the panel is already the signed extrude vector
+        # (for a cut it points into the material with dist < 0, giving a net
+        # displacement of dist*direction which lands at the cut face).
+        if direction is not None:
+            arrow_dir = np.asarray(direction, dtype=float)
+        else:
+            arrow_dir = np.asarray(normal, dtype=float)
+
+        n = np.linalg.norm(arrow_dir)
+        if n < 1e-10:
+            self._extrude_arrow_origin = None
+            self._extrude_arrow_dir    = None
+            return
+        arrow_dir = arrow_dir / n
+
+        # Place the arrow at the tip of the preview so it always moves with it.
+        # direction already encodes the sign (cut → flipped normal), and
+        # _do_extrude_solid uses abs(dist) with that direction, so the solid
+        # tip is at: face_origin + direction * (start_offset + abs(dist)).
+        tip = (np.asarray(origin, dtype=float)
+               + arrow_dir * start_offset
+               + arrow_dir * abs(dist))
+        self._extrude_arrow_origin = tip
+        self._extrude_arrow_dir = arrow_dir
+
+    def _draw_extrude_arrow(self):
+        """Render the drag arrow on top of the extrude preview."""
+        import numpy as np
+        from viewer.drag_arrow import DragArrow
+
+        origin = getattr(self, '_extrude_arrow_origin', None)
+        direction = getattr(self, '_extrude_arrow_dir', None)
+        if origin is None or direction is None:
+            return
+
+        dist = getattr(self, '_extrude_preview_dist', 0.0)
+        is_cut = dist < 0
+        color = (0.95, 0.25, 0.25) if is_cut else (0.95, 0.85, 0.15)
+
+        # Scale arrow relative to camera distance for consistent screen size
+        scale = self.camera.distance * 0.10
+        scale = max(scale, abs(dist) * 0.18) if dist != 0.0 else scale
+
+        arrow = DragArrow()
+        arrow.draw(origin, direction, scale, color=color)
 
     # ------------------------------------------------------------------
     # Pick routing (called by viewport mouse handler)

@@ -80,7 +80,7 @@ class SketchOverlay:
 
     def draw_committed(self, entry, camera_distance: float,
                        hovered_edge=None, history_idx=None,
-                       selection=None) -> list[dict]:
+                       selection=None, dim_dimensions: bool = False) -> list[dict]:
         """
         Draw a committed SketchEntry as a persistent overlay.
         No grid, no axes, no cursor — just the entities, slightly dimmed.
@@ -112,6 +112,7 @@ class SketchOverlay:
             entry.constraints if hasattr(entry, 'constraints') else [],
             lambda u, v: entry.plane_origin + u * entry.plane_x_axis + v * entry.plane_y_axis,
             camera_distance,
+            dimmed=dim_dimensions,
         )
         glPopAttrib()
         return labels
@@ -948,7 +949,7 @@ class SketchOverlay:
         glLineWidth(1.0)
         glDisable(GL_BLEND)
 
-    def _draw_dimension_constraints(self, entities, constraints, to_3d, camera_distance) -> list[dict]:
+    def _draw_dimension_constraints(self, entities, constraints, to_3d, camera_distance, dimmed: bool = False) -> list[dict]:
         """
         Draw blueprint-style dimension annotations for all distance constraints.
 
@@ -995,7 +996,8 @@ class SketchOverlay:
             # Extension lines always go from entity toward dimension line.
             ext_dir = np.sign(offset) * perp if offset != 0 else perp
 
-            glColor4f(0.35, 0.70, 1.00, 0.90)  # blueprint blue
+            alpha = 0.25 if dimmed else 0.90
+            glColor4f(0.35, 0.70, 1.00, alpha)  # blueprint blue
 
             glBegin(GL_LINES)
             glVertex3f(*_v3(to_3d(*(p0 + ext_dir * ext_gap))))
@@ -1025,6 +1027,7 @@ class SketchOverlay:
                 'text':           format_value(con.value, prefs.default_unit, prefs.display_decimals),
                 'constraint_idx': ci,
                 'entity_idx':     ei,
+                'dimmed':         dimmed,
                 # World-space perp direction (unit vector) for drag projection.
                 'perp_world':     np.array(_v3(to_3d(*perp))) -
                                   np.array(_v3(to_3d(0.0, 0.0))),
@@ -1062,6 +1065,7 @@ class SketchOverlay:
                     'constraint_idx': ci,
                     'entity_idx':     ei,
                     'parallel':       True,   # flag so click doesn't open value editor
+                    'dimmed':         dimmed,
                     'perp_world':     np.array(_v3(to_3d(*perp))) -
                                       np.array(_v3(to_3d(0.0, 0.0))) if slen > 1e-6 else
                                       np.array([0.0, 0.0, 0.0]),

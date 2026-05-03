@@ -87,6 +87,9 @@ class RevolveMixin:
         self._revolve_face_active  = False
         self._revolve_body_active  = False
         self._revolve_preview_mesh = None
+        self._revolve_arrow_origin = None
+        self._revolve_arrow_dir    = None
+        self._revolve_face_centroid = None
         if getattr(self, '_editing_history_idx', None) is not None:
             self._cancel_revolve_edit()
         self.update()
@@ -98,6 +101,8 @@ class RevolveMixin:
     def _on_revolve_preview(self, angle: float, axis_point, axis_dir):
         if axis_point is None or axis_dir is None or angle == 0:
             self._revolve_preview_mesh = None
+            self._revolve_arrow_origin = None
+            self._revolve_arrow_dir    = None
             self.update()
             return
         import numpy as np
@@ -107,6 +112,7 @@ class RevolveMixin:
         face_pairs = getattr(self, '_revolve_face_pairs', [])
         axis_pt  = np.array(axis_point, dtype=float)
         axis_d   = np.array(axis_dir,   dtype=float)
+        axis_d  /= np.linalg.norm(axis_d)
 
         try:
             faces = []
@@ -114,6 +120,8 @@ class RevolveMixin:
                 all_sketch = self._sketch_faces.get(sketch_idx, [])
                 if not all_sketch:
                     self._revolve_preview_mesh = None
+                    self._revolve_arrow_origin = None
+                    self._revolve_arrow_dir    = None
                     self.update(); return
                 fidx_sel = self._selected_sketch_face
                 faces = ([all_sketch[fidx_sel][0]]
@@ -130,16 +138,77 @@ class RevolveMixin:
 
             if not faces:
                 self._revolve_preview_mesh = None
+                self._revolve_arrow_origin = None
+                self._revolve_arrow_dir    = None
                 self.update(); return
 
             self._revolve_preview_mesh = [
                 _do_revolve_solid(f, axis_pt, axis_d, angle)
                 for f in faces
             ]
+            self._update_revolve_arrow(faces, axis_pt, axis_d, angle)
         except Exception as ex:
             print(f"[Revolve Preview] {ex}")
             self._revolve_preview_mesh = None
+            self._revolve_arrow_origin = None
+            self._revolve_arrow_dir    = None
         self.update()
+
+    def _update_revolve_arrow(self, faces, axis_pt, axis_d, angle_deg: float):
+        """Compute arrow position at the swept tip of the revolve."""
+        import numpy as np
+        import math
+
+        # Centroid of the first face (world space)
+        try:
+            from build123d import Plane
+            pl = Plane(faces[0])
+            o  = pl.origin
+            centroid = np.array([o.X, o.Y, o.Z], dtype=float)
+        except Exception:
+            self._revolve_arrow_origin = None
+            self._revolve_arrow_dir    = None
+            return
+
+        # Store for incremental drag updates
+        self._revolve_face_centroid = centroid
+        self._revolve_axis_point    = axis_pt.copy()
+        self._revolve_axis_dir      = axis_d.copy()
+        self._revolve_preview_angle = angle_deg
+
+        # Radial vector: from axis to centroid, perpendicular to axis
+        rel     = centroid - axis_pt
+        rel_ax  = np.dot(rel, axis_d) * axis_d   # component along axis
+        r_perp  = rel - rel_ax                    # component perp to axis
+        r       = np.linalg.norm(r_perp)
+        if r < 1e-10:
+            self._revolve_arrow_origin = None
+            self._revolve_arrow_dir    = None
+            return
+        r_unit = r_perp / r
+
+        # Tangential direction at angle=0 (cross of axis with radial)
+        tan0 = np.cross(axis_d, r_unit)
+        tn   = np.linalg.norm(tan0)
+        if tn < 1e-10:
+            self._revolve_arrow_origin = None
+            self._revolve_arrow_dir    = None
+            return
+        tan0 /= tn
+
+        # Rotate r_unit and tan0 by angle_deg around the axis
+        a   = math.radians(angle_deg)
+        c, s = math.cos(a), math.sin(a)
+        # Rotated radial = c*r_unit + s*tan0
+        r_rot   = c * r_unit + s * tan0
+        # Rotated tangent = -s*r_unit + c*tan0
+        tan_rot = -s * r_unit + c * tan0
+
+        # Arrow sits at the swept face centroid
+        tip = axis_pt + rel_ax + r * r_rot
+        self._revolve_arrow_origin = tip
+        # Arrow points in the tangential direction (along the sweep)
+        self._revolve_arrow_dir    = tan_rot
 
     def _draw_revolve_preview(self):
         solids = getattr(self, '_revolve_preview_mesh', None)
@@ -216,6 +285,19 @@ class RevolveMixin:
         glDisable(GL_BLEND)
         glEnable(GL_CULL_FACE)
         glEnable(GL_LIGHTING)
+
+        self._draw_revolve_arrow()
+
+    def _draw_revolve_arrow(self):
+        from viewer.drag_arrow import DragArrow
+        origin    = getattr(self, '_revolve_arrow_origin', None)
+        direction = getattr(self, '_revolve_arrow_dir',    None)
+        if origin is None or direction is None:
+            return
+        angle = getattr(self, '_revolve_preview_angle', 0.0)
+        scale = self.camera.distance * 0.10
+        scale = max(scale, angle * 0.005) if angle != 0.0 else scale
+        DragArrow().draw(origin, direction, scale, color=(0.95, 0.85, 0.15))
 
     # ------------------------------------------------------------------
     # Pick routing signals

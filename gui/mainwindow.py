@@ -159,6 +159,11 @@ class MainWindow(QMainWindow):
             __import__('PyQt6.QtCore', fromlist=['Qt']).Qt.TextFormat.RichText)
         sb.addWidget(self._sketch_label)
 
+        self._meas_label = QLabel("")
+        self._meas_label.setStyleSheet(
+            "color: #4fc3f7; padding-right: 12px; font-weight: bold;")
+        sb.addPermanentWidget(self._meas_label)
+
         self._sel_label = QLabel("")
         self._sel_label.setStyleSheet("color: #888; padding-right: 8px;")
         sb.addPermanentWidget(self._sel_label)
@@ -270,9 +275,42 @@ class MainWindow(QMainWindow):
     def _update_selection_label(self):
         if self._viewport is None:
             self._sel_label.setText("")
+            self._meas_label.setText("")
             return
         text = self._viewport.selection.status_text()
         self._sel_label.setText(text)
+        self._update_measurement_label()
+
+    def _update_measurement_label(self):
+        if self._viewport is None:
+            self._meas_label.setText("")
+            return
+        vp = self._viewport
+        verts = vp.selection.vertices
+        if len(verts) != 2:
+            self._meas_label.setText("")
+            return
+
+        from viewer.hover import parse_sketch_vtx_key
+        from cad.units import format_value
+        from cad.prefs import prefs
+        import numpy as np
+
+        positions = []
+        for v in verts:
+            if parse_sketch_vtx_key(v.body_id) is not None:
+                p = vp.hover.vertex_world_pos(v.body_id, v.vertex_idx)
+            else:
+                mesh = vp._meshes.get(v.body_id)
+                p = mesh.topo_verts[v.vertex_idx] if mesh is not None else None
+            if p is None:
+                self._meas_label.setText("")
+                return
+            positions.append(np.array(p, dtype=np.float64))
+
+        dist_mm = float(np.linalg.norm(positions[1] - positions[0]))
+        text = format_value(dist_mm, prefs.default_unit, prefs.display_decimals)
+        self._meas_label.setText(f"dist: {text}")
 
     def _build_menu(self):
         from cad.prefs import prefs

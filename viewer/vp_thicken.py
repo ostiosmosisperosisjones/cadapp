@@ -95,6 +95,8 @@ class ThickenMixin:
         self._thicken_preview_token = None
         self._thicken_preview_tris  = None
         self._thicken_preview_edges = None
+        self._thicken_arrow_origin  = None
+        self._thicken_arrow_dir     = None
         self._thicken_pending_errors = None
         self.update()
 
@@ -161,19 +163,35 @@ class ThickenMixin:
         body_id      = getattr(self, '_thicken_body_id', None)
         face_indices = getattr(self, '_thicken_face_indices', None)
         if body_id is None or not face_indices:
-            self._thicken_preview_tris = None; self.update(); return
+            self._thicken_preview_tris  = None
+            self._thicken_arrow_origin  = None
+            self._thicken_arrow_dir     = None
+            self.update(); return
         shape = self.workspace.current_shape(body_id)
         if shape is None:
-            self._thicken_preview_tris = None; self.update(); return
+            self._thicken_preview_tris  = None
+            self._thicken_arrow_origin  = None
+            self._thicken_arrow_dir     = None
+            self.update(); return
         all_faces = list(shape.faces())
-
-        token = object()
-        self._thicken_preview_token = token
 
         face_occs = [all_faces[idx].wrapped for idx in face_indices
                      if idx < len(all_faces)]
         if not face_occs:
-            self._thicken_preview_tris = None; self.update(); return
+            self._thicken_preview_tris  = None
+            self._thicken_arrow_origin  = None
+            self._thicken_arrow_dir     = None
+            self.update(); return
+
+        self._update_thicken_arrow(all_faces, face_indices, thickness)
+
+        if thickness == 0.0:
+            self._thicken_preview_tris  = None
+            self._thicken_preview_dist  = thickness
+            self.update(); return
+
+        token = object()
+        self._thicken_preview_token = token
 
         # face_indices snapshot for error reporting back to panel
         face_indices_snap = list(face_indices)
@@ -247,6 +265,7 @@ class ThickenMixin:
     def _draw_thicken_preview(self):
         tris  = getattr(self, '_thicken_preview_tris',  None)
         edges = getattr(self, '_thicken_preview_edges', None)
+        self._draw_thicken_arrow()
         if not tris and not edges:
             return
 
@@ -290,6 +309,92 @@ class ThickenMixin:
         glDisable(GL_BLEND)
         glEnable(GL_CULL_FACE)
         glEnable(GL_LIGHTING)
+
+    def _update_thicken_arrow(self, all_faces, face_indices, thickness: float):
+        """Compute centroid + average normal of selected faces for arrow placement."""
+        import numpy as np
+        from OCP.BRep import BRep_Tool
+        from OCP.BRepGProp import BRepGProp
+        from OCP.BRepGProp import BRepGProp_Face
+        from OCP.GProp import GProp_GProps
+        from OCP.gp import gp_Pnt2d
+
+        centroids = []
+        normals   = []
+        for idx in face_indices:
+            if idx >= len(all_faces):
+                continue
+            try:
+                face_occ = all_faces[idx].wrapped
+                # Area-weighted centroid — works for any surface type
+                props = GProp_GProps()
+                BRepGProp.SurfaceProperties_s(face_occ, props)
+                cog = props.CentreOfMass()
+                centroids.append(np.array([cog.X(), cog.Y(), cog.Z()], dtype=float))
+                # Normal at the surface centroid via UV evaluation
+                surf_props = BRepGProp_Face(face_occ)
+                umin, umax, vmin, vmax = surf_props.Bounds()
+                u_mid = (umin + umax) * 0.5
+                v_mid = (vmin + vmax) * 0.5
+                pt    = gp_Pnt2d(u_mid, v_mid)
+                from OCP.gp import gp_Pnt, gp_Vec
+                sampled = []
+                for uf in (0.25, 0.5, 0.75):
+                    for vf in (0.25, 0.5, 0.75):
+                        try:
+                            pt2 = gp_Pnt()
+                            nv2 = gp_Vec()
+                            surf_props.Normal(
+                                umin + uf*(umax-umin),
+                                vmin + vf*(vmax-vmin),
+                                pt2, nv2,
+                            )
+                            nv = np.array([nv2.X(), nv2.Y(), nv2.Z()], dtype=float)
+                            if np.linalg.norm(nv) > 1e-10:
+                                sampled.append(nv)
+                        except Exception:
+                            pass
+                if sampled:
+                    normals.append(np.mean(sampled, axis=0))
+            except Exception:
+                pass
+
+        if not centroids or not normals:
+            self._thicken_arrow_origin = None
+            self._thicken_arrow_dir    = None
+            return
+
+        centroid = np.mean(centroids, axis=0)
+        avg_normal = np.mean(normals, axis=0)
+        n = np.linalg.norm(avg_normal)
+        if n < 1e-10:
+            self._thicken_arrow_origin = None
+            self._thicken_arrow_dir    = None
+            return
+        avg_normal /= n
+
+        # Arrow direction follows thickness sign; base sits at the offset surface.
+        sign = 1.0 if thickness >= 0 else -1.0
+        arrow_dir = avg_normal * sign
+        self._thicken_arrow_origin = centroid + arrow_dir * abs(thickness)
+        self._thicken_arrow_dir    = arrow_dir
+
+    def _draw_thicken_arrow(self):
+        import numpy as np
+        from viewer.drag_arrow import DragArrow
+
+        origin    = getattr(self, '_thicken_arrow_origin', None)
+        direction = getattr(self, '_thicken_arrow_dir',    None)
+        if origin is None or direction is None:
+            return
+
+        thickness = getattr(self, '_thicken_preview_dist', 0.0)
+        is_cut    = thickness < 0
+        color     = (0.95, 0.25, 0.25) if is_cut else (0.95, 0.85, 0.15)
+        scale     = self.camera.distance * 0.10
+        scale     = max(scale, abs(thickness) * 0.18) if thickness != 0.0 else scale
+
+        DragArrow().draw(origin, direction, scale, color=color)
 
     @pyqtSlot()
     def _apply_thicken_face_errors(self):

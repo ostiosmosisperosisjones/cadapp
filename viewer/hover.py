@@ -26,6 +26,20 @@ EDGE_HOVER_RADIUS   = 6    # screen pixels
 # Prefix used for synthetic sketch-edge keys in the hover cache
 _SKETCH_KEY_PREFIX = "__sketch__"
 
+_SKETCHVTX_KEY_PREFIX = "__sketchvtx__"
+
+def sketch_vtx_key(history_idx: int) -> str:
+    return f"{_SKETCHVTX_KEY_PREFIX}{history_idx}"
+
+def parse_sketch_vtx_key(key: str) -> int | None:
+    """Return history_idx if key is a sketch-vertex key, else None."""
+    if not key.startswith(_SKETCHVTX_KEY_PREFIX):
+        return None
+    try:
+        return int(key[len(_SKETCHVTX_KEY_PREFIX):])
+    except ValueError:
+        return None
+
 
 def _sketch_key(history_idx: int, entity_idx: int) -> str:
     return f"{_SKETCH_KEY_PREFIX}{history_idx}__{entity_idx}"
@@ -204,6 +218,7 @@ class HoverState:
             se = entry.params.get("sketch_entry")
             if se is None or not se.visible:
                 continue
+            endpoints = []
             for j, ent in enumerate(se.entities):
                 def _uv_to_world(uv):
                     return (se.plane_origin
@@ -220,6 +235,20 @@ class HoverState:
                 key = _sketch_key(i, j)
                 self._se[key]   = [project_fn(pts3d)]
                 self._se3d[key] = [pts3d]
+
+                if isinstance(ent, LineEntity):
+                    endpoints.append(_uv_to_world(ent.p0))
+                    endpoints.append(_uv_to_world(ent.p1))
+                elif isinstance(ent, ArcEntity):
+                    tess = ent.tessellate(2)
+                    endpoints.append(_uv_to_world(tess[0]))
+                    endpoints.append(_uv_to_world(tess[-1]))
+
+            if endpoints:
+                vtx_3d = np.array(endpoints, dtype=np.float32)
+                vtx_2d = project_fn(vtx_3d)
+                self._sv[sketch_vtx_key(i)]   = vtx_2d
+                self._sv3d[sketch_vtx_key(i)] = vtx_3d
 
     def _add_active_sketch_edges(self, sketch, project_fn):
         """
@@ -356,6 +385,13 @@ class HoverState:
                 return body_id, ei
 
         return None, None
+
+    def vertex_world_pos(self, body_id: str, vertex_idx: int) -> np.ndarray | None:
+        """Return the 3D world position of a cached vertex, or None."""
+        pts = self._sv3d.get(body_id)
+        if pts is None or vertex_idx >= len(pts):
+            return None
+        return pts[vertex_idx].astype(np.float64)
 
     def clear(self):
         self._sv.clear();   self._sv3d.clear()
