@@ -56,6 +56,8 @@ class MainWindow(QMainWindow):
             lambda: self._sketch_set_tool("OFFSET"))
         self._sketch_toolbar.tool_include_requested.connect(
             self._sketch_include)
+        self._sketch_toolbar.tool_constraint_requested.connect(
+            self._sketch_set_constraint)
         self._sketch_toolbar.commit_requested.connect(
             lambda: self._viewport and self._viewport._complete_sketch())
         self.addToolBar(self._sketch_toolbar)
@@ -91,6 +93,23 @@ class MainWindow(QMainWindow):
         tool = self._viewport._sketch._active_tool
         if isinstance(tool, CircleTool):
             tool.mode = mode
+        self._viewport.sketch_mode_changed.emit(True)
+        self._viewport.update()
+
+    def _sketch_set_constraint(self, mode: str):
+        if not self._viewport or not self._viewport._sketch:
+            return
+        from cad.sketch import SketchTool
+        vp = self._viewport
+        if mode in ('distance', 'diameter'):
+            vp._sketch.set_tool(SketchTool.DIMENSION)
+            vp._sketch._dimension_callback = vp._on_dimension_requested
+        else:
+            from cad.sketch_tools.geometric import GeometricConstraintTool
+            vp._sketch.set_tool(SketchTool.GEOMETRIC)
+            tool = vp._sketch._active_tool
+            if isinstance(tool, GeometricConstraintTool):
+                tool._mode = mode
         self._viewport.sketch_mode_changed.emit(True)
         self._viewport.update()
 
@@ -215,7 +234,7 @@ class MainWindow(QMainWindow):
             tools_hint = (
                 "L=line  A=arc  C=circle  T=trim  D=divide  "
                 "F=fillet  O=offset  P=point  H/V=h/v line  "
-                "⇧D=dimension  ⇧P=constraints  Return=commit"
+                "Return=commit"
             )
             con_html = ''
             if getattr(sketch, 'constraints', None):

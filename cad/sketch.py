@@ -227,6 +227,7 @@ class SketchMode:
         # Per-sketch undo stack — each entry is a deep-copy of (entities, constraints)
         # taken before a mutation.  Ctrl+Z pops and restores.
         self._entity_snapshots: list = []
+        self._redo_snapshots:   list = []
 
         # Active tool enum value (for status bar / overlay checks)
         self.tool = SketchTool.NONE
@@ -276,11 +277,16 @@ class SketchMode:
         self._entity_snapshots.append(
             (copy.deepcopy(self.entities), copy.deepcopy(self.constraints))
         )
+        self._redo_snapshots.clear()
 
     def undo_entity(self) -> bool:
-        """Restore the most recent snapshot. Returns True if anything was undone."""
+        """Restore the most recent undo snapshot. Returns True if anything was undone."""
         if not self._entity_snapshots:
             return False
+        import copy
+        self._redo_snapshots.append(
+            (copy.deepcopy(self.entities), copy.deepcopy(self.constraints))
+        )
         snapshot = self._entity_snapshots.pop()
         if isinstance(snapshot, tuple):
             self.entities, self.constraints = snapshot
@@ -288,6 +294,21 @@ class SketchMode:
             self.entities = snapshot  # backwards compat with old single-list snapshots
         if self._active_tool is not None:
             self._active_tool.cancel()
+        return True
+
+    def redo_entity(self) -> bool:
+        """Re-apply the most recently undone snapshot. Returns True if anything was redone."""
+        if not self._redo_snapshots:
+            return False
+        import copy
+        self._entity_snapshots.append(
+            (copy.deepcopy(self.entities), copy.deepcopy(self.constraints))
+        )
+        snapshot = self._redo_snapshots.pop()
+        if isinstance(snapshot, tuple):
+            self.entities, self.constraints = snapshot
+        else:
+            self.entities = snapshot
         return True
 
     # ------------------------------------------------------------------
@@ -377,17 +398,22 @@ class SketchConstraint:
     """
     One parametric constraint on sketch entities.
 
-    type    : 'distance' | 'parallel' | 'perpendicular' | 'horizontal' | 'vertical'
-    indices : tuple of entity indices the constraint applies to
-    value   : numeric value (mm for distance; ignored for geometric constraints)
-    label_offset : perpendicular offset of the dimension label in mm (None = auto)
+    type         : 'distance' | 'diameter' | 'parallel' | ... etc.
+    indices      : tuple of entity indices the constraint applies to
+    value        : numeric value (mm for distance/diameter; 0 for geometric)
+    label_offset : for 'distance'  — perpendicular offset of label from line (mm)
+                   for 'diameter'  — radial offset of label beyond circle edge (mm)
+    label_angle  : for 'diameter' only — angle (radians) of the diameter chord
+                   measured from the +U axis.  None = default (0 = horizontal).
     """
     def __init__(self, type: str, indices: tuple, value: float,
-                 label_offset: float | None = None):
+                 label_offset: float | None = None,
+                 label_angle:  float | None = None):
         self.type         = type
         self.indices      = tuple(indices)
         self.value        = float(value)
         self.label_offset: float | None = label_offset
+        self.label_angle:  float | None = label_angle
 
 
 # ---------------------------------------------------------------------------
@@ -437,16 +463,170 @@ class SketchEntry:
     # Constraint solver
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Solver helpers
+    # ------------------------------------------------------------------
+
+    def _build_solver_system(self):
+        """
+        Build and return a populated SolverSystem with all entities registered.
+
+        Returns (sys, wp, nm3d, canon_map, slvs_pts, slvs_lines, slvs_arcs,
+                 arc_center_pts, arc_start_pts, arc_end_pts, arc_dist_ents)
+        or None if python-solvespace is unavailable.
+
+        canon_map  : (entity_idx, 'p0'|'p1'|'center') → canonical key
+                     Lines use 'p0'/'p1'; arcs use 'center'/'p0'/'p1'.
+        slvs_pts   : canonical key → solver point entity
+        slvs_lines : line entity index → solver line entity
+        slvs_arcs  : arc entity index → solver arc entity
+        arc_center_pts : arc idx → solver point for arc center
+        arc_start_pts  : arc idx → solver point for arc start
+        arc_end_pts    : arc idx → solver point for arc end
+        arc_dist_ents  : arc idx → solver distance entity (radius param) — only
+                         for full circles (start_angle==0, end_angle==2π).
+        """
+        try:
+            from python_solvespace import SolverSystem
+        except ImportError:
+            return None
+
+        slvs = SolverSystem()
+        wp   = slvs.create_2d_base()
+        # Quaternion for XY-plane 3-D normal (identity rotation).
+        nm3d = slvs.add_normal_3d(1.0, 0.0, 0.0, 0.0)
+
+        tol = 1e-3
+
+        # Build canon_map: deduplicate coincident points across lines AND arcs.
+        # Keys: (entity_idx, 'p0') for line p0, (entity_idx, 'p1') for line p1,
+        #       (entity_idx, 'center') for arc center,
+        #       (entity_idx, 'p0') for arc start, (entity_idx, 'p1') for arc end.
+        canon_map: dict[tuple, tuple] = {}
+
+        def _register_pt(key, pt):
+            for k, ck in canon_map.items():
+                if ck != k:
+                    continue
+                other_key = ck
+                # Retrieve the stored point for this canonical key.
+                ei, wh = other_key
+                ent = self.entities[ei]
+                if wh == 'p0':
+                    op = ent.p0
+                elif wh == 'p1':
+                    op = ent.p1
+                else:  # 'center'
+                    op = ent.center
+                if np.linalg.norm(pt - op) < tol:
+                    canon_map[key] = ck
+                    return
+            canon_map[key] = key
+
+        for i, ent in enumerate(self.entities):
+            if isinstance(ent, LineEntity):
+                _register_pt((i, 'p0'), ent.p0)
+                _register_pt((i, 'p1'), ent.p1)
+            elif isinstance(ent, ArcEntity):
+                _register_pt((i, 'center'), ent.center)
+                _register_pt((i, 'p0'), ent.p0)
+                _register_pt((i, 'p1'), ent.p1)
+
+        # Add solver points for each canonical key.
+        slvs_pts: dict[tuple, object] = {}
+        for i, ent in enumerate(self.entities):
+            if isinstance(ent, LineEntity):
+                keys_pts = [((i, 'p0'), ent.p0), ((i, 'p1'), ent.p1)]
+            elif isinstance(ent, ArcEntity):
+                keys_pts = [((i, 'center'), ent.center),
+                            ((i, 'p0'),     ent.p0),
+                            ((i, 'p1'),     ent.p1)]
+            else:
+                continue
+            for key, pt in keys_pts:
+                ck = canon_map[key]
+                if ck not in slvs_pts:
+                    slvs_pts[ck] = slvs.add_point_2d(float(pt[0]), float(pt[1]), wp)
+
+        def _pt(ei, which):
+            return slvs_pts[canon_map[(ei, which)]]
+
+        # Register lines.
+        slvs_lines: dict[int, object] = {}
+        for i, ent in enumerate(self.entities):
+            if isinstance(ent, LineEntity):
+                slvs_lines[i] = slvs.add_line_2d(_pt(i, 'p0'), _pt(i, 'p1'), wp)
+
+        # Register arcs and full circles.
+        TWO_PI = 2.0 * np.pi
+        slvs_arcs:      dict[int, object] = {}
+        arc_center_pts: dict[int, object] = {}
+        arc_start_pts:  dict[int, object] = {}
+        arc_end_pts:    dict[int, object] = {}
+        arc_dist_ents:  dict[int, object] = {}  # radius distance entity for circles
+
+        for i, ent in enumerate(self.entities):
+            if not isinstance(ent, ArcEntity):
+                continue
+            cp = _pt(i, 'center')
+            sp = _pt(i, 'p0')
+            ep = _pt(i, 'p1')
+            arc_center_pts[i] = cp
+            arc_start_pts[i]  = sp
+            arc_end_pts[i]    = ep
+
+            is_full_circle = abs(ent.end_angle - ent.start_angle - TWO_PI) < 1e-6
+            if is_full_circle:
+                dist_ent = slvs.add_distance(float(ent.radius), wp)
+                arc_dist_ents[i] = dist_ent
+                slvs_arcs[i] = slvs.add_circle(nm3d, cp, dist_ent, wp)
+            else:
+                slvs_arcs[i] = slvs.add_arc(nm3d, cp, sp, ep, wp)
+
+        return (slvs, wp, nm3d, canon_map, slvs_pts,
+                slvs_lines, slvs_arcs,
+                arc_center_pts, arc_start_pts, arc_end_pts, arc_dist_ents)
+
+    def _apply_constraints_to_solver(self, slvs, wp, canon_map,
+                                     slvs_pts, slvs_lines, slvs_arcs,
+                                     arc_dist_ents, constraints):
+        """Emit all constraint calls onto an already-built solver system."""
+        def _pt(ei, which):
+            return slvs_pts[canon_map[(ei, which)]]
+
+        for con in constraints:
+            i = con.indices[0] if con.indices else None
+            if con.type == 'distance':
+                if i is not None and i < len(self.entities) and \
+                        isinstance(self.entities[i], LineEntity):
+                    slvs.distance(_pt(i, 'p0'), _pt(i, 'p1'), con.value, wp)
+            elif con.type == 'diameter':
+                if i is not None and i < len(self.entities) and \
+                        isinstance(self.entities[i], ArcEntity):
+                    if i in slvs_arcs:
+                        slvs.diameter(slvs_arcs[i], con.value)
+            elif con.type == 'parallel':
+                ref, mov = con.indices
+                if ref in slvs_lines and mov in slvs_lines:
+                    slvs.parallel(slvs_lines[ref], slvs_lines[mov], wp)
+            elif con.type == 'perpendicular':
+                ref, mov = con.indices
+                if ref in slvs_lines and mov in slvs_lines:
+                    slvs.perpendicular(slvs_lines[ref], slvs_lines[mov], wp)
+            elif con.type == 'horizontal':
+                if i in slvs_lines:
+                    slvs.horizontal(slvs_lines[i], wp)
+            elif con.type == 'vertical':
+                if i in slvs_lines:
+                    slvs.vertical(slvs_lines[i], wp)
+            elif con.type == 'equal':
+                a, b = con.indices
+                if a in slvs_lines and b in slvs_lines:
+                    slvs.equal(slvs_lines[a], slvs_lines[b], wp)
+
     def compute_constraint_status(self) -> tuple[str, int]:
         """
         Return (status, user_dof) without touching entity coordinates.
-
-        Builds a fresh solver system with all constraints but zero dragged
-        points, solves, and reads dof().  In SolveSpace a fully shape-
-        constrained 2D sketch always has exactly 3 residual DOFs (rigid-body
-        translation × 2 + rotation × 1), so:
-
-            user_dof = dof() - 3
 
         status values: 'none' | 'under' | 'fully' | 'over'
         user_dof      : meaningful DOFs remaining (0 = fully constrained).
@@ -455,99 +635,62 @@ class SketchEntry:
         if not self.constraints:
             return ('none', -1)
 
-        lines = [e for e in self.entities if isinstance(e, LineEntity)]
-        if not lines:
+        has_geometry = any(isinstance(e, (LineEntity, ArcEntity))
+                           for e in self.entities)
+        if not has_geometry:
             return ('none', -1)
 
-        try:
-            from python_solvespace import SolverSystem
-        except ImportError:
+        built = self._build_solver_system()
+        if built is None:
             return ('none', -1)
+        slvs, wp, nm3d, canon_map, slvs_pts, slvs_lines, slvs_arcs, \
+            arc_center_pts, arc_start_pts, arc_end_pts, arc_dist_ents = built
 
-        sys = SolverSystem()
-        wp  = sys.create_2d_base()
+        # Measure unconstrained DOF before adding any constraints.
+        if slvs.solve() != 0:
+            return ('none', -1)
+        baseline_dof = slvs.dof()
 
-        # Deduplicate coincident endpoints so the solver sees shared points.
-        tol = 1e-3
-        canon_map: dict[tuple, tuple] = {}
-        for i, ent in enumerate(self.entities):
-            if not isinstance(ent, LineEntity):
-                continue
-            for which in ('p0', 'p1'):
-                key = (i, which)
-                pt  = ent.p0 if which == 'p0' else ent.p1
-                found = None
-                for k, ck in canon_map.items():
-                    if ck != k:
-                        continue
-                    other = self.entities[k[0]]
-                    op = other.p0 if k[1] == 'p0' else other.p1
-                    if np.linalg.norm(pt - op) < tol:
-                        found = k
-                        break
-                canon_map[key] = found if found is not None else key
+        self._apply_constraints_to_solver(slvs, wp, canon_map, slvs_pts,
+                                          slvs_lines, slvs_arcs,
+                                          arc_dist_ents, self.constraints)
 
-        slvs_pts: dict[tuple, object] = {}
-        for i, ent in enumerate(self.entities):
-            if not isinstance(ent, LineEntity):
-                continue
-            for which in ('p0', 'p1'):
-                ck = canon_map[(i, which)]
-                if ck not in slvs_pts:
-                    pt = ent.p0 if which == 'p0' else ent.p1
-                    slvs_pts[ck] = sys.add_point_2d(float(pt[0]), float(pt[1]), wp)
-
-        def _pt(ei, which):
-            return slvs_pts[canon_map[(ei, which)]]
-
-        slvs_lines: dict[int, object] = {}
-        for i, ent in enumerate(self.entities):
-            if isinstance(ent, LineEntity):
-                slvs_lines[i] = sys.add_line_2d(_pt(i, 'p0'), _pt(i, 'p1'), wp)
-
-        # Apply constraints — no dragged points at all.
-        for con in self.constraints:
-            if con.type == 'distance':
-                i = con.indices[0]
-                if i < len(self.entities) and isinstance(self.entities[i], LineEntity):
-                    sys.distance(_pt(i, 'p0'), _pt(i, 'p1'), con.value, wp)
-            elif con.type == 'parallel':
-                ref, mov = con.indices
-                if ref in slvs_lines and mov in slvs_lines:
-                    sys.parallel(slvs_lines[ref], slvs_lines[mov], wp)
-            elif con.type == 'perpendicular':
-                ref, mov = con.indices
-                if ref in slvs_lines and mov in slvs_lines:
-                    sys.perpendicular(slvs_lines[ref], slvs_lines[mov], wp)
-            elif con.type == 'horizontal':
-                i = con.indices[0]
-                if i in slvs_lines:
-                    sys.horizontal(slvs_lines[i], wp)
-            elif con.type == 'vertical':
-                i = con.indices[0]
-                if i in slvs_lines:
-                    sys.vertical(slvs_lines[i], wp)
-
-        result = sys.solve()
-        if result != 0:
+        if slvs.solve() != 0:
             return ('over', -1)
 
-        # SolveSpace dof() includes the workplane overhead (6) plus the 2D
-        # rigid-body residual (translation×2 + rotation×1 = 3).  Baseline = 9.
-        user_dof = sys.dof() - 9
+        user_dof = slvs.dof() - 6  # subtract workplane overhead (always 6)
         if user_dof <= 0:
             return ('fully', 0)
         return ('under', user_dof)
 
-    def _add_snap_coincidences(self, sys, wp, slvs_pts, slvs_lines, canon_map):
+    def _add_snap_coincidences(self, slvs, wp, slvs_pts, slvs_lines,
+                               slvs_arcs, canon_map, user_constraints=None,
+                               implicit_lengths=True):
         """Add geometric constraints for non-endpoint snap anchors.
 
-        MIDPOINT snap on a line  → sys.midpoint(ep, line)      — parametric, no pinning
-        NEAREST snap on a line   → sys.coincident(ep, line)    — point-on-line, no pinning
-        CENTER/NEAREST/TANGENT on an arc → pin endpoint to stored coordinate (arcs are
-            not yet registered as solver entities, so we fall back to a fixed point)
+        MIDPOINT snap on a line  → midpoint(ep, line)
+        NEAREST  snap on a line  → coincident(ep, line)
+        ENDPOINT snap on an arc  → already deduplicated via canon_map (shared pt)
+        CENTER   snap on an arc  → coincident(ep, arc_center_pt) via zero-distance
+        NEAREST/TANGENT on arc   → pin endpoint to stored coordinate (fallback)
+
+        implicit_lengths: if False, skip adding distance() for line length
+          preservation. Use False when re-solving a fully-established sketch
+          (no_pin=True) to avoid redundant distance constraints.
+
+        Returns a set of canonical keys that have coincident(point, circle)
+        constraints — these must NOT be pinned with dragged() in the caller.
         """
+        circle_coincident_cks: set = set()
         from cad.sketch_tools.snap import SnapType
+
+        # Indices of lines that already have a user-placed distance constraint —
+        # don't add an implicit length for those or we'll over-constrain.
+        user_distanced = set()
+        if user_constraints:
+            for con in user_constraints:
+                if con.type == 'distance':
+                    user_distanced.add(con.indices[0])
 
         for i, ent in enumerate(self.entities):
             if not isinstance(ent, LineEntity):
@@ -560,25 +703,82 @@ class SketchEntry:
                 if src_idx >= len(self.entities):
                     continue
                 src = self.entities[src_idx]
-                ep_sp = slvs_pts.get(canon_map.get((i, which)))
+                ck = canon_map.get((i, which))
+                ep_sp = slvs_pts.get(ck) if ck is not None else None
                 if ep_sp is None:
                     continue
 
+                # Check whether the OTHER endpoint of this line also has a
+                # non-endpoint snap — if so, both ends are geometrically
+                # constrained and adding an implicit length would over-constrain.
+                other_which = 'p1' if which == 'p0' else 'p0'
+                other_snap = getattr(ent, f'{other_which}_snap', None)
+                other_also_snapped = (other_snap is not None)
+
+                def _add_implicit_length():
+                    """Pin this line's length to keep it rigid during solve."""
+                    if not implicit_lengths:
+                        return  # caller opted out (re-solve of established sketch)
+                    if i in user_distanced:
+                        return  # user already constrains this line's length
+                    if other_also_snapped:
+                        return  # both ends constrained — length is implicit
+                    other_ck = canon_map.get((i, other_which))
+                    other_sp = slvs_pts.get(other_ck) if other_ck else None
+                    if other_sp is not None:
+                        cur_len = float(np.linalg.norm(ent.p1 - ent.p0))
+                        if cur_len > 1e-6:
+                            slvs.distance(ep_sp, other_sp, cur_len, wp)
+
                 if snap_type == SnapType.MIDPOINT and isinstance(src, LineEntity):
                     if src_idx in slvs_lines:
-                        sys.midpoint(ep_sp, slvs_lines[src_idx], wp)
+                        slvs.midpoint(ep_sp, slvs_lines[src_idx], wp)
+                        _add_implicit_length()
 
                 elif snap_type == SnapType.NEAREST and isinstance(src, LineEntity):
                     if src_idx in slvs_lines:
-                        sys.coincident(ep_sp, slvs_lines[src_idx], wp)
+                        slvs.coincident(ep_sp, slvs_lines[src_idx], wp)
+                        _add_implicit_length()
+
+                elif isinstance(src, ArcEntity) and src_idx in slvs_arcs:
+                    # Endpoint snapped to arc start/end: already shared via
+                    # canon_map deduplication — no extra constraint needed.
+                    # Center snap: enforce coincidence with arc center point.
+                    if snap_type == SnapType.CENTER:
+                        center_ck = canon_map.get((src_idx, 'center'))
+                        center_sp = slvs_pts.get(center_ck) if center_ck else None
+                        if center_sp is not None:
+                            slvs.distance(ep_sp, center_sp, 0.0, wp)
+                            _add_implicit_length()
+                    elif snap_type in (SnapType.NEAREST, SnapType.TANGENT,
+                                       SnapType.ENDPOINT):
+                        TWO_PI = 2.0 * np.pi
+                        is_full_circle = abs(src.end_angle - src.start_angle
+                                             - TWO_PI) < 1e-6
+                        if is_full_circle and src_idx in slvs_arcs:
+                            # coincident(point, circle) keeps the point on the
+                            # circle surface — works even when diameter changes.
+                            slvs.coincident(ep_sp, slvs_arcs[src_idx], wp)
+                            circle_coincident_cks.add(ck)
+                            _add_implicit_length()
+                        else:
+                            # Partial arc — pin to stored coordinate (fallback).
+                            ref_uv = (ent.p0 if which == 'p0' else ent.p1).copy()
+                            ref_sp = slvs.add_point_2d(float(ref_uv[0]),
+                                                       float(ref_uv[1]), wp)
+                            slvs.dragged(ref_sp, wp)
+                            slvs.distance(ep_sp, ref_sp, 0.0, wp)
 
                 elif snap_type in (SnapType.CENTER, SnapType.NEAREST,
                                    SnapType.TANGENT, SnapType.MIDPOINT):
-                    # Arc/reference entity — pin to stored snapped coordinate.
+                    # Reference entity or unregistered arc — pin coordinate.
                     ref_uv = (ent.p0 if which == 'p0' else ent.p1).copy()
-                    ref_sp = sys.add_point_2d(float(ref_uv[0]), float(ref_uv[1]), wp)
-                    sys.dragged(ref_sp, wp)
-                    sys.distance(ep_sp, ref_sp, 0.0, wp)
+                    ref_sp = slvs.add_point_2d(float(ref_uv[0]),
+                                               float(ref_uv[1]), wp)
+                    slvs.dragged(ref_sp, wp)
+                    slvs.distance(ep_sp, ref_sp, 0.0, wp)
+
+        return circle_coincident_cks
 
     def apply_last_constraint(self) -> bool:
         """Solve all constraints with no pinning. Alias for apply_all_constraints."""
@@ -597,7 +797,10 @@ class SketchEntry:
             i = con.indices[0]
             if i < len(self.entities) and isinstance(self.entities[i], LineEntity):
                 free.add(canon_map[(i, 'p1')])
-        elif con.type in ('parallel', 'perpendicular'):
+        elif con.type == 'diameter':
+            # Diameter only changes radius, not point positions — free nothing.
+            pass
+        elif con.type in ('parallel', 'perpendicular', 'equal'):
             mov = con.indices[1]
             if mov < len(self.entities) and isinstance(self.entities[mov], LineEntity):
                 free.add(canon_map[(mov, 'p0')])
@@ -619,71 +822,39 @@ class SketchEntry:
         """
         if not self.constraints:
             return True
-        try:
-            from python_solvespace import SolverSystem
-        except ImportError:
+
+        def _build_and_pin(implicit_lengths: bool):
+            built = self._build_solver_system()
+            if built is None:
+                return None, None, None
+            slvs, wp, nm3d, canon_map, slvs_pts, slvs_lines, slvs_arcs, \
+                arc_center_pts, arc_start_pts, arc_end_pts, arc_dist_ents = built
+            circ_cks = self._add_snap_coincidences(
+                slvs, wp, slvs_pts, slvs_lines, slvs_arcs, canon_map,
+                self.constraints, implicit_lengths=implicit_lengths)
+            return slvs, (wp, canon_map, slvs_pts, slvs_lines, slvs_arcs,
+                          arc_dist_ents), circ_cks
+
+        slvs, extras, circle_coincident_cks = _build_and_pin(implicit_lengths=True)
+        if slvs is None:
             return False
-
-        sys = SolverSystem()
-        wp  = sys.create_2d_base()
-
-        tol = 1e-3
-        canon_map: dict[tuple, tuple] = {}
-        for i, ent in enumerate(self.entities):
-            if not isinstance(ent, LineEntity):
-                continue
-            for which in ('p0', 'p1'):
-                key = (i, which)
-                pt  = ent.p0 if which == 'p0' else ent.p1
-                found = None
-                for k in canon_map:
-                    if canon_map[k] != k:
-                        continue
-                    other = self.entities[k[0]]
-                    op = other.p0 if k[1] == 'p0' else other.p1
-                    if np.linalg.norm(pt - op) < tol:
-                        found = k
-                        break
-                canon_map[key] = found if found is not None else key
-
-        slvs_pts: dict[tuple, object] = {}
-        for i, ent in enumerate(self.entities):
-            if not isinstance(ent, LineEntity):
-                continue
-            for which in ('p0', 'p1'):
-                ck = canon_map[(i, which)]
-                if ck not in slvs_pts:
-                    pt = ent.p0 if which == 'p0' else ent.p1
-                    slvs_pts[ck] = sys.add_point_2d(float(pt[0]), float(pt[1]), wp)
-
-        def _pt(ent_idx, which):
-            return slvs_pts[canon_map[(ent_idx, which)]]
-
-        slvs_lines: dict[int, object] = {}
-        for i, ent in enumerate(self.entities):
-            if isinstance(ent, LineEntity):
-                slvs_lines[i] = sys.add_line_2d(_pt(i, 'p0'), _pt(i, 'p1'), wp)
-
-        self._add_snap_coincidences(sys, wp, slvs_pts, slvs_lines, canon_map)
+        wp, canon_map, slvs_pts, slvs_lines, slvs_arcs, arc_dist_ents = extras
 
         if free_for_last and self.constraints:
             free_cks = self._free_cks_for_constraint(self.constraints[-1], canon_map)
 
-            # Also free p1 of any previously distance-constrained line — dragging
-            # it would conflict with the distance constraint itself.
             for con in self.constraints[:-1]:
                 if con.type == 'distance':
                     i = con.indices[0]
                     if i < len(self.entities) and isinstance(self.entities[i], LineEntity):
                         free_cks.add(canon_map[(i, 'p1')])
 
-            # Propagate: points connected by geometric constraints to a free
-            # point must also be free.
+            # Propagate freedom through geometric constraints.
             changed = True
             while changed:
                 changed = False
                 for con in self.constraints[:-1]:
-                    if con.type in ('parallel', 'perpendicular'):
+                    if con.type in ('parallel', 'perpendicular', 'equal'):
                         ref, mov = con.indices
                         involved = {canon_map.get((ref, 'p0')), canon_map.get((ref, 'p1')),
                                     canon_map.get((mov, 'p0')), canon_map.get((mov, 'p1'))} - {None}
@@ -700,40 +871,87 @@ class SketchEntry:
                             free_cks |= {p0, p1} - {None}
                             changed = changed or len(free_cks) > before
 
+            # Propagate freedom to arc centers: if any line endpoint that is
+            # snap-connected to an arc is free, the arc center must also be
+            # free so the arc can move with the line system instead of being
+            # pinned in place by dragged(center_sp).
+            from cad.sketch_tools.snap import SnapType
+            for i, ent in enumerate(self.entities):
+                if not isinstance(ent, LineEntity):
+                    continue
+                for which, snap_meta in (('p0', getattr(ent, 'p0_snap', None)),
+                                         ('p1', getattr(ent, 'p1_snap', None))):
+                    if snap_meta is None:
+                        continue
+                    src_idx, snap_type = snap_meta
+                    if src_idx >= len(self.entities):
+                        continue
+                    src = self.entities[src_idx]
+                    if not isinstance(src, ArcEntity):
+                        continue
+                    ep_ck = canon_map.get((i, which))
+                    center_ck = canon_map.get((src_idx, 'center'))
+                    if ep_ck in free_cks and center_ck is not None:
+                        free_cks.add(center_ck)
+
             for ck, sp in slvs_pts.items():
-                if ck not in free_cks:
-                    sys.dragged(sp, wp)
-        elif not no_pin:
-            # Pin p0 of distance-constrained lines to prevent positional drift.
+                if ck not in free_cks and ck not in circle_coincident_cks:
+                    slvs.dragged(sp, wp)
+        elif no_pin:
+            # no_pin=True: solver is free for all lines, but arcs have no
+            # implicit anchor — pin arc centers so the solver doesn't drift
+            # circles away from their snap-connected line endpoints.
+            # The coincident(point, circle) constraints still let endpoints
+            # slide freely along the circle surface.
+            for i, ent in enumerate(self.entities):
+                if not isinstance(ent, ArcEntity):
+                    continue
+                center_ck = canon_map.get((i, 'center'))
+                if center_ck and center_ck in slvs_pts:
+                    slvs.dragged(slvs_pts[center_ck], wp)
+        else:
             for con in self.constraints:
                 if con.type == 'distance':
                     i = con.indices[0]
                     if i < len(self.entities) and isinstance(self.entities[i], LineEntity):
-                        sys.dragged(slvs_pts[canon_map[(i, 'p0')]], wp)
+                        slvs.dragged(slvs_pts[canon_map[(i, 'p0')]], wp)
 
-        for con in self.constraints:
-            if con.type == 'distance':
-                i = con.indices[0]
-                if not isinstance(self.entities[i], LineEntity): continue
-                sys.distance(_pt(i, 'p0'), _pt(i, 'p1'), con.value, wp)
-            elif con.type == 'parallel':
-                ref, mov = con.indices
-                if ref in slvs_lines and mov in slvs_lines:
-                    sys.parallel(slvs_lines[ref], slvs_lines[mov], wp)
-            elif con.type == 'perpendicular':
-                ref, mov = con.indices
-                if ref in slvs_lines and mov in slvs_lines:
-                    sys.perpendicular(slvs_lines[ref], slvs_lines[mov], wp)
-            elif con.type == 'horizontal':
-                i = con.indices[0]
-                if i in slvs_lines: sys.horizontal(slvs_lines[i], wp)
-            elif con.type == 'vertical':
-                i = con.indices[0]
-                if i in slvs_lines: sys.vertical(slvs_lines[i], wp)
+        self._apply_constraints_to_solver(slvs, wp, canon_map, slvs_pts,
+                                          slvs_lines, slvs_arcs,
+                                          arc_dist_ents, self.constraints)
 
-        if sys.solve() != 0:
+        result = slvs.solve()
+        if result != 0 and no_pin:
+            # Implicit length constraints may be redundant when re-solving a
+            # fully-constrained sketch (e.g., after re-entering). Retry without
+            # them — the starting positions already satisfy the snap topology so
+            # minimum-motion will preserve it without explicit length enforcement.
+            slvs2, extras2, circle_coincident_cks = _build_and_pin(
+                implicit_lengths=False)
+            if slvs2 is not None:
+                wp2, canon_map2, slvs_pts2, slvs_lines2, slvs_arcs2, arc_dist_ents2 = extras2
+                for i, ent in enumerate(self.entities):
+                    if not isinstance(ent, ArcEntity):
+                        continue
+                    center_ck = canon_map2.get((i, 'center'))
+                    if center_ck and center_ck in slvs_pts2:
+                        slvs2.dragged(slvs_pts2[center_ck], wp2)
+                self._apply_constraints_to_solver(slvs2, wp2, canon_map2, slvs_pts2,
+                                                  slvs_lines2, slvs_arcs2,
+                                                  arc_dist_ents2, self.constraints)
+                result2 = slvs2.solve()
+                if result2 == 0:
+                    slvs, wp, canon_map, slvs_pts, slvs_lines, slvs_arcs, arc_dist_ents = \
+                        slvs2, wp2, canon_map2, slvs_pts2, slvs_lines2, slvs_arcs2, arc_dist_ents2
+                    result = 0
+
+        if result != 0:
+            print(f"[Solver] FAILED result={result} dof={slvs.dof()} "
+                  f"constraints={[c.type for c in self.constraints]} "
+                  f"no_pin={no_pin} free_for_last={free_for_last}")
             return False
 
+        # Write back line endpoint coordinates from solver points.
         for i, ent in enumerate(self.entities):
             if not isinstance(ent, LineEntity):
                 continue
@@ -742,11 +960,71 @@ class SketchEntry:
                 sp = slvs_pts.get(ck)
                 if sp is None:
                     continue
-                uv = sys.params(sp.params)
+                uv = slvs.params(sp.params)
                 if which == 'p0':
                     ent.p0 = np.array([uv[0], uv[1]], dtype=np.float64)
                 else:
                     ent.p1 = np.array([uv[0], uv[1]], dtype=np.float64)
+
+        # Write back arc coordinates.
+        TWO_PI = 2.0 * np.pi
+        for i, ent in enumerate(self.entities):
+            if not isinstance(ent, ArcEntity):
+                continue
+            ck_center = canon_map.get((i, 'center'))
+            if ck_center and ck_center in slvs_pts:
+                uv = slvs.params(slvs_pts[ck_center].params)
+                ent.center = np.array([uv[0], uv[1]], dtype=np.float64)
+            is_full_circle = abs(ent.end_angle - ent.start_angle - TWO_PI) < 1e-6
+            if is_full_circle:
+                if i in arc_dist_ents:
+                    r_val = slvs.params(arc_dist_ents[i].params)
+                    ent.radius = float(r_val[0])
+            else:
+                ck0 = canon_map.get((i, 'p0'))
+                ck1 = canon_map.get((i, 'p1'))
+                if ck0 and ck0 in slvs_pts:
+                    uv = slvs.params(slvs_pts[ck0].params)
+                    d  = np.array([uv[0], uv[1]]) - ent.center
+                    ent.radius      = float(np.linalg.norm(d))
+                    ent.start_angle = float(np.arctan2(d[1], d[0]))
+                if ck1 and ck1 in slvs_pts:
+                    uv = slvs.params(slvs_pts[ck1].params)
+                    d  = np.array([uv[0], uv[1]]) - ent.center
+                    ent.end_angle = float(np.arctan2(d[1], d[0]))
+                    if ent.end_angle <= ent.start_angle:
+                        ent.end_angle += TWO_PI
+
+        # Second pass: fix line endpoints that share a canonical key with an arc
+        # point.  For full circles the radius changed but the solver point wasn't
+        # repositioned (the circle entity owns its radius separately), so any
+        # line endpoint that was merged with arc.p0 / arc.p1 / arc.center must be
+        # recomputed from the now-updated arc geometry.
+        arc_canonical_coords: dict[tuple, np.ndarray] = {}
+        for i, ent in enumerate(self.entities):
+            if not isinstance(ent, ArcEntity):
+                continue
+            ck_c  = canon_map.get((i, 'center'))
+            ck_p0 = canon_map.get((i, 'p0'))
+            ck_p1 = canon_map.get((i, 'p1'))
+            if ck_c:
+                arc_canonical_coords[ck_c] = ent.center.copy()
+            if ck_p0:
+                arc_canonical_coords[ck_p0] = ent.p0.copy()
+            if ck_p1:
+                arc_canonical_coords[ck_p1] = ent.p1.copy()
+
+        for i, ent in enumerate(self.entities):
+            if not isinstance(ent, LineEntity):
+                continue
+            for which in ('p0', 'p1'):
+                ck = canon_map[(i, which)]
+                if ck in arc_canonical_coords:
+                    coord = arc_canonical_coords[ck]
+                    if which == 'p0':
+                        ent.p0 = coord.copy()
+                    else:
+                        ent.p1 = coord.copy()
 
         return True
 

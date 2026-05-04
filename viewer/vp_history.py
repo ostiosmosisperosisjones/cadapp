@@ -134,11 +134,14 @@ class HistoryMixin:
     def handle_redo(self):
         """
         Context-aware redo:
-          1. Inside sketch  → no-op
+          1. Inside sketch  → per-sketch redo
           2. Structural commands available → redo reorder/delete
           3. Otherwise      → history cursor redo
         """
         if self._sketch is not None:
+            if self._sketch.redo_entity():
+                self.sketch_mode_changed.emit(True)
+                self.update()
             return
         if self._cmd_stack.can_redo:
             desc = self._cmd_stack.redo(self)

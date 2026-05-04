@@ -61,9 +61,14 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._dragging_label: dict | None = None  # label being dragged (stable ref)
         self._drag_start_screen: tuple | None = None
         # Stable drag state — set on press, used across move events
-        self._drag_constraint = None   # the actual SketchConstraint object
-        self._drag_perp_world = None   # perp world direction np.ndarray
-        self._drag_line_mid   = None   # world pos of line midpoint (no offset)
+        self._drag_constraint   = None   # the actual SketchConstraint object
+        self._drag_perp_world   = None   # perp world direction np.ndarray
+        self._drag_line_mid     = None   # world pos of line midpoint (no offset)
+        # Diameter-specific drag state
+        self._drag_is_diameter      = False
+        self._drag_chord_world      = None   # chord direction world np.ndarray
+        self._drag_arc_center_world = None   # arc center in world coords
+        self._drag_arc_radius       = None   # arc radius in mm (sketch coords)
 
         from viewer.line_hud import LineHUD
         self._line_hud = LineHUD(self)
@@ -726,6 +731,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         from cad.sketch import SketchTool
 
         if e.key() == Qt.Key.Key_Escape:
+            from PyQt6.QtWidgets import QApplication
+            if QApplication.activeModalWidget() is not None:
+                super().keyPressEvent(e); return
             if self._sketch is not None:
                 if self._sketch.snap.declared_type is not None:
                     self._sketch.snap.consume_declared()
@@ -817,12 +825,6 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 self._sketch.set_tool(SketchTool.DIVIDE)
             elif prefs.matches("sketch_offset", e):
                 self._sketch.set_tool(SketchTool.OFFSET)
-            elif prefs.matches("sketch_dimension", e):
-                self._sketch.set_tool(SketchTool.DIMENSION)
-                self._sketch._dimension_callback = self._on_dimension_requested
-            elif prefs.matches("sketch_geometric", e):
-                from cad.sketch_tools.geometric import GeometricConstraintTool
-                self._sketch.set_tool(SketchTool.GEOMETRIC)
             elif prefs.matches("sketch_include", e):
                 from cad.sketch_tools.include import IncludeTool
                 self._sketch.push_undo_snapshot()
@@ -839,18 +841,11 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     print("[Sketch] Nothing selected to include — "
                           "select edges, vertices, or sketch lines first.")
                 return
-            elif prefs.matches("sketch_dimension", e):
-                self._sketch._dimension_callback = self._on_dimension_requested
-                self._sketch.set_tool(SketchTool.DIMENSION)
-            elif prefs.matches("sketch_geometric", e):
-                from cad.sketch_tools.geometric import GeometricConstraintTool
-                if (self._sketch.tool == SketchTool.GEOMETRIC and
-                        isinstance(self._sketch._active_tool, GeometricConstraintTool)):
-                    self._sketch._active_tool.cycle_mode()
-                else:
-                    self._sketch.set_tool(SketchTool.GEOMETRIC)
             elif prefs.matches("sketch_commit", e):
-                self._complete_sketch(); return
+                from PyQt6.QtWidgets import QApplication
+                if QApplication.activeModalWidget() is None:
+                    self._complete_sketch()
+                return
             elif prefs.matches("sketch_projection_toggle", e):
                 self.toggle_projection(); return
             else:
@@ -975,14 +970,18 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         if self._sketch is not None and ci < len(self._sketch.constraints):
             self._sketch.push_undo_snapshot()
             del self._sketch.constraints[ci]
-            from cad.sketch import SketchEntry
+            from cad.sketch import SketchEntry, LineEntity, ArcEntity
             tmp = SketchEntry.from_sketch_mode(self._sketch)
             if tmp.apply_last_constraint() if tmp.constraints else True:
-                from cad.sketch import LineEntity
                 for i, ent in enumerate(tmp.entities):
                     if isinstance(ent, LineEntity):
                         self._sketch.entities[i].p0 = ent.p0.copy()
                         self._sketch.entities[i].p1 = ent.p1.copy()
+                    elif isinstance(ent, ArcEntity):
+                        self._sketch.entities[i].center      = ent.center.copy()
+                        self._sketch.entities[i].radius      = ent.radius
+                        self._sketch.entities[i].start_angle = ent.start_angle
+                        self._sketch.entities[i].end_angle   = ent.end_angle
             self._rebuild_sketch_faces()
             self.sketch_mode_changed.emit(True)
             self.update()
@@ -1004,7 +1003,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
     def _edit_dimension_label(self, lbl: dict):
         """Re-open the dimension value editor for a label that was clicked."""
         if lbl.get('parallel'):
-            return  # parallel labels are not editable via click
+            return  # geometric labels are not editable via click
+        if self._sketch is None:
+            return  # sketch exited before mouse-release arrived
         from PyQt6.QtWidgets import QInputDialog
         from cad.sketch import SketchConstraint
         from cad.prefs import prefs
@@ -1013,35 +1014,47 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
 
         ci = lbl['constraint_idx']
         ei = lbl['entity_idx']
+        is_diameter = lbl.get('is_diameter', False)
+        con_type    = 'diameter' if is_diameter else 'distance'
+        edit_title  = "Edit Diameter" if is_diameter else "Edit Length"
+        edit_label  = f"Diameter ({unit}):" if is_diameter else f"Length ({unit}):"
 
         def _ask(current_mm):
             return QInputDialog.getDouble(
-                self, "Edit Length", f"Length ({unit}):",
+                self, edit_title, edit_label,
                 from_mm(current_mm, unit), 0.0, 1_000_000, prefs.display_decimals)
 
-        # Determine which constraint list to edit (active sketch or committed).
+        def _make_con(old_con, new_val_mm):
+            return SketchConstraint(con_type, (ei,), new_val_mm,
+                                    label_offset=old_con.label_offset,
+                                    label_angle=getattr(old_con, 'label_angle', None))
+
+        # Active sketch.
         if self._sketch is not None and ci < len(self._sketch.constraints):
             con = self._sketch.constraints[ci]
-            if con.type == 'distance' and con.indices[0] == ei:
+            if con.type == con_type and con.indices[0] == ei:
                 val_disp, ok = _ask(con.value)
                 if ok:
-                    new_con = SketchConstraint('distance', (ei,), to_mm(val_disp, unit),
-                                               label_offset=con.label_offset)
-                    self._sketch.constraints[ci] = new_con
-                    from cad.sketch import SketchEntry
+                    self._sketch.push_undo_snapshot()
+                    self._sketch.constraints[ci] = _make_con(con, to_mm(val_disp, unit))
+                    from cad.sketch import SketchEntry, LineEntity, ArcEntity
                     tmp = SketchEntry.from_sketch_mode(self._sketch)
                     if tmp.apply_last_constraint():
-                        from cad.sketch import LineEntity
                         for i, ent in enumerate(tmp.entities):
                             if isinstance(ent, LineEntity):
                                 self._sketch.entities[i].p0 = ent.p0.copy()
                                 self._sketch.entities[i].p1 = ent.p1.copy()
+                            elif isinstance(ent, ArcEntity):
+                                self._sketch.entities[i].center      = ent.center.copy()
+                                self._sketch.entities[i].radius      = ent.radius
+                                self._sketch.entities[i].start_angle = ent.start_angle
+                                self._sketch.entities[i].end_angle   = ent.end_angle
                     self._rebuild_sketch_faces()
                     self.sketch_mode_changed.emit(True)
                     self.update()
                 return
 
-        # Committed sketch — find the entry that owns this constraint.
+        # Committed sketch.
         for entry in self.history.entries:
             if entry.operation != 'sketch':
                 continue
@@ -1049,13 +1062,11 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             if se is None or ci >= len(se.constraints):
                 continue
             con = se.constraints[ci]
-            if con.type != 'distance' or con.indices[0] != ei:
+            if con.type != con_type or con.indices[0] != ei:
                 continue
             val_disp, ok = _ask(con.value)
             if ok:
-                se.constraints[ci] = SketchConstraint('distance', (ei,),
-                                                       to_mm(val_disp, unit),
-                                                       label_offset=con.label_offset)
+                se.constraints[ci] = _make_con(con, to_mm(val_disp, unit))
                 se.apply_last_constraint()
                 self._rebuild_sketch_faces()
                 self.history_changed.emit()
@@ -1122,6 +1133,16 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         self._drag_line_mid    = lbl['world'] - perp_w * cur_offset
                         self._dragging_label   = lbl
                         self._drag_start_screen = (mx, my)
+                        if lbl.get('is_diameter'):
+                            self._drag_is_diameter      = True
+                            cw = np.array(lbl['chord_world'], dtype=np.float64)
+                            cn = float(np.linalg.norm(cw))
+                            self._drag_chord_world      = cw / cn if cn > 1e-9 else cw
+                            self._drag_arc_center_world = np.array(
+                                lbl['arc_center_world'], dtype=np.float64)
+                            self._drag_arc_radius       = float(lbl['arc_radius'])
+                        else:
+                            self._drag_is_diameter = False
                         return
 
             R = _quat_to_matrix(self.camera.rotation)
@@ -1359,11 +1380,15 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             dy = my - self._drag_start_screen[1]
             if dx * dx + dy * dy < 16:
                 self._edit_dimension_label(self._dragging_label)
-            self._dragging_label   = None
-            self._drag_start_screen = None
-            self._drag_constraint  = None
-            self._drag_perp_world  = None
-            self._drag_line_mid    = None
+            self._dragging_label        = None
+            self._drag_start_screen     = None
+            self._drag_constraint       = None
+            self._drag_perp_world       = None
+            self._drag_line_mid         = None
+            self._drag_is_diameter      = False
+            self._drag_chord_world      = None
+            self._drag_arc_center_world = None
+            self._drag_arc_radius       = None
             return
         if e.button() == Qt.MouseButton.RightButton:
             self.camera.end_orbit()
@@ -1452,41 +1477,78 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self.update()
 
     def _update_dim_drag(self, mx: int, my: int):
-        """Update label_offset on the constraint being dragged."""
+        """Update label_offset (and label_angle for diameter) on the dragged constraint."""
         if self._drag_constraint is None or self._modelview is None:
             return
         from OpenGL.GLU import gluProject
         dpr = self.devicePixelRatio()
 
-        # Project the line_mid and line_mid+perp_w into screen space.
-        # The screen-space direction of perp tells us how mouse delta maps to offset.
-        lm = self._drag_line_mid
-        pw = self._drag_perp_world
-        try:
-            sx0, sy0, _ = gluProject(lm[0], lm[1], lm[2],
-                                     self._modelview, self._projection, self._viewport)
-            sx1, sy1, _ = gluProject(lm[0]+pw[0], lm[1]+pw[1], lm[2]+pw[2],
-                                     self._modelview, self._projection, self._viewport)
-        except Exception:
-            return
-
-        # Screen-space perp direction (pixels per mm).
-        spx = (sx1 - sx0) / dpr
-        spy = -(sy1 - sy0) / dpr  # flip Y: GL bottom=0, Qt top=0
-        screen_perp_len = float(np.sqrt(spx*spx + spy*spy))
-        if screen_perp_len < 1e-3:
-            return
-
-        # Mouse delta from drag start in screen space.
         dx = mx - self._drag_start_screen[0]
         dy = my - self._drag_start_screen[1]
 
-        # Project mouse delta onto screen-space perp direction.
-        dot = (dx * spx + dy * spy) / screen_perp_len
-        # Scale: dot is in pixels, screen_perp_len is pixels-per-mm.
-        new_off = dot / screen_perp_len
+        def _project(pt):
+            return gluProject(pt[0], pt[1], pt[2],
+                              self._modelview, self._projection, self._viewport)
 
-        self._drag_constraint.label_offset = new_off
+        if self._drag_is_diameter:
+            # 2D drag: decompose mouse movement into angular + radial components.
+            # Angular: project delta onto screen-space chord direction.
+            # Radial:  project delta onto screen-space perp (chord_perp) direction.
+            lm  = self._drag_arc_center_world
+            cw  = self._drag_chord_world    # chord direction world unit vector
+            pw  = self._drag_perp_world     # perp to chord, world unit vector
+            try:
+                sx0, sy0, _ = _project(lm)
+                sxc, syc, _ = _project(lm + cw)
+                sxp, syp, _ = _project(lm + pw)
+            except Exception:
+                return
+            # Screen vectors (Qt coords: flip Y).
+            chord_sx = (sxc - sx0) / dpr;  chord_sy = -(syc - sy0) / dpr
+            perp_sx  = (sxp - sx0) / dpr;  perp_sy  = -(syp - sy0) / dpr
+            chord_len = float(np.sqrt(chord_sx**2 + chord_sy**2))
+            perp_len  = float(np.sqrt(perp_sx**2  + perp_sy**2))
+            if chord_len < 1e-3 or perp_len < 1e-3:
+                return
+
+            # Project mouse delta onto each screen-space axis.
+            chord_dot = (dx * chord_sx + dy * chord_sy) / chord_len
+            perp_dot  = (dx * perp_sx  + dy * perp_sy)  / perp_len
+
+            # chord_dot in pixels → angle change: moving 1 radius in screen
+            # space = 90° rotation, so dangle = chord_dot / (r_pixels) * (pi/2).
+            r_mm      = self._drag_arc_radius
+            r_pixels  = chord_len * r_mm   # pixels per mm * radius mm
+            if r_pixels > 1e-3:
+                cur_angle = self._drag_constraint.label_angle or 0.0
+                new_angle = cur_angle - (chord_dot / r_pixels) * (np.pi / 2.0)
+                self._drag_constraint.label_angle = float(new_angle)
+
+            # perp_dot in pixels → radial label offset change (mm).
+            cur_off = self._drag_constraint.label_offset or 0.0
+            new_off = cur_off + perp_dot / perp_len
+            self._drag_constraint.label_offset = float(new_off)
+
+            # Update drag start so next event is a delta, not absolute.
+            self._drag_start_screen = (mx, my)
+
+        else:
+            # Linear dimension: project onto single perp direction.
+            lm = self._drag_line_mid
+            pw = self._drag_perp_world
+            try:
+                sx0, sy0, _ = _project(lm)
+                sx1, sy1, _ = _project(lm + pw)
+            except Exception:
+                return
+            spx = (sx1 - sx0) / dpr
+            spy = -(sy1 - sy0) / dpr
+            screen_perp_len = float(np.sqrt(spx*spx + spy*spy))
+            if screen_perp_len < 1e-3:
+                return
+            dot = (dx * spx + dy * spy) / screen_perp_len
+            self._drag_constraint.label_offset = dot / screen_perp_len
+
         self.update()
 
     def wheelEvent(self, e):

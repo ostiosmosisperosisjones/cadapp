@@ -111,41 +111,68 @@ class SketchModalMixin:
         self.sketch_mode_changed.emit(False)
         if hasattr(self, '_line_hud'):
             self._line_hud.hide()
+        # Clear any pending drag state so stale mouseRelease events don't
+        # attempt to call _edit_dimension_label on a None sketch.
+        self._dragging_label        = None
+        self._drag_start_screen     = None
+        self._drag_constraint       = None
+        self._drag_perp_world       = None
+        self._drag_line_mid         = None
+        self._drag_is_diameter      = False
+        self._drag_chord_world      = None
+        self._drag_arc_center_world = None
+        self._drag_arc_radius       = None
         self.update()
         print("[Sketch] Exited sketch mode.")
 
-    def _on_dimension_requested(self, entity_idx: int, current_len: float):
-        """Show a spinbox for the user to enter a length constraint."""
+    def _on_dimension_requested(self, entity_idx: int, current_val: float,
+                                entity_type: str = 'line'):
+        """Show a spinbox for the user to enter a length or diameter constraint."""
         from PyQt6.QtWidgets import QInputDialog
         from cad.sketch import SketchConstraint
         from cad.prefs import prefs
         from cad.units import from_mm, to_mm
         unit = prefs.default_unit
-        display_len = from_mm(current_len, unit)
+
+        is_arc = (entity_type == 'arc')
+        label  = f"Diameter ({unit}):" if is_arc else f"Length ({unit}):"
+        title  = "Set Diameter" if is_arc else "Set Length"
+        con_type = 'diameter' if is_arc else 'distance'
+
+        display_val = from_mm(current_val, unit)
         val_display, ok = QInputDialog.getDouble(
-            self, "Set Length",
-            f"Length ({unit}):",
-            display_len, 0.0, 1_000_000, prefs.display_decimals,
+            self, title, label,
+            display_val, 0.0, 1_000_000, prefs.display_decimals,
         )
         if not ok:
             return
         val = to_mm(val_display, unit)
-        # Replace any existing distance constraint on this entity.
+
+        self._sketch.push_undo_snapshot()
+        # Replace any existing same-type constraint on this entity.
         self._sketch.constraints = [
             c for c in self._sketch.constraints
-            if not (c.type == 'distance' and c.indices == (entity_idx,))
+            if not (c.type == con_type and c.indices == (entity_idx,))
         ]
         self._sketch.constraints.append(
-            SketchConstraint('distance', (entity_idx,), val)
+            SketchConstraint(con_type, (entity_idx,), val)
         )
-        from cad.sketch import SketchEntry
+        from cad.sketch import SketchEntry, LineEntity, ArcEntity
         tmp = SketchEntry.from_sketch_mode(self._sketch)
         if tmp.apply_all_constraints():
             for i, ent in enumerate(tmp.entities):
-                from cad.sketch import LineEntity
                 if isinstance(ent, LineEntity):
                     self._sketch.entities[i].p0 = ent.p0.copy()
                     self._sketch.entities[i].p1 = ent.p1.copy()
+                elif isinstance(ent, ArcEntity):
+                    self._sketch.entities[i].center      = ent.center.copy()
+                    self._sketch.entities[i].radius      = ent.radius
+                    self._sketch.entities[i].start_angle = ent.start_angle
+                    self._sketch.entities[i].end_angle   = ent.end_angle
+        else:
+            # Solver failed — roll back the constraint and snapshot.
+            self._sketch.constraints.pop()
+            self._sketch._entity_snapshots.pop()
         self._rebuild_sketch_faces()
         self.sketch_mode_changed.emit(True)
         self.update()

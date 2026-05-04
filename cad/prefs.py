@@ -54,8 +54,8 @@ KEYBIND_DEFAULTS: dict[str, str] = {
     "sketch_offset":     "O",
     "sketch_fillet":     "F",
     "sketch_include":    "I",
-    "sketch_dimension":  "Shift+D",
-    "sketch_geometric":  "Shift+P",
+    "sketch_dimension":  "",
+    "sketch_geometric":  "",
     "sketch_commit":     "Return",
     # Sketch mode — snap declarations (take priority over tool switches when tool active)
     "snap_endpoint":     "E",

@@ -1,12 +1,7 @@
 """
 cad/sketch_tools/dimension.py
 
-DimensionTool — click a line to apply a length constraint.
-
-Workflow:
-  1. Shift+D activates the tool.
-  2. Click a LineEntity — a dialog appears with the current length.
-  3. User types a value; constraint is stored and solver runs immediately.
+DimensionTool — click a line or arc/circle to apply a length/diameter constraint.
 """
 
 from __future__ import annotations
@@ -35,25 +30,47 @@ class DimensionTool(BaseTool):
             self._hover_idx = None
             return
         self._cursor_2d = pt.copy()
-        self._hover_idx = _nearest_line(pt, sketch.entities)
+        self._hover_idx = _nearest_dimensionable(pt, sketch.entities)
 
     def handle_click(self, snap_result, sketch) -> bool:
         pt = snap_result.point
         if pt is None:
             return False
-        idx = _nearest_line(pt, sketch.entities)
+        idx = _nearest_dimensionable(pt, sketch.entities)
         if idx is None:
             return False
         if hasattr(sketch, '_dimension_callback') and sketch._dimension_callback:
-            from cad.sketch import LineEntity
+            from cad.sketch import LineEntity, ArcEntity
             ent = sketch.entities[idx]
-            current_len = float(np.linalg.norm(ent.p1 - ent.p0))
-            sketch._dimension_callback(idx, current_len)
+            if isinstance(ent, LineEntity):
+                current_val = float(np.linalg.norm(ent.p1 - ent.p0))
+                sketch._dimension_callback(idx, current_val, 'line')
+            elif isinstance(ent, ArcEntity):
+                current_val = float(ent.radius * 2.0)  # diameter
+                sketch._dimension_callback(idx, current_val, 'arc')
         return True
 
     def cancel(self) -> None:
         self._hover_idx = None
         self._cursor_2d = None
+
+
+def _nearest_dimensionable(pt: np.ndarray, entities, tol: float = 5.0) -> int | None:
+    """Return index of the closest LineEntity or ArcEntity within tol mm, or None."""
+    from cad.sketch import LineEntity, ArcEntity
+    best_idx  = None
+    best_dist = tol
+    for i, ent in enumerate(entities):
+        if isinstance(ent, LineEntity):
+            d = _pt_to_seg_dist(pt, ent.p0, ent.p1)
+        elif isinstance(ent, ArcEntity):
+            d = abs(float(np.linalg.norm(pt - ent.center)) - ent.radius)
+        else:
+            continue
+        if d < best_dist:
+            best_dist = d
+            best_idx  = i
+    return best_idx
 
 
 def _nearest_line(pt: np.ndarray, entities, tol: float = 5.0) -> int | None:

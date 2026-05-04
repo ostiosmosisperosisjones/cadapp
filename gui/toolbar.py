@@ -380,6 +380,94 @@ _SVG_COMMIT = """
             stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>"""
 
+# Constraint icons (blue-ish tint to distinguish from draw tools)
+_SVG_CONSTRAINT_DISTANCE = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <line x1="8" y1="10" x2="28" y2="10" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round"/>
+  <line x1="8" y1="26" x2="28" y2="26" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round"/>
+  <line x1="18" y1="10" x2="18" y2="26" stroke="#64b5f6" stroke-width="1.4"
+        stroke-dasharray="2,2" opacity="0.7"/>
+  <polygon points="18,10 16,14 20,14" fill="#64b5f6"/>
+  <polygon points="18,26 16,22 20,22" fill="#64b5f6"/>
+</svg>"""
+
+_SVG_CONSTRAINT_PARALLEL = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <line x1="6" y1="10" x2="22" y2="28" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round"/>
+  <line x1="14" y1="8" x2="30" y2="26" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round"/>
+</svg>"""
+
+_SVG_CONSTRAINT_PERP = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <line x1="6" y1="30" x2="30" y2="6" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round"/>
+  <line x1="6" y1="6" x2="30" y2="30" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round"/>
+  <rect x="15" y="15" width="6" height="6" fill="none" stroke="#64b5f6"
+        stroke-width="1.4" opacity="0.7"/>
+</svg>"""
+
+_SVG_CONSTRAINT_HORIZ = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <line x1="6" y1="14" x2="30" y2="22" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round" opacity="0.5"/>
+  <line x1="6" y1="18" x2="30" y2="18" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round"/>
+  <line x1="4" y1="18" x2="32" y2="18" stroke="#64b5f6" stroke-width="1"
+        stroke-dasharray="2,3" opacity="0.4"/>
+</svg>"""
+
+_SVG_CONSTRAINT_VERT = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <line x1="14" y1="6" x2="22" y2="30" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round" opacity="0.5"/>
+  <line x1="18" y1="6" x2="18" y2="30" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round"/>
+  <line x1="18" y1="4" x2="18" y2="32" stroke="#64b5f6" stroke-width="1"
+        stroke-dasharray="2,3" opacity="0.4"/>
+</svg>"""
+
+_SVG_CONSTRAINT_EQUAL = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <line x1="8" y1="14" x2="28" y2="14" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round"/>
+  <line x1="8" y1="22" x2="28" y2="22" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round"/>
+</svg>"""
+
+_SVG_CONSTRAINT_DIAMETER = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <circle cx="18" cy="18" r="11" fill="none" stroke="#64b5f6" stroke-width="2"/>
+  <line x1="7" y1="18" x2="29" y2="18" stroke="#64b5f6" stroke-width="1.6"
+        stroke-dasharray="3,2" opacity="0.8"/>
+  <polygon points="7,18 11,16 11,20" fill="#64b5f6"/>
+  <polygon points="29,18 25,16 25,20" fill="#64b5f6"/>
+</svg>"""
+
+_CONSTRAINT_MODES = ['distance', 'diameter', 'equal', 'parallel', 'perpendicular', 'horizontal', 'vertical']
+_CONSTRAINT_LABELS = {
+    'distance':     'Distance (line)',
+    'diameter':     'Diameter (arc/circle)',
+    'equal':        'Equal',
+    'parallel':     'Parallel',
+    'perpendicular':'Perpendicular',
+    'horizontal':   'Horizontal',
+    'vertical':     'Vertical',
+}
+_CONSTRAINT_ICONS = {
+    'distance':     _SVG_CONSTRAINT_DISTANCE,
+    'diameter':     _SVG_CONSTRAINT_DIAMETER,
+    'equal':        _SVG_CONSTRAINT_EQUAL,
+    'parallel':     _SVG_CONSTRAINT_PARALLEL,
+    'perpendicular':_SVG_CONSTRAINT_PERP,
+    'horizontal':   _SVG_CONSTRAINT_HORIZ,
+    'vertical':     _SVG_CONSTRAINT_VERT,
+}
+
 _SKETCH_TOOLBAR_STYLE = """
 QToolBar {
     background: #1a2a1a;
@@ -439,8 +527,9 @@ class SketchToolbar(QToolBar):
     tool_divide_requested  = pyqtSignal()
     tool_fillet_requested  = pyqtSignal()
     tool_offset_requested  = pyqtSignal()
-    tool_include_requested = pyqtSignal()
-    commit_requested       = pyqtSignal()
+    tool_include_requested     = pyqtSignal()
+    tool_constraint_requested  = pyqtSignal(str)   # emits constraint mode
+    commit_requested           = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__("Sketch Tools", parent)
@@ -479,6 +568,12 @@ class SketchToolbar(QToolBar):
         self._btn_include = self._add_btn(
             "Include  I", _SVG_INCLUDE, self.tool_include_requested,
             "Include geometry  (I)")
+
+        self._add_separator()
+
+        # Constraint button with drop-down for sub-type
+        self._btn_constraint = self._make_constraint_btn()
+        self.addWidget(self._btn_constraint)
 
         # Spacer
         spacer = QWidget()
@@ -533,6 +628,36 @@ class SketchToolbar(QToolBar):
         self._circle_mode = mode
         self.tool_circle_requested.emit(mode)
 
+    def _make_constraint_btn(self) -> QToolButton:
+        btn = QToolButton(self)
+        self._constraint_mode = 'distance'
+        btn.setText("Constrain")
+        btn.setIcon(_svg_icon(_CONSTRAINT_ICONS[self._constraint_mode]))
+        btn.setToolTip("Constraints — click arrow for type  (Shift+P)")
+        btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+
+        menu = QMenu(btn)
+        self._constraint_actions = {}
+        for mode in _CONSTRAINT_MODES:
+            act = menu.addAction(_CONSTRAINT_LABELS[mode])
+            act.setCheckable(True)
+            act.setData(mode)
+            act.triggered.connect(lambda checked, m=mode: self._set_constraint_mode(m))
+            self._constraint_actions[mode] = act
+        self._constraint_actions[self._constraint_mode].setChecked(True)
+
+        btn.setMenu(menu)
+        btn.clicked.connect(
+            lambda: self.tool_constraint_requested.emit(self._constraint_mode))
+        return btn
+
+    def _set_constraint_mode(self, mode: str):
+        for m, act in self._constraint_actions.items():
+            act.setChecked(m == mode)
+        self._constraint_mode = mode
+        self._btn_constraint.setIcon(_svg_icon(_CONSTRAINT_ICONS[mode]))
+        self.tool_constraint_requested.emit(mode)
+
     def _add_separator(self):
         sep = QFrame(self)
         sep.setFrameShape(QFrame.Shape.VLine)
@@ -543,18 +668,20 @@ class SketchToolbar(QToolBar):
     def set_active_tool(self, tool_name: str | None):
         """Highlight the button matching the active tool."""
         mapping = {
-            "LINE":   self._btn_line,
-            "ARC3":   self._btn_arc,
-            "CIRCLE": self._btn_circle,
-            "TRIM":   self._btn_trim,
-            "DIVIDE": self._btn_divide,
-            "FILLET": self._btn_fillet,
-            "OFFSET": self._btn_offset,
-            "NONE":   None,
+            "LINE":      self._btn_line,
+            "ARC3":      self._btn_arc,
+            "CIRCLE":    self._btn_circle,
+            "TRIM":      self._btn_trim,
+            "DIVIDE":    self._btn_divide,
+            "FILLET":    self._btn_fillet,
+            "OFFSET":    self._btn_offset,
+            "DIMENSION": self._btn_constraint,
+            "GEOMETRIC": self._btn_constraint,
+            "NONE":      None,
         }
         for btn in [self._btn_line, self._btn_arc, self._btn_circle,
                     self._btn_trim, self._btn_divide, self._btn_fillet,
-                    self._btn_offset, self._btn_include]:
+                    self._btn_offset, self._btn_include, self._btn_constraint]:
             btn.setChecked(False)
         active = mapping.get(tool_name or "NONE")
         if active is not None:

@@ -14,12 +14,27 @@ from cad.sketch_tools.base import BaseTool
 from cad.sketch_tools.dimension import _nearest_line
 
 
-MODES = ['parallel', 'perpendicular', 'horizontal', 'vertical']
+MODES = ['parallel', 'perpendicular', 'horizontal', 'vertical', 'equal']
+
+
+def _writeback_entities(sketch, tmp):
+    """Copy solved line and arc coordinates from tmp back to sketch."""
+    from cad.sketch import LineEntity, ArcEntity
+    for i, ent in enumerate(tmp.entities):
+        if isinstance(ent, LineEntity):
+            sketch.entities[i].p0 = ent.p0.copy()
+            sketch.entities[i].p1 = ent.p1.copy()
+        elif isinstance(ent, ArcEntity):
+            sketch.entities[i].center      = ent.center.copy()
+            sketch.entities[i].radius      = ent.radius
+            sketch.entities[i].start_angle = ent.start_angle
+            sketch.entities[i].end_angle   = ent.end_angle
 MODE_LABELS = {
     'parallel':      'PARALLEL  (Tab→)',
     'perpendicular': 'PERP  (Tab→)',
     'horizontal':    'HORIZONTAL  (Tab→)',
     'vertical':      'VERTICAL  (Tab→)',
+    'equal':         'EQUAL  (Tab→)',
 }
 
 
@@ -75,11 +90,7 @@ class GeometricConstraintTool(BaseTool):
             sketch.constraints.append(SketchConstraint(self._mode, (idx,), 0.0))
             tmp = SketchEntry.from_sketch_mode(sketch)
             if tmp.apply_all_constraints():
-                from cad.sketch import LineEntity
-                for i, ent in enumerate(tmp.entities):
-                    if isinstance(ent, LineEntity):
-                        sketch.entities[i].p0 = ent.p0.copy()
-                        sketch.entities[i].p1 = ent.p1.copy()
+                _writeback_entities(sketch, tmp)
             else:
                 sketch.constraints.pop()
                 sketch._entity_snapshots.pop()
@@ -102,11 +113,7 @@ class GeometricConstraintTool(BaseTool):
         )
         tmp = SketchEntry.from_sketch_mode(sketch)
         if tmp.apply_all_constraints():
-            from cad.sketch import LineEntity
-            for i, ent in enumerate(tmp.entities):
-                if isinstance(ent, LineEntity):
-                    sketch.entities[i].p0 = ent.p0.copy()
-                    sketch.entities[i].p1 = ent.p1.copy()
+            _writeback_entities(sketch, tmp)
         else:
             sketch.constraints.pop()
             sketch._entity_snapshots.pop()

@@ -1036,11 +1036,110 @@ class SketchOverlay:
                 'constraints':    constraints,  # reference for live update
             })
 
+        # Diameter constraint annotations — full chord across circle, draggable.
+        from cad.sketch import ArcEntity as _AE
+        from cad.prefs import prefs
+        from cad.units import format_value
+        for ci, con in enumerate(constraints):
+            if con.type != 'diameter':
+                continue
+            ei = con.indices[0]
+            if ei >= len(entities):
+                continue
+            ent = entities[ei]
+            if not isinstance(ent, _AE):
+                continue
+
+            cx, cy = float(ent.center[0]), float(ent.center[1])
+            r      = float(ent.radius)
+            angle  = float(con.label_angle) if con.label_angle is not None else 0.0
+            # Radial offset beyond circle edge (positive = outside).
+            radial_off = float(con.label_offset) if con.label_offset is not None \
+                         else default_offset
+
+            cos_a, sin_a = float(np.cos(angle)), float(np.sin(angle))
+            chord_dir  = np.array([cos_a, sin_a])
+            chord_perp = np.array([-sin_a, cos_a])  # 90° CCW from chord
+
+            # Chord endpoints on circle.
+            q0 = np.array([cx, cy]) - chord_dir * r
+            q1 = np.array([cx, cy]) + chord_dir * r
+
+            # If label_offset != 0, the chord shifts perpendicular to itself
+            # (like a linear dimension) so the label sits outside the circle.
+            chord_shift = radial_off  # mm perpendicular to chord direction
+            d0 = q0 + chord_perp * chord_shift
+            d1 = q1 + chord_perp * chord_shift
+
+            alpha = 0.25 if dimmed else 0.90
+            glColor4f(0.35, 0.70, 1.00, alpha)
+
+            # Extension lines from circle edge to shifted chord line.
+            ext_gap    = abs(chord_shift) * 0.15
+            ext_beyond = abs(chord_shift) * 0.15
+            ext_dir    = np.sign(chord_shift) * chord_perp if chord_shift != 0 \
+                         else chord_perp
+
+            glBegin(GL_LINES)
+            if abs(chord_shift) > 1e-3:
+                glVertex3f(*_v3(to_3d(*(q0 + ext_dir * ext_gap))))
+                glVertex3f(*_v3(to_3d(*(d0 + ext_dir * ext_beyond))))
+                glVertex3f(*_v3(to_3d(*(q1 + ext_dir * ext_gap))))
+                glVertex3f(*_v3(to_3d(*(d1 + ext_dir * ext_beyond))))
+            glVertex3f(*_v3(to_3d(*d0)))
+            glVertex3f(*_v3(to_3d(*d1)))
+            glEnd()
+
+            # Arrowheads pointing inward along chord.
+            for tip, away in ((d0, chord_dir), (d1, -chord_dir)):
+                base_centre = tip + away * arrow_size
+                base_half   = chord_perp * (arrow_size * 0.35)
+                glBegin(GL_TRIANGLES)
+                glVertex3f(*_v3(to_3d(*tip)))
+                glVertex3f(*_v3(to_3d(*(base_centre + base_half))))
+                glVertex3f(*_v3(to_3d(*(base_centre - base_half))))
+                glEnd()
+
+            # Label at midpoint of chord line.
+            mid_uv = (d0 + d1) * 0.5
+            mid_3d = to_3d(*mid_uv)
+
+            # perp_world for radial (in/out) drag — perpendicular to chord.
+            perp_uv_for_drag = chord_perp
+            perp_world_for_drag = (np.array(_v3(to_3d(*perp_uv_for_drag))) -
+                                   np.array(_v3(to_3d(0.0, 0.0))))
+
+            # chord_world for angular drag — along the chord direction.
+            chord_world = (np.array(_v3(to_3d(*chord_dir))) -
+                           np.array(_v3(to_3d(0.0, 0.0))))
+
+            labels.append({
+                'world':            np.array([float(mid_3d[0]), float(mid_3d[1]),
+                                              float(mid_3d[2])]),
+                'text':             'ø' + format_value(con.value, prefs.default_unit,
+                                                       prefs.display_decimals),
+                'constraint_idx':   ci,
+                'entity_idx':       ei,
+                'dimmed':           dimmed,
+                'constraints':      constraints,
+                # Drag geometry.
+                'perp_world':       perp_world_for_drag,
+                'perp_uv':          perp_uv_for_drag,
+                'p0_uv':            mid_uv,
+                # Diameter-specific drag data.
+                'is_diameter':      True,
+                'chord_world':      chord_world,
+                'chord_dir_uv':     chord_dir,
+                'arc_center_uv':    np.array([cx, cy]),
+                'arc_radius':       r,
+                'arc_center_world': np.array(_v3(to_3d(cx, cy))),
+            })
+
         # Parallel constraint labels — "||" floating at each line's midpoint.
         # Group by constraint so paired lines share the same label index.
         from cad.sketch import LineEntity as _LE
         for ci, con in enumerate(constraints):
-            if con.type not in ('parallel', 'perpendicular', 'horizontal', 'vertical'):
+            if con.type not in ('parallel', 'perpendicular', 'horizontal', 'vertical', 'equal'):
                 continue
             for ei in con.indices:
                 if ei >= len(entities) or not isinstance(entities[ei], _LE):
@@ -1060,7 +1159,8 @@ class SketchOverlay:
                     'world':          np.array([float(mid_3d[0]), float(mid_3d[1]),
                                                 float(mid_3d[2])]),
                     'text':           {'parallel': '||', 'perpendicular': '⊥',
-                                       'horizontal': '—', 'vertical': '|'
+                                       'horizontal': '—', 'vertical': '|',
+                                       'equal': '='
                                        }.get(con.type, con.type),
                     'constraint_idx': ci,
                     'entity_idx':     ei,

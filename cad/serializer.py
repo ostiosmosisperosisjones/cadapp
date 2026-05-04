@@ -217,6 +217,8 @@ def _constraint_to_dict(c) -> dict:
     }
     if c.label_offset is not None:
         d["label_offset"] = c.label_offset
+    if getattr(c, 'label_angle', None) is not None:
+        d["label_angle"] = c.label_angle
     return d
 
 
@@ -227,6 +229,7 @@ def _constraint_from_dict(d: dict):
         indices      = tuple(d["indices"]),
         value        = float(d["value"]),
         label_offset = d.get("label_offset"),
+        label_angle  = d.get("label_angle"),
     )
 
 
