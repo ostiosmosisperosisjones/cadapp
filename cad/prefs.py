@@ -41,6 +41,7 @@ KEYBIND_DEFAULTS: dict[str, str] = {
     # 3D mode
     "extrude":           "E",
     "thicken":           "T",
+    "fillet":            "F",
     "undo":              "Ctrl+Z",
     "redo":              "Ctrl+Y",
     "projection_toggle": "",
@@ -56,14 +57,15 @@ KEYBIND_DEFAULTS: dict[str, str] = {
     "sketch_include":    "I",
     "sketch_dimension":  "",
     "sketch_geometric":  "",
+    "sketch_square":     "S",
     "sketch_commit":     "Return",
     # Sketch mode — snap declarations (take priority over tool switches when tool active)
     "snap_endpoint":     "E",
     "snap_midpoint":     "M",
     "snap_center":       "C",
     "snap_nearest":      "N",
-    "snap_tangent":         "T",
-    "snap_intersection":    "I",
+    "snap_tangent":      "T",
+    "snap_intersection": "I",
     # Sketch mode — constrained line shortcuts
     "sketch_hline":      "H",
     "sketch_vline":      "V",
@@ -71,10 +73,26 @@ KEYBIND_DEFAULTS: dict[str, str] = {
     "sketch_projection_toggle": "",
 }
 
+# Actions that are only active in 3D mode (no sketch open)
+KEYBINDS_3D: frozenset[str] = frozenset({
+    "extrude", "thicken", "fillet", "undo", "redo", "projection_toggle",
+})
+
+# Actions that are only active in sketch mode
+KEYBINDS_SKETCH: frozenset[str] = frozenset({
+    "sketch_line", "sketch_arc", "sketch_circle", "sketch_trim",
+    "sketch_divide", "sketch_point", "sketch_offset", "sketch_fillet",
+    "sketch_include", "sketch_dimension", "sketch_geometric", "sketch_square",
+    "sketch_commit", "snap_endpoint", "snap_midpoint", "snap_center",
+    "snap_nearest", "snap_tangent", "snap_intersection",
+    "sketch_hline", "sketch_vline", "sketch_projection_toggle",
+})
+
 # Human-readable labels: action → (section, label)
 KEYBIND_LABELS: dict[str, tuple[str, str]] = {
     "extrude":                  ("3D Mode",    "Extrude selected face"),
     "thicken":                  ("3D Mode",    "Thicken active body"),
+    "fillet":                  ("3D Mode",    "Fillet selected edges"),
     "undo":                     ("3D Mode",    "Undo"),
     "redo":                     ("3D Mode",    "Redo"),
     "projection_toggle":        ("3D Mode",    "Toggle ortho/perspective"),
@@ -89,6 +107,7 @@ KEYBIND_LABELS: dict[str, tuple[str, str]] = {
     "sketch_include":           ("Sketch",     "Include geometry"),
     "sketch_dimension":         ("Sketch",     "Dimension tool (length constraint)"),
     "sketch_geometric":         ("Sketch",     "Geometric constraint tool"),
+    "sketch_square":            ("Sketch",     "Square tool (2-point)"),
     "snap_endpoint":            ("Sketch",     "Force snap: endpoint"),
     "snap_midpoint":            ("Sketch",     "Force snap: midpoint"),
     "snap_center":              ("Sketch",     "Force snap: center"),

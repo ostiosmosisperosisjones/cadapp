@@ -24,7 +24,8 @@ from cad.sketch_tools.fillet    import FilletTool
 from cad.sketch_tools.include   import IncludeTool
 from cad.sketch_tools.dimension import DimensionTool
 from cad.sketch_tools.geometric import GeometricConstraintTool
-from cad.sketch_tools.snap      import SnapEngine, SnapResult, SnapType
+from cad.sketch_tools.square  import SquareTool
+from cad.sketch_tools.snap    import SnapEngine, SnapResult, SnapType
 
 from cad.sketch import SketchTool
 
@@ -33,6 +34,7 @@ TOOLS: dict[SketchTool, type[BaseTool]] = {
     SketchTool.LINE:      LineTool,
     SketchTool.ARC3:      Arc3Tool,
     SketchTool.CIRCLE:    CircleTool,
+    SketchTool.SQUARE:    SquareTool,
     SketchTool.TRIM:      TrimTool,
     SketchTool.DIVIDE:    DivideTool,
     SketchTool.POINT:     PointTool,

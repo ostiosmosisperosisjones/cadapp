@@ -1,7 +1,7 @@
 """
 gui/fillet_panel.py
 
-FilletPanel — small floating panel for fillet radius input.
+FilletPanel — small floating panel for the 2D sketch fillet tool.
 """
 
 from __future__ import annotations
@@ -42,11 +42,10 @@ class FilletPanel(QWidget):
         self.setFixedWidth(220)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._corner = None
-        self._tool   = None   # FilletTool reference for live preview
+        self._tool   = None
         self._build_ui()
 
     def set_corner(self, corner: tuple, tool=None):
-        """Supply the selected corner so live validation and preview can run."""
         self._corner = corner
         self._tool   = tool
         self._validate()
@@ -86,13 +85,13 @@ class FilletPanel(QWidget):
         self._ok_btn = QPushButton("OK")
         self._ok_btn.setObjectName("ok")
         self._ok_btn.clicked.connect(self._on_ok)
+        self._ok_btn.setEnabled(False)
         btns.addWidget(cancel)
         btns.addWidget(self._ok_btn)
         root.addLayout(btns)
 
     def _on_radius_changed(self, _):
         self._validate()
-        # Repaint viewport so preview arc updates
         vp = self.parent()
         if vp is not None:
             vp.update()
@@ -123,7 +122,7 @@ class FilletPanel(QWidget):
         self._ok_btn.setEnabled(True)
         if self._tool is not None:
             self._tool.preview_radius = radius
-            self._tool._refresh_results(radius)  # resets idx to 0 on radius change
+            self._tool._refresh_results(radius)
             self._flip_btn.setEnabled(len(self._tool._all_results) > 1)
 
     def _set_invalid(self, msg: str):

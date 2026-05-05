@@ -35,6 +35,7 @@ class MainWindow(QMainWindow):
         self._ops_toolbar = OpsToolbar(self)
         self._ops_toolbar.extrude_requested.connect(self._toolbar_extrude)
         self._ops_toolbar.thicken_requested.connect(self._toolbar_thicken)
+        self._ops_toolbar.fillet_requested.connect(self._toolbar_fillet)
         self._ops_toolbar.sketch_requested.connect(self._toolbar_sketch)
         self._ops_toolbar.revolve_requested.connect(self._toolbar_revolve)
         self.addToolBar(self._ops_toolbar)
@@ -44,6 +45,8 @@ class MainWindow(QMainWindow):
             lambda: self._sketch_set_tool("LINE"))
         self._sketch_toolbar.tool_arc_requested.connect(
             lambda: self._sketch_set_tool("ARC3"))
+        self._sketch_toolbar.tool_square_requested.connect(
+            lambda: self._sketch_set_tool("SQUARE"))
         self._sketch_toolbar.tool_circle_requested.connect(
             self._sketch_set_circle)
         self._sketch_toolbar.tool_trim_requested.connect(
@@ -146,6 +149,14 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Select a face first.", 3000)
             return
         self._viewport._try_thicken()
+
+    def _toolbar_fillet(self):
+        if not self._viewport:
+            return
+        if self._viewport.selection.face_count == 0:
+            self.statusBar().showMessage("Select a face first.", 3000)
+            return
+        self._viewport._try_fillet()
 
     def _toolbar_revolve(self):
         if not self._viewport:
@@ -263,6 +274,7 @@ class MainWindow(QMainWindow):
                 SketchTool.TRIM:   "TRIM — click segment to remove",
                 SketchTool.DIVIDE: "DIVIDE — click entity to split",
                 SketchTool.FILLET:    "FILLET — click corner",
+                SketchTool.SQUARE:    "SQUARE — click two corners",
                 SketchTool.OFFSET:    "OFFSET — click entity or loop",
                 SketchTool.POINT:     "POINT — click to place",
                 SketchTool.DIMENSION: "DIMENSION — click a line",
@@ -562,6 +574,7 @@ class MainWindow(QMainWindow):
         sidebar.history_panel.reopen_extrude_requested.connect(vp.reopen_extrude)
         sidebar.history_panel.reopen_thicken_requested.connect(vp.reopen_thicken)
         sidebar.history_panel.reopen_revolve_requested.connect(vp.reopen_revolve)
+        sidebar.history_panel.reopen_fillet_requested.connect(vp.reopen_fillet)
         sidebar.history_panel.delete_requested.connect(vp.do_delete)
         sidebar.history_panel.reorder_requested.connect(vp.do_reorder)
         sidebar.plane_visibility_changed.connect(vp.set_world_plane_visible)

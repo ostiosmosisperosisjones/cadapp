@@ -33,12 +33,13 @@ from viewer.vp_revolve import RevolveMixin
 from viewer.vp_async import AsyncOpMixin
 from viewer.vp_offset import VpOffsetMixin
 from viewer.vp_fillet import VpFilletMixin
+from viewer.vp_fillet3d import Fillet3DMixin
 from cad.workspace import Workspace
 from cad.history import History
 from cad.selection import SelectionSet
 
 
-class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, ExtrudeMixin, ThickenMixin, RevolveMixin, VpOffsetMixin, VpFilletMixin, QOpenGLWidget):
+class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, ExtrudeMixin, ThickenMixin, RevolveMixin, VpOffsetMixin, VpFilletMixin, Fillet3DMixin, QOpenGLWidget):
     history_changed     = pyqtSignal()
     selection_changed   = pyqtSignal()
     sketch_mode_changed = pyqtSignal(bool)
@@ -138,9 +139,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     getattr(self, '_line_hud', None) is not None and
                     self._line_hud.isVisible()):
                 return False
-            # Only intercept if the key matches a bound action
-            from cad.prefs import prefs, KEYBIND_DEFAULTS
-            if not any(prefs.matches(action, e) for action in KEYBIND_DEFAULTS):
+            # Only intercept if the key matches a bound action for the current mode
+            from cad.prefs import prefs, KEYBINDS_3D, KEYBINDS_SKETCH
+            active_binds = KEYBINDS_SKETCH if self._sketch is not None else KEYBINDS_3D
+            if not any(prefs.matches(action, e) for action in active_binds):
                 return False
             # Don't steal bound keys from actual text fields (HUD fields, search bars)
             if isinstance(focused, (QLineEdit, QTextEdit)):
@@ -365,6 +367,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._draw_extrude_preview()
         self._draw_thicken_preview()
         self._draw_revolve_preview()
+        self._draw_fillet3d_preview()
 
         self._dim_labels = draw_overlays(visible, self.selection,
                       self._hovered_vertex, self._hovered_edge,
@@ -807,6 +810,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             elif prefs.matches("sketch_arc", e):
                 self._close_offset_panel()
                 self._sketch.set_tool(SketchTool.ARC3)
+            elif prefs.matches("sketch_square", e):
+                self._close_offset_panel()
+                self._sketch.set_tool(SketchTool.SQUARE)
             elif prefs.matches("sketch_circle", e):
                 self._close_offset_panel()
                 self._sketch.set_tool(SketchTool.CIRCLE)
@@ -864,6 +870,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             if getattr(self, '_fillet_panel', None) is not None:
                 self._close_fillet_panel()
                 return
+            if getattr(self, '_fillet3d_panel', None) is not None:
+                self._close_fillet3d_panel()
+                return
             if getattr(self, '_offset_panel', None) is not None:
                 self._close_offset_panel()
                 return
@@ -883,6 +892,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             self._try_extrude()
         elif prefs.matches("thicken", e):
             self._try_thicken()
+        elif prefs.matches("fillet", e):
+            self._try_fillet()
         else:
             super().keyPressEvent(e)
 
@@ -1262,6 +1273,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         return
 
                 body_id, idx = self._pick_at(e.position())
+                if idx is not None and self.route_face_pick_for_fillet3d(body_id, idx):
+                    return
                 if idx is not None and self.route_face_pick_for_thicken(body_id, idx):
                     return
                 if idx is not None and self.route_face_pick_for_extrude(body_id, idx):

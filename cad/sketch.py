@@ -39,6 +39,7 @@ class SketchTool(Enum):
     FILLET    = auto()
     DIMENSION = auto()
     GEOMETRIC = auto()
+    SQUARE    = auto()
 
 
 # ---------------------------------------------------------------------------

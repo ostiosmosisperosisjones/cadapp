@@ -368,6 +368,9 @@ class SketchOverlay:
         elif sketch.tool == SketchTool.FILLET:
             self._draw_fillet_preview(sketch)
 
+        elif sketch.tool == SketchTool.SQUARE:
+            self._draw_square_preview(sketch)
+
         glLineWidth(1.0)
 
     def _draw_arc_preview(self, sketch: SketchMode):
@@ -499,6 +502,54 @@ class SketchOverlay:
 
         glLineWidth(1.0)
         glDisable(GL_BLEND)
+
+    def _draw_square_preview(self, sketch: SketchMode):
+        """Draw a 2-point square preview when the first corner is set."""
+        from cad.sketch_tools.square import SquareTool
+        tool = sketch._active_tool
+        if not isinstance(tool, SquareTool):
+            return
+
+        r, g, b = prefs.sketch_preview_color
+        glColor3f(r, g, b)
+        glLineWidth(1.6)
+
+        p1 = tool.square_p1
+        cur = tool.cursor_2d
+        if p1 is None or cur is None:
+            return
+
+        x0, y0 = float(p1[0]), float(p1[1])
+        x1, y1 = float(cur[0]), float(cur[1])
+
+        # Square vertices in sketch (u, v) space
+        a = (x0, y0)
+        b = (x1, y0)
+        c = (x1, y1)
+        d = (x0, y1)
+
+        # Draw 4 edges
+        glBegin(GL_LINE_STRIP)
+        glVertex3f(*self._pt(sketch.plane, a[0], a[1]))
+        glVertex3f(*self._pt(sketch.plane, b[0], b[1]))
+        glVertex3f(*self._pt(sketch.plane, c[0], c[1]))
+        glVertex3f(*self._pt(sketch.plane, d[0], d[1]))
+        glVertex3f(*self._pt(sketch.plane, a[0], a[1]))
+        glEnd()
+
+        # Corner dot at first corner
+        glPointSize(5.0)
+        glBegin(GL_POINTS)
+        glVertex3f(*self._pt(sketch.plane, a[0], a[1]))
+        glEnd()
+        glPointSize(1.0)
+
+        # Corner dot at opposite corner
+        glPointSize(5.0)
+        glBegin(GL_POINTS)
+        glVertex3f(*self._pt(sketch.plane, c[0], c[1]))
+        glEnd()
+        glPointSize(1.0)
 
     def _draw_circle_preview(self, sketch: SketchMode):
         from cad.sketch_tools.circle import CircleTool

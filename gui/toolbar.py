@@ -224,6 +224,7 @@ class OpsToolbar(QToolBar):
     thicken_requested = pyqtSignal()
     sketch_requested  = pyqtSignal()
     revolve_requested = pyqtSignal()
+    fillet_requested  = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__("Operations", parent)
@@ -256,9 +257,10 @@ class OpsToolbar(QToolBar):
         self._btn_loft     = self._add_stub("Loft",     _SVG_LOFT,     "Loft between two or more profiles  [not yet implemented]")
         self._btn_draft    = self._add_stub("Draft",    _SVG_DRAFT,    "Apply a draft angle to faces  [not yet implemented]")
 
-        self._add_separator()
+        self._btn_fillet   = self._add_op_button(
+            "Fillet", _SVG_FILLET, self.fillet_requested,
+            "Fillet selected edges  (F)")
 
-        self._btn_fillet   = self._add_stub("Fillet",   _SVG_FILLET,   "Round selected edges  [not yet implemented]")
         self._btn_chamfer  = self._add_stub("Chamfer",  _SVG_CHAMFER,  "Bevel selected edges  [not yet implemented]")
 
         self._add_separator()
@@ -297,6 +299,7 @@ class OpsToolbar(QToolBar):
         self._btn_extrude.setEnabled(enabled)
         self._btn_thicken.setEnabled(enabled)
         self._btn_revolve.setEnabled(enabled)
+        self._btn_fillet.setEnabled(enabled)
         # other stubs stay disabled always
 
 
@@ -378,6 +381,14 @@ _SVG_COMMIT = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
   <polyline points="6,18 14,27 30,9" fill="none" stroke="#66bb6a"
             stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"""
+
+_SVG_SQUARE = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <rect x="8" y="8" width="20" height="20" rx="1"
+        fill="none" stroke="#ffb74d" stroke-width="2.2"/>
+  <circle cx="8" cy="8" r="2.5" fill="#ffb74d" opacity="0.8"/>
+  <circle cx="28" cy="28" r="2.5" fill="#ffb74d" opacity="0.8"/>
 </svg>"""
 
 # Constraint icons (blue-ish tint to distinguish from draw tools)
@@ -522,6 +533,7 @@ class SketchToolbar(QToolBar):
     """
     tool_line_requested    = pyqtSignal()
     tool_arc_requested     = pyqtSignal()
+    tool_square_requested  = pyqtSignal()
     tool_circle_requested  = pyqtSignal(str)   # emits CircleMode value
     tool_trim_requested    = pyqtSignal()
     tool_divide_requested  = pyqtSignal()
@@ -547,6 +559,9 @@ class SketchToolbar(QToolBar):
             "Line  L", _SVG_LINE, self.tool_line_requested, "Line tool  (L)")
         self._btn_arc  = self._add_btn(
             "Arc  A",  _SVG_ARC,  self.tool_arc_requested,  "3-point arc  (A)")
+        self._btn_square = self._add_btn(
+            "Square  S", _SVG_SQUARE, self.tool_square_requested,
+            "2-point square  (S)")
 
         # Circle button with drop-down corner menu for sub-mode
         self._btn_circle = self._make_circle_btn()
@@ -670,6 +685,7 @@ class SketchToolbar(QToolBar):
         mapping = {
             "LINE":      self._btn_line,
             "ARC3":      self._btn_arc,
+            "SQUARE":     self._btn_square,
             "CIRCLE":    self._btn_circle,
             "TRIM":      self._btn_trim,
             "DIVIDE":    self._btn_divide,

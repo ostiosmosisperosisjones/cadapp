@@ -5,6 +5,7 @@ Re-exports all operation types and the dispatch table.
 Implementation lives in:
   cad/op_base.py             — Op base class, _push_result()
   cad/op_extrude.py          — FaceExtrudeOp, CrossBodyCutOp, SketchExtrudeOp, SketchOp, ImportOp
+  cad/op_fillet.py           — FaceFilletOp
   cad/op_revolve_thicken.py  — ThickenOp, FaceRevolveOp, SketchRevolveOp
 """
 
@@ -16,6 +17,7 @@ from cad.op_extrude import (
     SketchOp,
     ImportOp,
 )
+from cad.op_fillet import FaceFilletOp
 from cad.op_revolve_thicken import (
     ThickenOp,
     FaceRevolveOp,
@@ -41,6 +43,7 @@ _FROM_PARAMS: dict[str, Any] = {
     "sketch":  lambda op, p: SketchOp._from_params(p),
     "import":  lambda op, p: ImportOp._from_params(p),
     "thicken": lambda op, p: ThickenOp._from_params(p),
+    "fillet":  lambda op, p: FaceFilletOp._from_params(p),
     "revolve": lambda op, p: (FaceRevolveOp._from_params(p)
                                if "source_body_id" in p
                                else SketchRevolveOp._from_params(p)),
@@ -49,6 +52,7 @@ _FROM_PARAMS: dict[str, Any] = {
 __all__ = [
     "Op", "_push_result",
     "FaceExtrudeOp", "CrossBodyCutOp", "SketchExtrudeOp", "SketchOp", "ImportOp",
+    "FaceFilletOp",
     "ThickenOp", "FaceRevolveOp", "SketchRevolveOp",
     "_FROM_PARAMS", "_extrude_or_cut_from_params",
 ]

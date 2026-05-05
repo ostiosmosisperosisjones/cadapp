@@ -13,6 +13,7 @@ Adding a new operation:
 """
 
 from cad.operations.extrude import extrude_face, extrude_face_direct
+from cad.operations.fillet import fillet_face
 
 # ---------------------------------------------------------------------------
 # Execution registry
@@ -26,11 +27,11 @@ REGISTRY: dict[str, callable] = {
                    shape, face_idx,  params["distance"]),
     "cut":     lambda shape, face_idx, params: extrude_face(
                    shape, face_idx, -abs(params["distance"])),
+    "fillet":  lambda shape, face_idx, params: fillet_face(
+                   shape, face_idx, params["radius"]),
     # "sketch" is intentionally absent — it is a no-op on geometry,
     # replay just carries shape_before forward unchanged.
     # Future:
-    # "fillet":  lambda shape, face_idx, params: fillet_face(
-    #                shape, face_idx, params["radius"]),
     # "revolve": lambda shape, face_idx, params: revolve_face(
     #                shape, face_idx, params["angle"]),
 }
@@ -50,6 +51,9 @@ EDIT_SCHEMA: dict[str, list[tuple]] = {
     ],
     "cut": [
         ("distance", "Depth", float, 0.001, 1000.0, 3, "length"),
+    ],
+    "fillet": [
+        ("radius", "Radius", float, 0.001, 1000.0, 3, None),
     ],
 }
 # Schema tuple: (param_key, label, type, min, max, decimals, kind)
