@@ -50,6 +50,7 @@ _LABELS = {
     'vertex_hovered_color':    ('Selection', 'Hovered vertex color'),
     'vertex_selected_color':   ('Selection', 'Selected vertex color'),
     'op_preview_color':        ('Operations', '3D operation preview color'),
+    'op_preview_opacity':      ('Operations', '3D operation preview opacity (0–1)'),
     'sketch_line_color':       ('Sketch',    'Sketch line color'),
     'sketch_reference_color':  ('Sketch',    'Reference geometry color'),
     'sketch_preview_color':    ('Sketch',    'Preview line color'),
@@ -195,9 +196,14 @@ class PrefsDialog(QDialog):
             elif isinstance(val, float):
                 sp = QDoubleSpinBox()
                 sp.setDecimals(2)
-                sp.setMinimum(0.1)
-                sp.setMaximum(20.0)
-                sp.setSingleStep(0.1)
+                if key.endswith('_opacity'):
+                    sp.setMinimum(0.0)
+                    sp.setMaximum(1.0)
+                    sp.setSingleStep(0.05)
+                else:
+                    sp.setMinimum(0.1)
+                    sp.setMaximum(20.0)
+                    sp.setSingleStep(0.1)
                 sp.setValue(val)
                 sp.setFixedWidth(80)
                 sp.setProperty('pref_key', key)

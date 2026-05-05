@@ -172,6 +172,7 @@ class Prefs:
     # 3D operation preview
     # ------------------------------------------------------------------
     op_preview_color:       Color3 = field(default_factory=lambda: _p(0.55, 0.25, 0.85))
+    op_preview_opacity:     float  = 0.45
 
     # ------------------------------------------------------------------
     # Camera

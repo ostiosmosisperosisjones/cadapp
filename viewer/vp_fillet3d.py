@@ -51,15 +51,21 @@ class Fillet3DMixin:
             old.close()
             self._fillet3d_panel = None
 
-        self._fillet3d_body_id       = body_id
-        self._fillet3d_face_indices  = list(face_indices)
-        self._fillet3d_preview_token = None
-        self._fillet3d_preview_tris  = None
-        self._fillet3d_preview_edges = None
-        self._fillet3d_pick_active   = False
-        self._editing_fillet3d_idx   = (editing_entry and
-                                         self.history.entries.index(editing_entry)
-                                         if editing_entry is not None else None)
+        self._fillet3d_body_id        = body_id
+        self._fillet3d_face_indices   = list(face_indices)
+        self._fillet3d_edge_indices   = []
+        self._fillet3d_preview_token  = None
+        self._fillet3d_preview_mesh   = None
+        self._fillet3d_computing      = False   # True while worker thread is running
+        self._fillet3d_pending        = None    # (face_indices, edge_occs, radius) to retry
+        self._fillet3d_arrow_base     = None   # fixed face/edge centroid
+        self._fillet3d_arrow_origin   = None   # base + dir*radius (moves with drag)
+        self._fillet3d_arrow_dir      = None
+        self._fillet3d_pick_face      = False
+        self._fillet3d_pick_edge      = False
+        self._editing_fillet3d_idx    = (editing_entry and
+                                          self.history.entries.index(editing_entry)
+                                          if editing_entry is not None else None)
 
         panel = Fillet3DPanel(self.workspace, parent=self)
         panel.set_radius(radius)
@@ -76,10 +82,13 @@ class Fillet3DMixin:
         panel.cancelled.connect(self._close_fillet3d_panel)
         panel.preview_changed.connect(self._update_fillet3d_preview)
         panel.face_entry_removed.connect(self._on_fillet3d_face_removed)
+        panel.edge_entry_removed.connect(self._on_fillet3d_edge_removed)
         panel.picking_face_changed.connect(self._on_fillet3d_pick_face)
+        panel.picking_edge_changed.connect(self._on_fillet3d_pick_edge)
 
         self._fillet3d_panel = panel
         self._position_fillet3d_panel()
+        self._update_fillet3d_arrow()
         panel.show()
         panel.setFocus()
         panel._emit_preview()
@@ -103,14 +112,16 @@ class Fillet3DMixin:
         if panel is not None:
             panel._preview_timer.stop()
             panel.end_pick_face()
-            try:
-                panel.preview_changed.disconnect(self._update_fillet3d_preview)
-            except Exception:
-                pass
-            try:
-                panel.face_entry_removed.disconnect(self._on_fillet3d_face_removed)
-            except Exception:
-                pass
+            panel.end_pick_edge()
+            for sig, slot in [
+                (panel.preview_changed,     self._update_fillet3d_preview),
+                (panel.face_entry_removed,  self._on_fillet3d_face_removed),
+                (panel.edge_entry_removed,  self._on_fillet3d_edge_removed),
+            ]:
+                try:
+                    sig.disconnect(slot)
+                except Exception:
+                    pass
             panel.close()
             self._fillet3d_panel = None
 
@@ -118,9 +129,14 @@ class Fillet3DMixin:
             self._cancel_fillet3d_edit()
 
         self._fillet3d_preview_token = None
-        self._fillet3d_preview_tris  = None
-        self._fillet3d_preview_edges = None
-        self._fillet3d_pick_active   = False
+        self._fillet3d_preview_mesh  = None
+        self._fillet3d_computing     = False
+        self._fillet3d_pending       = None
+        self._fillet3d_arrow_base    = None
+        self._fillet3d_arrow_origin  = None
+        self._fillet3d_arrow_dir     = None
+        self._fillet3d_pick_face     = False
+        self._fillet3d_pick_edge     = False
         self.update()
 
     # ------------------------------------------------------------------
@@ -128,52 +144,86 @@ class Fillet3DMixin:
     # ------------------------------------------------------------------
 
     def _on_fillet3d_pick_face(self, active: bool):
-        self._fillet3d_pick_active = active
+        self._fillet3d_pick_face = active
+
+    def _on_fillet3d_pick_edge(self, active: bool):
+        self._fillet3d_pick_edge = active
 
     def _on_fillet3d_face_removed(self, index: int):
         indices = getattr(self, '_fillet3d_face_indices', [])
         if 0 <= index < len(indices):
             indices.pop(index)
         self._fillet3d_face_indices = indices
-        # If last face removed, clear the body lock too
-        if not indices:
+        if not indices and not getattr(self, '_fillet3d_edge_indices', []):
             self._fillet3d_body_id = None
-        self._fillet3d_preview_tris  = None
-        self._fillet3d_preview_edges = None
+        self._fillet3d_preview_mesh = None
+        panel = getattr(self, '_fillet3d_panel', None)
+        if panel is not None:
+            panel._emit_preview()
+        self.update()
+
+    def _on_fillet3d_edge_removed(self, index: int):
+        indices = getattr(self, '_fillet3d_edge_indices', [])
+        if 0 <= index < len(indices):
+            indices.pop(index)
+        self._fillet3d_edge_indices = indices
+        if not indices and not getattr(self, '_fillet3d_face_indices', []):
+            self._fillet3d_body_id = None
+        self._fillet3d_preview_mesh = None
         panel = getattr(self, '_fillet3d_panel', None)
         if panel is not None:
             panel._emit_preview()
         self.update()
 
     def route_face_pick_for_fillet3d(self, body_id: str, face_idx: int) -> bool:
-        """Called by mousePressEvent when pick mode is active. Returns True if consumed."""
         panel = getattr(self, '_fillet3d_panel', None)
-        if panel is None or not getattr(self, '_fillet3d_pick_active', False):
+        if panel is None or not getattr(self, '_fillet3d_pick_face', False):
             return False
-
-        # Lock to the first picked body
-        fillet_body = getattr(self, '_fillet3d_body_id', None)
-        if fillet_body is None:
-            self._fillet3d_body_id = body_id
-            fillet_body = body_id
-        elif body_id != fillet_body:
-            print("[Fillet] All faces must be on the same body.")
+        if not self._fillet3d_lock_body(body_id):
             return True
 
         indices = getattr(self, '_fillet3d_face_indices', [])
         if face_idx in indices:
-            # Toggle off — remove
-            idx = indices.index(face_idx)
-            panel.remove_face_entry(idx)   # emits face_entry_removed
+            panel.remove_face_entry(indices.index(face_idx))
         else:
             indices.append(face_idx)
             self._fillet3d_face_indices = indices
             shape = self.workspace.current_shape(body_id)
             all_faces = list(shape.faces()) if shape is not None else []
-            label = self._fillet3d_face_label(body_id, face_idx, all_faces)
-            panel.add_face_entry(body_id, face_idx, label)
+            panel.add_face_entry(body_id, face_idx,
+                                 self._fillet3d_face_label(body_id, face_idx, all_faces))
+            self._update_fillet3d_arrow()
             panel._emit_preview()
+        return True
 
+    def route_edge_pick_for_fillet3d(self, edge_idx: int, body_id: str) -> bool:
+        panel = getattr(self, '_fillet3d_panel', None)
+        if panel is None or not getattr(self, '_fillet3d_pick_edge', False):
+            return False
+        if not self._fillet3d_lock_body(body_id):
+            return True
+
+        indices = getattr(self, '_fillet3d_edge_indices', [])
+        if edge_idx in indices:
+            panel.remove_edge_entry(indices.index(edge_idx))
+        else:
+            indices.append(edge_idx)
+            self._fillet3d_edge_indices = indices
+            body = self.workspace.bodies.get(body_id)
+            name = body.name if body else body_id
+            panel.add_edge_entry(body_id, edge_idx, f"{name}  ·  edge {edge_idx}")
+            self._update_fillet3d_arrow()
+            panel._emit_preview()
+        return True
+
+    def _fillet3d_lock_body(self, body_id: str) -> bool:
+        """Lock to first picked body. Returns False (consumed, rejected) if mismatch."""
+        locked = getattr(self, '_fillet3d_body_id', None)
+        if locked is None:
+            self._fillet3d_body_id = body_id
+        elif body_id != locked:
+            print("[Fillet] All selections must be on the same body.")
+            return False
         return True
 
     # ------------------------------------------------------------------
@@ -181,144 +231,162 @@ class Fillet3DMixin:
     # ------------------------------------------------------------------
 
     def _update_fillet3d_preview(self, radius: float):
-        from cad.operations.fillet import fillet_face_preview
-        import threading
-
         body_id      = getattr(self, '_fillet3d_body_id', None)
-        face_indices = getattr(self, '_fillet3d_face_indices', None)
-        if body_id is None or not face_indices:
-            self._fillet3d_preview_tris  = None
-            self._fillet3d_preview_edges = None
+        face_indices = getattr(self, '_fillet3d_face_indices', [])
+        edge_indices = getattr(self, '_fillet3d_edge_indices', [])
+        if body_id is None or (not face_indices and not edge_indices):
+            self._fillet3d_preview_mesh = None
             self.update()
             return
 
         shape = self.workspace.current_shape(body_id)
-        if shape is None:
-            self._fillet3d_preview_tris  = None
-            self._fillet3d_preview_edges = None
+        if shape is None or radius <= 0:
+            self._fillet3d_preview_mesh = None
             self.update()
             return
 
-        all_faces = list(shape.faces())
+        # Resolve TopoDS_Edge objects for direct edge picks (main-thread safe)
+        edge_occs = []
+        live_mesh = self._meshes.get(body_id)
+        if live_mesh is not None:
+            for ei in edge_indices:
+                if ei < len(live_mesh.topo_edges_occ):
+                    edge_occs.append(live_mesh.topo_edges_occ[ei])
 
-        if radius <= 0:
-            self._fillet3d_preview_tris  = None
-            self._fillet3d_preview_edges = None
-            self.update()
+        params = (list(face_indices), edge_occs, radius)
+
+        if getattr(self, '_fillet3d_computing', False):
+            # A thread is already running — stash latest params, it will re-fire
+            self._fillet3d_pending = params
             return
 
+        self._fillet3d_computing = True
+        self._fillet3d_pending   = None
+        self._launch_fillet3d_thread(shape, params)
+
+    def _launch_fillet3d_thread(self, shape, params):
+        import threading
+        from cad.operations.fillet import fillet_preview
+
+        face_indices, edge_occs, radius = params
         token = object()
         self._fillet3d_preview_token = token
 
         def _compute():
             try:
-                result = fillet_face_preview(shape, face_indices, all_faces, radius)
+                result = fillet_preview(shape, face_indices, edge_occs, radius)
+                from viewer.mesh import Mesh
+                preview_mesh = Mesh(result)
             except Exception:
-                QMetaObject.invokeMethod(
-                    self, "_fillet3d_preview_done",
-                    Qt.ConnectionType.QueuedConnection,
-                    Q_ARG(object, token),
-                    Q_ARG(object, None),
-                    Q_ARG(object, None),
-                )
-                return
-
-            from OCP.BRep import BRep_Tool
-            from OCP.BRepMesh import BRepMesh_IncrementalMesh
-            from OCP.TopExp import TopExp_Explorer
-            from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
-            from OCP.TopoDS import TopoDS
-            from OCP.BRepAdaptor import BRepAdaptor_Curve
-            from OCP.GCPnts import GCPnts_UniformAbscissa
-
-            tris  = []
-            edges = []
-            wrapped = result.wrapped
-            BRepMesh_IncrementalMesh(wrapped, 0.15)
-            exp = TopExp_Explorer(wrapped, TopAbs_FACE)
-            while exp.More():
-                face = TopoDS.Face_s(exp.Current())
-                tri = BRep_Tool.Triangulation_s(face, face.Location())
-                if tri is not None:
-                    for j in range(1, tri.NbTriangles() + 1):
-                        n1, n2, n3 = tri.Triangle(j).Get()
-                        for ni in (n1, n2, n3):
-                            p = tri.Node(ni)
-                            tris.extend((p.X(), p.Y(), p.Z()))
-                exp.Next()
-            exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
-            while exp2.More():
-                try:
-                    adaptor = BRepAdaptor_Curve(exp2.Current())
-                    disc = GCPnts_UniformAbscissa()
-                    disc.Initialize(adaptor, 24)
-                    if disc.IsDone() and disc.NbPoints() >= 2:
-                        strip = []
-                        for pi in range(1, disc.NbPoints() + 1):
-                            p = adaptor.Value(disc.Parameter(pi))
-                            strip.extend((p.X(), p.Y(), p.Z()))
-                        edges.append(strip)
-                except Exception:
-                    pass
-                exp2.Next()
-
+                preview_mesh = None
             QMetaObject.invokeMethod(
                 self, "_fillet3d_preview_done",
                 Qt.ConnectionType.QueuedConnection,
                 Q_ARG(object, token),
-                Q_ARG(object, tris),
-                Q_ARG(object, edges),
+                Q_ARG(object, preview_mesh),
             )
 
         threading.Thread(target=_compute, daemon=True).start()
 
-    @pyqtSlot(object, object, object)
-    def _fillet3d_preview_done(self, token, tris, edges):
+    @pyqtSlot(object, object)
+    def _fillet3d_preview_done(self, token, preview_mesh):
         if getattr(self, '_fillet3d_preview_token', None) is not token:
+            self._fillet3d_computing = False
             return
-        self._fillet3d_preview_tris  = tris
-        self._fillet3d_preview_edges = edges
+        if preview_mesh is not None:
+            self.makeCurrent()
+            try:
+                preview_mesh.upload()
+            except Exception:
+                preview_mesh = None
+        self._fillet3d_preview_mesh = preview_mesh
+        self._update_fillet3d_arrow()
         self.update()
 
-    def _draw_fillet3d_preview(self):
-        tris  = getattr(self, '_fillet3d_preview_tris',  None)
-        edges = getattr(self, '_fillet3d_preview_edges', None)
-        if not tris and not edges:
+        pending = getattr(self, '_fillet3d_pending', None)
+        self._fillet3d_pending   = None
+        self._fillet3d_computing = False
+        if pending is not None:
+            shape = self.workspace.current_shape(getattr(self, '_fillet3d_body_id', None))
+            if shape is not None:
+                self._fillet3d_computing = True
+                self._launch_fillet3d_thread(shape, pending)
+
+    def _update_fillet3d_arrow(self):
+        """Derive base + direction from selection; then position tip at current radius."""
+        import numpy as np
+        body_id      = getattr(self, '_fillet3d_body_id', None)
+        face_indices = getattr(self, '_fillet3d_face_indices', [])
+        edge_indices = getattr(self, '_fillet3d_edge_indices', [])
+
+        def _clear():
+            self._fillet3d_arrow_base   = None
+            self._fillet3d_arrow_origin = None
+            self._fillet3d_arrow_dir    = None
+
+        if body_id is None or (not face_indices and not edge_indices):
+            _clear(); return
+
+        shape = self.workspace.current_shape(body_id)
+        if shape is None:
+            _clear(); return
+
+        try:
+            if face_indices:
+                all_faces = list(shape.faces())
+                fi = face_indices[0]
+                if fi >= len(all_faces):
+                    raise IndexError
+                from build123d import Plane
+                pl = Plane(all_faces[fi])
+                base   = np.array([pl.origin.X, pl.origin.Y, pl.origin.Z])
+                normal = np.array([pl.z_dir.X,  pl.z_dir.Y,  pl.z_dir.Z])
+            else:
+                mesh = self._meshes.get(body_id)
+                if mesh is None or edge_indices[0] >= len(mesh.topo_edges):
+                    raise IndexError
+                pts  = mesh.topo_edges[edge_indices[0]]
+                base = np.array(pts[len(pts) // 2], dtype=float)
+                efn  = getattr(mesh, 'topo_edge_face_normals', None)
+                if efn and edge_indices[0] < len(efn):
+                    adj    = np.array(efn[edge_indices[0]], dtype=float)
+                    normal = adj.mean(axis=0) if adj.ndim == 2 else adj.flatten()[:3]
+                else:
+                    normal = np.array([0.0, 0.0, 1.0])
+
+            n = np.linalg.norm(normal)
+            if n < 1e-10:
+                raise ValueError
+            normal /= n
+            self._fillet3d_arrow_base = base
+            self._fillet3d_arrow_dir  = normal
+        except Exception:
+            _clear(); return
+
+        self._reposition_fillet3d_arrow()
+
+    def _reposition_fillet3d_arrow(self):
+        """Move the arrow tip to base + dir * radius (called after each drag step)."""
+        import numpy as np
+        base   = getattr(self, '_fillet3d_arrow_base', None)
+        normal = getattr(self, '_fillet3d_arrow_dir',  None)
+        if base is None or normal is None:
+            self._fillet3d_arrow_origin = None
             return
+        panel  = getattr(self, '_fillet3d_panel', None)
+        radius = (panel._spinbox.mm_value() or 1.0) if panel else 1.0
+        self._fillet3d_arrow_origin = np.asarray(base) + np.asarray(normal) * radius
 
-        from OpenGL.GL import (
-            glDisable, glEnable, glColor4f, glBegin, glEnd, glVertex3f,
-            glLineWidth, GL_LIGHTING, GL_DEPTH_TEST, GL_CULL_FACE, GL_BLEND,
-            GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_TRIANGLES, GL_LINE_STRIP,
-            glBlendFunc,
-        )
-
-        glDisable(GL_LIGHTING)
-        glEnable(GL_DEPTH_TEST)
-        glDisable(GL_CULL_FACE)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-
-        if tris:
-            glColor4f(0.22, 0.70, 0.45, 0.22)
-            glBegin(GL_TRIANGLES)
-            for i in range(0, len(tris), 3):
-                glVertex3f(tris[i], tris[i+1], tris[i+2])
-            glEnd()
-
-        if edges:
-            glColor4f(0.40, 0.90, 0.60, 0.80)
-            glLineWidth(1.4)
-            for strip in edges:
-                glBegin(GL_LINE_STRIP)
-                for i in range(0, len(strip), 3):
-                    glVertex3f(strip[i], strip[i+1], strip[i+2])
-                glEnd()
-            glLineWidth(1.0)
-
-        glDisable(GL_BLEND)
-        glEnable(GL_CULL_FACE)
-        glEnable(GL_LIGHTING)
+    def _draw_fillet3d_preview(self):
+        origin    = getattr(self, '_fillet3d_arrow_origin', None)
+        direction = getattr(self, '_fillet3d_arrow_dir',    None)
+        if origin is None or direction is None:
+            return
+        from viewer.drag_arrow import DragArrow
+        panel  = getattr(self, '_fillet3d_panel', None)
+        radius = (panel._spinbox.mm_value() or 1.0) if panel else 1.0
+        scale  = self._arrow_scale(radius)
+        DragArrow().draw(origin, direction, scale, color=(0.40, 0.85, 0.95))
 
     # ------------------------------------------------------------------
     # Commit
@@ -327,23 +395,25 @@ class Fillet3DMixin:
     @pyqtSlot(float)
     def _on_fillet3d_ok(self, radius: float):
         body_id      = getattr(self, '_fillet3d_body_id', None)
-        face_indices = getattr(self, '_fillet3d_face_indices', None)
+        face_indices = getattr(self, '_fillet3d_face_indices', [])
+        edge_indices = getattr(self, '_fillet3d_edge_indices', [])
         editing_idx  = getattr(self, '_editing_fillet3d_idx', None)
 
         if editing_idx is not None:
             self._editing_fillet3d_idx = None
         self._close_fillet3d_panel()
 
-        if body_id is None or not face_indices:
+        if body_id is None or (not face_indices and not edge_indices):
             return
 
         from cad.op_types import FaceFilletOp
         if editing_idx is not None:
             self._editing_fillet3d_idx = editing_idx
-            self._commit_fillet3d_edit(body_id, face_indices, radius)
+            self._commit_fillet3d_edit(body_id, face_indices, edge_indices, radius)
             return
         FaceFilletOp(source_body_id=body_id,
                      face_indices=face_indices,
+                     edge_indices=edge_indices,
                      radius=radius).commit_async(self)
 
     # ------------------------------------------------------------------
@@ -370,8 +440,18 @@ class Fillet3DMixin:
             op.source_body_id, list(op.face_indices),
             editing_entry=entry, radius=op.radius)
 
+        # Restore edge picks (panel already open)
+        panel = getattr(self, '_fillet3d_panel', None)
+        if panel is not None and op.edge_indices:
+            self._fillet3d_edge_indices = list(op.edge_indices)
+            body = self.workspace.bodies.get(op.source_body_id)
+            name = body.name if body else op.source_body_id
+            for ei in op.edge_indices:
+                panel.add_edge_entry(op.source_body_id, ei,
+                                     f"{name}  ·  edge {ei}")
+
     def _commit_fillet3d_edit(self, body_id: str, face_indices: list,
-                               radius: float):
+                               edge_indices: list, radius: float):
         from cad.op_types import FaceFilletOp
 
         idx = getattr(self, '_editing_fillet3d_idx', None)
@@ -414,6 +494,7 @@ class Fillet3DMixin:
 
         FaceFilletOp(source_body_id=body_id,
                      face_indices=face_indices,
+                     edge_indices=edge_indices,
                      radius=radius).commit_async(self)
 
     def _cancel_fillet3d_edit(self):

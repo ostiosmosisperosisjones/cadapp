@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QButtonGroup, QRadioButton, QFrame, QSizePolicy,
 )
-from PyQt6.QtCore import pyqtSignal, Qt
+from PyQt6.QtCore import pyqtSignal, Qt, QTimer
+from gui.fillet3d_panel import _adaptive_delay
 from PyQt6.QtGui import QKeyEvent
 
 from gui.selection_list import SelectionList
@@ -122,6 +123,12 @@ class RevolvePanel(QWidget):
         self._axis_point     : np.ndarray | None = None   # world-space point on axis
         self._axis_dir       : np.ndarray | None = None   # stored unit axis (unflipped)
         self._merge_body_id  : str | None = None
+
+        self._preview_timer      = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._fire_preview)
+        self._preview_last_value = None
+        self._preview_last_ms    = 0
 
         self._build_ui()
 
@@ -308,6 +315,10 @@ class RevolvePanel(QWidget):
         self._emit_preview()
 
     def _emit_preview(self, _=None):
+        self._preview_timer.start(_adaptive_delay(
+            self._angle_spinbox.mm_value(), self))
+
+    def _fire_preview(self):
         angle = self._angle_spinbox.mm_value()
         if angle is None:
             return

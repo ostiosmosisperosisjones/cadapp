@@ -12,7 +12,7 @@ from OpenGL.GL import *
 
 
 class Mesh:
-    def __init__(self, shape):
+    def __init__(self, shape, deviation: float | None = None):
         # Use a stable cache key based on the shape's OCCT hash so the
         # tessellator can reuse cached results for identical shapes (e.g. undo/redo).
         cache_key = f"mesh_{hash(shape.wrapped)}"
@@ -21,11 +21,15 @@ class Mesh:
 
         # Retry with progressively looser tolerances if the tessellator returns
         # a face count that doesn't match shape.faces() (ocp_tessellate bug).
+        # A caller-supplied deviation skips to that quality tier immediately.
         _attempts = [
             dict(deviation=0.01,  quality=0.01,  angular_tolerance=0.1),
             dict(deviation=0.05,  quality=0.05,  angular_tolerance=0.3),
             dict(deviation=0.1,   quality=0.1,   angular_tolerance=0.5),
         ]
+        if deviation is not None:
+            _attempts = [dict(deviation=deviation, quality=deviation,
+                              angular_tolerance=deviation * 5)] + _attempts
         tess = None
         for attempt in _attempts:
             t = tessellate(shape.wrapped, cache_key=cache_key, **attempt)

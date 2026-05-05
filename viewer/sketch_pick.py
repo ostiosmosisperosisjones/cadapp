@@ -350,21 +350,22 @@ class SketchPickMixin:
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
+        from cad.prefs import prefs as _prefs
+        op = _prefs.op_preview_opacity
         if is_cut:
-            fill_color   = (0.75, 0.18, 0.18, 0.28)
-            edge_color   = (1.00, 0.35, 0.35, 0.75)
+            fill_color   = (0.75, 0.18, 0.18, op)
+            edge_color   = (1.00, 0.35, 0.35, min(op + 0.35, 1.0))
         else:
-            from cad.prefs import prefs as _prefs
             r, g, b = _prefs.op_preview_color
-            fill_color   = (r, g, b, 0.22)
-            edge_color   = (min(r + 0.23, 1.0), min(g + 0.30, 1.0), min(b + 0.15, 1.0), 0.80)
+            fill_color   = (r, g, b, op)
+            edge_color   = (min(r + 0.23, 1.0), min(g + 0.30, 1.0), min(b + 0.15, 1.0), min(op + 0.35, 1.0))
 
         for solid in solids:
             try:
                 wrapped = solid.wrapped
                 BRepMesh_IncrementalMesh(wrapped, 0.15)
 
-                # Filled triangles
+                # Filled triangles — fetch with face location, then apply transform
                 glColor4f(*fill_color)
                 exp = TopExp_Explorer(wrapped, TopAbs_FACE)
                 while exp.More():
@@ -372,11 +373,15 @@ class SketchPickMixin:
                     loc  = face.Location()
                     tri  = BRep_Tool.Triangulation_s(face, loc)
                     if tri is not None:
+                        has_trsf = not loc.IsIdentity()
+                        trsf = loc.Transformation() if has_trsf else None
                         glBegin(GL_TRIANGLES)
                         for i in range(1, tri.NbTriangles() + 1):
                             n1, n2, n3 = tri.Triangle(i).Get()
                             for ni in (n1, n2, n3):
                                 p = tri.Node(ni)
+                                if trsf is not None:
+                                    p = p.Transformed(trsf)
                                 glVertex3f(p.X(), p.Y(), p.Z())
                         glEnd()
                     exp.Next()

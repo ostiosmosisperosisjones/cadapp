@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QButtonGroup, QRadioButton, QFrame,
 )
 from PyQt6.QtCore import pyqtSignal, Qt, QTimer
+from gui.fillet3d_panel import _adaptive_delay
 from PyQt6.QtGui import QKeyEvent
 
 from gui.expr_spinbox import ExprSpinBox
@@ -173,10 +174,11 @@ class ThickenPanel(QWidget):
         btn_row.addWidget(ok_btn)
         layout.addLayout(btn_row)
 
-        self._preview_timer = QTimer(self)
+        self._preview_timer      = QTimer(self)
         self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(200)
         self._preview_timer.timeout.connect(self._fire_preview)
+        self._preview_last_value = None
+        self._preview_last_ms    = 0
 
         self._spinbox.value_changed.connect(self._schedule_preview)
 
@@ -263,7 +265,7 @@ class ThickenPanel(QWidget):
             self.thicken_requested.emit(val)
 
     def _schedule_preview(self, _val=None):
-        self._preview_timer.start()
+        self._preview_timer.start(_adaptive_delay(self._signed_value(), self))
 
     def _fire_preview(self):
         val = self._signed_value()
@@ -271,7 +273,7 @@ class ThickenPanel(QWidget):
             self.preview_changed.emit(val)
 
     def _emit_preview(self, _val=None):
-        self._preview_timer.start()
+        self._preview_timer.start(_adaptive_delay(self._signed_value(), self))
 
     def set_thickness(self, thickness_mm: float):
         """Restore panel state from a saved thickness (signed)."""

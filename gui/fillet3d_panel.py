@@ -10,7 +10,7 @@ from __future__ import annotations
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
 )
-from PyQt6.QtCore import pyqtSignal, Qt, QTimer
+from PyQt6.QtCore import pyqtSignal, Qt, QTimer, QElapsedTimer
 from PyQt6.QtGui import QKeyEvent
 
 from gui.selection_list import SelectionList
@@ -43,17 +43,49 @@ QPushButton#ok:hover { background: #1e5a8a; }
 QPushButton#pick_face[active=true] {
     background: #2a1e1e; border-color: #d96a4a; color: #ff9977;
 }
+QPushButton#pick_edge[active=true] {
+    background: #2a1e3a; border-color: #aa6aee; color: #cc8dff;
+}
 """
 
 _SEP_STYLE = "background: #333;"
 
+_FAST_MS = 16
+_SLOW_MS = 150
+_CLOCK   = QElapsedTimer()
+_CLOCK.start()
+
+
+def _adaptive_delay(value, panel) -> int:
+    """Return a debounce delay in ms that shrinks with faster value changes.
+
+    Maps velocity (units/ms) to delay via a smooth hyperbolic curve:
+      stopped          → 150ms
+      0.05 units/ms    →  ~54ms
+      0.2  units/ms    →  ~28ms  (typical fast drag)
+      1.0+ units/ms    →  ~18ms  (floor)
+    """
+    now = _CLOCK.elapsed()
+    dt  = now - panel._preview_last_ms
+    if dt > 0 and panel._preview_last_value is not None and value is not None:
+        velocity = abs(value - panel._preview_last_value) / dt  # units per ms
+        delay = int(_FAST_MS + (_SLOW_MS - _FAST_MS) / (1.0 + 0.5 * velocity * 100))
+        delay = max(_FAST_MS, min(_SLOW_MS, delay))
+    else:
+        delay = _SLOW_MS
+    panel._preview_last_value = value
+    panel._preview_last_ms    = now
+    return delay
+
 
 class Fillet3DPanel(QWidget):
-    confirmed           = pyqtSignal(float)
-    cancelled           = pyqtSignal()
-    preview_changed     = pyqtSignal(float)
-    face_entry_removed  = pyqtSignal(int)
+    confirmed            = pyqtSignal(float)
+    cancelled            = pyqtSignal()
+    preview_changed      = pyqtSignal(float)
+    face_entry_removed   = pyqtSignal(int)
+    edge_entry_removed   = pyqtSignal(int)
     picking_face_changed = pyqtSignal(bool)
+    picking_edge_changed = pyqtSignal(bool)
 
     def __init__(self, workspace, parent=None):
         super().__init__(None)   # top-level so it's never clipped by the viewport
@@ -69,11 +101,13 @@ class Fillet3DPanel(QWidget):
 
         self._workspace     = workspace
         self._picking_face  = False
+        self._picking_edge  = False
 
-        self._preview_timer = QTimer(self)
+        self._preview_timer      = QTimer(self)
         self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(120)
         self._preview_timer.timeout.connect(self._fire_preview)
+        self._preview_last_value = None
+        self._preview_last_ms    = 0
 
         self._build_ui()
 
@@ -110,6 +144,24 @@ class Fillet3DPanel(QWidget):
         self._face_list = SelectionList(empty_text="No faces selected")
         self._face_list.entry_removed.connect(self.face_entry_removed)
         root.addWidget(self._face_list)
+
+        root.addWidget(self._separator())
+
+        # ── Edges ─────────────────────────────────────────────────────
+        edge_header = QHBoxLayout()
+        edge_header.setSpacing(6)
+        edge_header.addWidget(self._section_label("Edges"))
+        edge_header.addStretch()
+        self._pick_edge_btn = QPushButton("+ Add")
+        self._pick_edge_btn.setObjectName("pick_edge")
+        self._pick_edge_btn.setCheckable(True)
+        self._pick_edge_btn.clicked.connect(self._on_pick_edge_toggle)
+        edge_header.addWidget(self._pick_edge_btn)
+        root.addLayout(edge_header)
+
+        self._edge_list = SelectionList(empty_text="No edges selected")
+        self._edge_list.entry_removed.connect(self.edge_entry_removed)
+        root.addWidget(self._edge_list)
 
         root.addWidget(self._separator())
 
@@ -156,8 +208,7 @@ class Fillet3DPanel(QWidget):
         self._spinbox.set_mm(radius)
 
     def add_face_entry(self, body_id: str | None, face_idx: int | None, label: str):
-        key = (body_id, face_idx)
-        self._face_list.add(key, label)
+        self._face_list.add((body_id, face_idx), label)
 
     def remove_face_entry(self, index: int):
         self._face_list.remove_at(index)
@@ -165,9 +216,18 @@ class Fillet3DPanel(QWidget):
     def clear_face_entries(self):
         self._face_list.clear()
 
+    def add_edge_entry(self, body_id: str | None, edge_idx: int | None, label: str):
+        self._edge_list.add((body_id, edge_idx), label)
+
+    def remove_edge_entry(self, index: int):
+        self._edge_list.remove_at(index)
+
+    def clear_edge_entries(self):
+        self._edge_list.clear()
+
     @property
-    def _has_faces(self) -> bool:
-        return len(self._face_list) > 0
+    def _has_selection(self) -> bool:
+        return len(self._face_list) > 0 or len(self._edge_list) > 0
 
     def end_pick_face(self):
         self._picking_face = False
@@ -176,6 +236,14 @@ class Fillet3DPanel(QWidget):
         self._pick_face_btn.style().unpolish(self._pick_face_btn)
         self._pick_face_btn.style().polish(self._pick_face_btn)
         self.picking_face_changed.emit(False)
+
+    def end_pick_edge(self):
+        self._picking_edge = False
+        self._pick_edge_btn.setChecked(False)
+        self._pick_edge_btn.setProperty("active", False)
+        self._pick_edge_btn.style().unpolish(self._pick_edge_btn)
+        self._pick_edge_btn.style().polish(self._pick_edge_btn)
+        self.picking_edge_changed.emit(False)
 
     # ------------------------------------------------------------------
     # Preview
@@ -187,7 +255,9 @@ class Fillet3DPanel(QWidget):
             self.preview_changed.emit(v)
 
     def _emit_preview(self):
-        self._preview_timer.start()
+        self._preview_timer.start(_adaptive_delay(
+            self._spinbox.mm_value(),
+            self))
 
     # ------------------------------------------------------------------
     # Slots
@@ -198,6 +268,7 @@ class Fillet3DPanel(QWidget):
 
     def _on_pick_face_toggle(self, checked: bool):
         if checked:
+            self.end_pick_edge()   # mutually exclusive
             self._picking_face = True
             self._pick_face_btn.setProperty("active", True)
             self._pick_face_btn.style().unpolish(self._pick_face_btn)
@@ -206,8 +277,19 @@ class Fillet3DPanel(QWidget):
         else:
             self.end_pick_face()
 
+    def _on_pick_edge_toggle(self, checked: bool):
+        if checked:
+            self.end_pick_face()   # mutually exclusive
+            self._picking_edge = True
+            self._pick_edge_btn.setProperty("active", True)
+            self._pick_edge_btn.style().unpolish(self._pick_edge_btn)
+            self._pick_edge_btn.style().polish(self._pick_edge_btn)
+            self.picking_edge_changed.emit(True)
+        else:
+            self.end_pick_edge()
+
     def _on_ok(self):
-        if not self._has_faces:
+        if not self._has_selection:
             return
         v = self._spinbox.mm_value()
         if v is not None and v > 0:
@@ -227,6 +309,8 @@ class Fillet3DPanel(QWidget):
         elif e.key() == Qt.Key.Key_Escape:
             if self._picking_face:
                 self.end_pick_face()
+            elif self._picking_edge:
+                self.end_pick_edge()
             else:
                 self.cancelled.emit()
         else:

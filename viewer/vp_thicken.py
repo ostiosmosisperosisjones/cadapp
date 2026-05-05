@@ -5,7 +5,6 @@ ThickenMixin — uniform body offset panel, preview, and commit.
 """
 
 from __future__ import annotations
-from PyQt6.QtCore import pyqtSlot
 
 
 class ThickenMixin:
@@ -36,11 +35,9 @@ class ThickenMixin:
             old.close()
             self._thicken_panel = None
 
-        self._thicken_body_id       = body_id
-        self._thicken_face_indices  = list(face_indices)
-        self._thicken_preview_token = None
-        self._thicken_preview_tris  = None
-        self._thicken_preview_edges = None
+        self._thicken_body_id        = body_id
+        self._thicken_face_indices   = list(face_indices)
+        self._thicken_preview_mesh   = None
         panel = ThickenPanel(parent=self)
         panel.thicken_requested.connect(self._on_thicken_ok)
         panel.cancelled.connect(self._close_thicken_panel)
@@ -58,7 +55,7 @@ class ThickenMixin:
         self._position_thicken_panel()
         panel.show()
         panel.setFocus()
-        panel._emit_preview()
+        panel._emit_preview()  # triggers _update_thicken_preview → wire build
 
     def _thicken_face_label(self, body_id: str, face_idx: int, all_faces: list) -> str:
         body = self.workspace.bodies.get(body_id)
@@ -90,12 +87,9 @@ class ThickenMixin:
             self._thicken_panel = None
         if getattr(self, '_editing_thicken_idx', None) is not None:
             self._cancel_thicken_edit()
-        self._thicken_preview_token = None
-        self._thicken_preview_tris  = None
-        self._thicken_preview_edges = None
-        self._thicken_arrow_origin  = None
-        self._thicken_arrow_dir     = None
-        self._thicken_pending_errors = None
+        self._thicken_preview_mesh = None
+        self._thicken_arrow_origin = None
+        self._thicken_arrow_dir    = None
         self.update()
 
     # ------------------------------------------------------------------
@@ -107,8 +101,7 @@ class ThickenMixin:
         if 0 <= index < len(indices):
             indices.pop(index)
             self._thicken_face_indices = indices
-        self._thicken_preview_tris  = None
-        self._thicken_preview_edges = None
+        self._thicken_preview_mesh = None
         panel = getattr(self, '_thicken_panel', None)
         if panel is not None:
             panel._emit_preview()
@@ -155,158 +148,121 @@ class ThickenMixin:
     # ------------------------------------------------------------------
 
     def _update_thicken_preview(self, thickness: float):
-        from cad.operations.thicken import thicken_face_preview
-        import threading
-
         body_id      = getattr(self, '_thicken_body_id', None)
         face_indices = getattr(self, '_thicken_face_indices', None)
         if body_id is None or not face_indices:
-            self._thicken_preview_tris  = None
-            self._thicken_arrow_origin  = None
-            self._thicken_arrow_dir     = None
+            self._thicken_preview_mesh = None
+            self._thicken_arrow_origin = None
+            self._thicken_arrow_dir    = None
             self.update(); return
         shape = self.workspace.current_shape(body_id)
         if shape is None:
-            self._thicken_preview_tris  = None
-            self._thicken_arrow_origin  = None
-            self._thicken_arrow_dir     = None
+            self._thicken_preview_mesh = None
+            self._thicken_arrow_origin = None
+            self._thicken_arrow_dir    = None
             self.update(); return
-        all_faces = list(shape.faces())
 
+        all_faces = list(shape.faces())
         face_occs = [all_faces[idx].wrapped for idx in face_indices
                      if idx < len(all_faces)]
         if not face_occs:
-            self._thicken_preview_tris  = None
-            self._thicken_arrow_origin  = None
-            self._thicken_arrow_dir     = None
+            self._thicken_preview_mesh = None
+            self._thicken_arrow_origin = None
+            self._thicken_arrow_dir    = None
             self.update(); return
 
         self._update_thicken_arrow(all_faces, face_indices, thickness)
+        self._thicken_preview_dist = thickness
+
+        panel = getattr(self, '_thicken_panel', None)
+        if panel is not None:
+            panel.clear_face_errors()
 
         if thickness == 0.0:
-            self._thicken_preview_tris  = None
-            self._thicken_preview_dist  = thickness
+            self._thicken_preview_mesh = None
             self.update(); return
 
-        token = object()
-        self._thicken_preview_token = token
+        from cad.operations.thicken import thicken_face_preview
+        slabs = []
+        for i, fo in enumerate(face_occs):
+            try:
+                slabs.append(thicken_face_preview(fo, thickness))
+            except Exception as ex:
+                if panel is not None:
+                    panel.set_face_entry_error(i, str(ex))
+        self._thicken_preview_mesh = slabs if slabs else None
+        self.update()
 
-        # face_indices snapshot for error reporting back to panel
-        face_indices_snap = list(face_indices)
-
-        def _compute():
-            # Compute per-face: (result_or_None, error_str_or_None)
-            per_face = []
-            for fo in face_occs:
-                try:
-                    per_face.append((thicken_face_preview(fo, thickness), None))
-                except Exception as ex:
-                    per_face.append((None, str(ex)))
-
-            tris = []
-            edges = []
-            face_errors: dict[int, str] = {}   # face_indices_snap index → error msg
+    def _draw_thicken_preview(self):
+        solids = getattr(self, '_thicken_preview_mesh', None)
+        if solids:
             from OCP.BRep import BRep_Tool
             from OCP.BRepMesh import BRepMesh_IncrementalMesh
             from OCP.TopExp import TopExp_Explorer
             from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
             from OCP.TopoDS import TopoDS
+            from OCP.TopLoc import TopLoc_Location
             from OCP.BRepAdaptor import BRepAdaptor_Curve
             from OCP.GCPnts import GCPnts_UniformAbscissa
-            for i, (result, err) in enumerate(per_face):
-                if err is not None:
-                    face_errors[i] = err
-                    continue
-                wrapped = result.wrapped
-                BRepMesh_IncrementalMesh(wrapped, 0.15)
-                exp = TopExp_Explorer(wrapped, TopAbs_FACE)
-                while exp.More():
-                    face = TopoDS.Face_s(exp.Current())
-                    tri = BRep_Tool.Triangulation_s(face, face.Location())
-                    if tri is not None:
-                        for j in range(1, tri.NbTriangles() + 1):
-                            n1, n2, n3 = tri.Triangle(j).Get()
-                            for ni in (n1, n2, n3):
-                                p = tri.Node(ni)
-                                tris.extend((p.X(), p.Y(), p.Z()))
-                    exp.Next()
-                exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
-                while exp2.More():
-                    try:
-                        adaptor = BRepAdaptor_Curve(exp2.Current())
-                        disc = GCPnts_UniformAbscissa()
-                        disc.Initialize(adaptor, 24)
-                        if disc.IsDone() and disc.NbPoints() >= 2:
-                            strip = []
-                            for pi in range(1, disc.NbPoints() + 1):
-                                p = adaptor.Value(disc.Parameter(pi))
-                                strip.extend((p.X(), p.Y(), p.Z()))
-                            edges.append(strip)
-                    except Exception:
-                        pass
-                    exp2.Next()
+            from OpenGL.GL import (glDisable, glEnable, glColor4f, glBegin, glEnd,
+                                   glVertex3f, glLineWidth, glBlendFunc,
+                                   GL_LIGHTING, GL_DEPTH_TEST, GL_CULL_FACE,
+                                   GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                                   GL_TRIANGLES, GL_LINE_STRIP)
+            from cad.prefs import prefs as _prefs
+            r, g, b = _prefs.op_preview_color
+            op = _prefs.op_preview_opacity
+            fill_color = (r, g, b, op)
+            edge_color = (min(r+0.23, 1.0), min(g+0.30, 1.0), min(b+0.15, 1.0), min(op+0.35, 1.0))
 
-            if getattr(self, '_thicken_preview_token', None) is token:
-                self._thicken_preview_tris  = tris
-                self._thicken_preview_edges = edges
-                self._thicken_preview_dist  = thickness
-                # Store errors for the main-thread slot to pick up, then invoke it.
-                self._thicken_pending_errors = (dict(face_errors), list(face_indices_snap))
-                from PyQt6.QtCore import QMetaObject, Qt as _Qt
-                QMetaObject.invokeMethod(
-                    self, "_apply_thicken_face_errors",
-                    _Qt.ConnectionType.QueuedConnection)
-                self.update()
+            glDisable(GL_LIGHTING)
+            glEnable(GL_DEPTH_TEST)
+            glDisable(GL_CULL_FACE)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-        threading.Thread(target=_compute, daemon=True).start()
+            for solid in solids:
+                try:
+                    wrapped = solid.wrapped
+                    BRepMesh_IncrementalMesh(wrapped, 0.15)
+                    _identity = TopLoc_Location()
+                    glColor4f(*fill_color)
+                    exp = TopExp_Explorer(wrapped, TopAbs_FACE)
+                    while exp.More():
+                        face = TopoDS.Face_s(exp.Current())
+                        tri  = BRep_Tool.Triangulation_s(face, _identity)
+                        if tri is not None:
+                            glBegin(GL_TRIANGLES)
+                            for i in range(1, tri.NbTriangles() + 1):
+                                n1, n2, n3 = tri.Triangle(i).Get()
+                                for ni in (n1, n2, n3):
+                                    p = tri.Node(ni)
+                                    glVertex3f(p.X(), p.Y(), p.Z())
+                            glEnd()
+                        exp.Next()
+                    glColor4f(*edge_color)
+                    glLineWidth(1.4)
+                    exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
+                    while exp2.More():
+                        edge = exp2.Current()
+                        try:
+                            adp  = BRepAdaptor_Curve(edge)
+                            disc = GCPnts_UniformAbscissa()
+                            disc.Initialize(adp, 24)
+                            if disc.IsDone() and disc.NbPoints() >= 2:
+                                glBegin(GL_LINE_STRIP)
+                                for pi in range(1, disc.NbPoints() + 1):
+                                    p = adp.Value(disc.Parameter(pi))
+                                    glVertex3f(p.X(), p.Y(), p.Z())
+                                glEnd()
+                        except Exception:
+                            pass
+                        exp2.Next()
+                    glLineWidth(1.0)
+                except Exception as ex:
+                    print(f"[Thicken preview draw] {ex}")
 
-    def _draw_thicken_preview(self):
-        tris  = getattr(self, '_thicken_preview_tris',  None)
-        edges = getattr(self, '_thicken_preview_edges', None)
         self._draw_thicken_arrow()
-        if not tris and not edges:
-            return
-
-        from OpenGL.GL import (
-            glDisable, glEnable, glColor4f, glBegin, glEnd, glVertex3f,
-            glLineWidth, GL_LIGHTING, GL_DEPTH_TEST, GL_CULL_FACE, GL_BLEND,
-            GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_TRIANGLES, GL_LINE_STRIP,
-            glBlendFunc,
-        )
-
-        glDisable(GL_LIGHTING)
-        glEnable(GL_DEPTH_TEST)
-        glDisable(GL_CULL_FACE)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-
-        is_cut = getattr(self, '_thicken_preview_dist', 0.0) < 0
-        if tris:
-            if is_cut:
-                glColor4f(0.70, 0.22, 0.22, 0.22)
-            else:
-                glColor4f(0.22, 0.70, 0.45, 0.22)
-            glBegin(GL_TRIANGLES)
-            for i in range(0, len(tris), 3):
-                glVertex3f(tris[i], tris[i+1], tris[i+2])
-            glEnd()
-
-        if edges:
-            if is_cut:
-                glColor4f(0.90, 0.40, 0.40, 0.80)
-            else:
-                glColor4f(0.40, 0.90, 0.60, 0.80)
-            glLineWidth(1.4)
-            for strip in edges:
-                glBegin(GL_LINE_STRIP)
-                for i in range(0, len(strip), 3):
-                    glVertex3f(strip[i], strip[i+1], strip[i+2])
-                glEnd()
-            glLineWidth(1.0)
-
-        glDisable(GL_BLEND)
-        glEnable(GL_CULL_FACE)
-        glEnable(GL_LIGHTING)
 
     def _update_thicken_arrow(self, all_faces, face_indices, thickness: float):
         """Compute centroid + average normal of selected faces for arrow placement."""
@@ -393,21 +349,6 @@ class ThickenMixin:
         scale     = max(scale, abs(thickness) * 0.18) if thickness != 0.0 else scale
 
         DragArrow().draw(origin, direction, scale, color=color)
-
-    @pyqtSlot()
-    def _apply_thicken_face_errors(self):
-        pending = getattr(self, '_thicken_pending_errors', None)
-        if pending is None:
-            return
-        face_errors, face_indices_snap = pending
-        self._thicken_pending_errors = None
-        p = getattr(self, '_thicken_panel', None)
-        if p is None:
-            return
-        p.clear_face_errors()
-        for i, msg in face_errors.items():
-            if i < len(face_indices_snap):
-                p.set_face_entry_error(i, msg)
 
     def _on_thicken_ok(self, thickness: float):
         body_id      = getattr(self, '_thicken_body_id', None)

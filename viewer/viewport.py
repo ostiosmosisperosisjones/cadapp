@@ -106,8 +106,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._extrude_arrow_dir    = None
         self._drag_arrow_active      = False  # True while dragging any op arrow
         self._drag_arrow_axis_origin = None  # world point on drag axis
-        self._drag_arrow_op          = None  # 'extrude' | 'thicken' | 'revolve'
-        self._revolve_preview_mesh   = None  # list of build123d solids | None
+        self._drag_arrow_op          = None  # 'extrude' | 'thicken' | 'revolve' | 'fillet3d'
+        self._revolve_preview_mesh   = None
         self._revolve_arrow_origin   = None
         self._revolve_arrow_dir      = None
         self._revolve_axis_point     = None  # stored for drag projection
@@ -115,9 +115,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
 
         self._thicken_panel         = None
         self._thicken_body_id       = None
-        self._thicken_preview_token = None
-        self._thicken_preview_tris  = None
-        self._thicken_preview_edges = None
+        self._thicken_preview_mesh  = None
         self._thicken_preview_dist  = 0.0
         self._thicken_arrow_origin  = None
         self._thicken_arrow_dir     = None
@@ -216,8 +214,15 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self.update()
 
     def _visible_meshes(self) -> dict:
-        return {bid: m for bid, m in self._meshes.items()
-                if self._body_visible.get(bid, True)}
+        meshes = {bid: m for bid, m in self._meshes.items()
+                  if self._body_visible.get(bid, True)}
+        # Fillet3D preview: swap source body mesh with preview mesh
+        preview = getattr(self, '_fillet3d_preview_mesh', None)
+        body_id = getattr(self, '_fillet3d_body_id', None)
+        if preview is not None and body_id is not None and body_id in meshes:
+            meshes = dict(meshes)
+            meshes[body_id] = preview
+        return meshes
 
     def fit_camera_to_scene(self):
         if not self._meshes:
@@ -619,10 +624,38 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._drag_arrow_op          = 'revolve'
         return True
 
+    def _hit_fillet3d_arrow(self, mx: int, my: int) -> bool:
+        if getattr(self, '_fillet3d_panel', None) is None:
+            return False
+        arrow_origin = getattr(self, '_fillet3d_arrow_origin', None)
+        arrow_dir    = getattr(self, '_fillet3d_arrow_dir',    None)
+        if arrow_origin is None or arrow_dir is None:
+            return False
+        ray_o, ray_d = self.get_ray(mx, my)
+        if ray_o is None:
+            return False
+        from viewer.drag_arrow import DragArrow
+        panel  = getattr(self, '_fillet3d_panel', None)
+        radius = (panel._spinbox.mm_value() or 1.0) if panel else 1.0
+        if DragArrow().hit_test(ray_o, ray_d, arrow_origin, arrow_dir,
+                                self._arrow_scale(radius)) is None:
+            return False
+        import numpy as np
+        # Use the base (face centroid) as axis origin so _closest_point_on_axis
+        # returns the radius directly (distance along normal from base).
+        base = getattr(self, '_fillet3d_arrow_base', None)
+        self._drag_arrow_axis_origin = (np.asarray(base, dtype=float)
+                                        if base is not None
+                                        else np.asarray(arrow_origin, dtype=float))
+        self._drag_arrow_active = True
+        self._drag_arrow_op     = 'fillet3d'
+        return True
+
     def _hit_any_arrow(self, mx: int, my: int) -> bool:
         return (self._hit_extrude_arrow(mx, my) or
                 self._hit_thicken_arrow(mx, my) or
-                self._hit_revolve_arrow(mx, my))
+                self._hit_revolve_arrow(mx, my) or
+                self._hit_fillet3d_arrow(mx, my))
 
     def _update_arrow_drag(self, mx: int, my: int):
         import numpy as np
@@ -660,7 +693,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             if panel is None:
                 return
             panel._spinbox.set_mm(s)
-            panel._emit_preview()
+            panel._fire_preview()
 
         elif op == 'revolve':
             # Project mouse onto the tangent plane at the arrow tip to get angle delta.
@@ -712,6 +745,22 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     new_tip = ap + np.dot(bp - ap, ad) * ad + rn * (c * r_perp + s_r * tan_vec)
                     self._drag_arrow_axis_origin = new_tip
             panel._angle_spinbox.set_mm(new_angle)
+            panel._fire_preview()
+
+        elif op == 'fillet3d':
+            arrow_dir = getattr(self, '_fillet3d_arrow_dir', None)
+            if arrow_dir is None:
+                return
+            s = self._closest_point_on_axis(ray_o, ray_d, axis_origin, arrow_dir)
+            if s is None:
+                return
+            s = max(0.001, min(10000.0, s))
+            panel = getattr(self, '_fillet3d_panel', None)
+            if panel is None:
+                return
+            panel._spinbox.set_mm(s)
+            self._reposition_fillet3d_arrow()
+            self.update()
             panel._emit_preview()
 
     # ------------------------------------------------------------------
@@ -1244,6 +1293,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         return
                     # Route to extrude panel pick-edge mode if active
                     if self.route_edge_pick_for_extrude(hov_eidx, hov_ebody):
+                        return
+                    # Route to 3D fillet edge-pick if active
+                    if self.route_edge_pick_for_fillet3d(hov_eidx, hov_ebody):
                         return
                     self.selection.select_edge(hov_ebody, hov_eidx,
                                                additive=additive)

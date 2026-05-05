@@ -60,11 +60,11 @@ class RevolveMixin:
         panel.picking_body_changed.connect(self._on_revolve_pick_body)
         panel.preview_changed.connect(self._on_revolve_preview)
 
-        self._revolve_panel        = panel
-        self._revolve_axis_active  = False
-        self._revolve_face_active  = False
-        self._revolve_body_active  = False
-        self._revolve_preview_mesh = None
+        self._revolve_panel          = panel
+        self._revolve_axis_active    = False
+        self._revolve_face_active    = False
+        self._revolve_body_active    = False
+        self._revolve_preview_mesh   = None
 
         self._position_revolve_panel()
         panel.show()
@@ -82,12 +82,12 @@ class RevolveMixin:
         if hasattr(self, '_revolve_panel') and self._revolve_panel is not None:
             self._revolve_panel.close()
             self._revolve_panel = None
-        self._revolve_axis_active  = False
-        self._revolve_face_active  = False
-        self._revolve_body_active  = False
-        self._revolve_preview_mesh = None
-        self._revolve_arrow_origin = None
-        self._revolve_arrow_dir    = None
+        self._revolve_axis_active   = False
+        self._revolve_face_active   = False
+        self._revolve_body_active   = False
+        self._revolve_preview_mesh  = None
+        self._revolve_arrow_origin  = None
+        self._revolve_arrow_dir     = None
         self._revolve_face_centroid = None
         if getattr(self, '_editing_history_idx', None) is not None:
             self._cancel_revolve_edit()
@@ -98,61 +98,53 @@ class RevolveMixin:
     # ------------------------------------------------------------------
 
     def _on_revolve_preview(self, angle: float, axis_point, axis_dir):
+        import numpy as np
+        from cad.operations.revolve import _do_revolve_solid
+
         if axis_point is None or axis_dir is None or angle == 0:
             self._revolve_preview_mesh = None
             self._revolve_arrow_origin = None
             self._revolve_arrow_dir    = None
             self.update()
             return
-        import numpy as np
-        from cad.operations.revolve import _do_revolve_solid
+
+        axis_pt = np.array(axis_point, dtype=float)
+        axis_d  = np.array(axis_dir,   dtype=float)
+        axis_d /= np.linalg.norm(axis_d)
 
         sketch_idx = getattr(self, '_revolve_sketch_idx', None)
         face_pairs = getattr(self, '_revolve_face_pairs', [])
-        axis_pt  = np.array(axis_point, dtype=float)
-        axis_d   = np.array(axis_dir,   dtype=float)
-        axis_d  /= np.linalg.norm(axis_d)
 
-        try:
-            faces = []
-            if sketch_idx is not None:
-                all_sketch = self._sketch_faces.get(sketch_idx, [])
-                if not all_sketch:
-                    self._revolve_preview_mesh = None
-                    self._revolve_arrow_origin = None
-                    self._revolve_arrow_dir    = None
-                    self.update(); return
-                fidx_sel = self._selected_sketch_face
-                if fidx_sel is not None:
-                    faces = [all_sketch[i][0] for i in fidx_sel
-                             if 0 <= i < len(all_sketch)]
-                else:
-                    faces = [f[0] for f in all_sketch]
-            elif face_pairs:
-                for bid, fi in face_pairs:
-                    shape = self.workspace.current_shape(bid)
-                    if shape is None:
-                        continue
-                    all_f = list(shape.faces())
-                    if fi < len(all_f):
-                        faces.append(all_f[fi])
+        faces = []
+        if sketch_idx is not None:
+            all_sketch = self._sketch_faces.get(sketch_idx, [])
+            fidx_sel   = self._selected_sketch_face
+            faces = ([all_sketch[i][0] for i in fidx_sel if 0 <= i < len(all_sketch)]
+                     if fidx_sel is not None else [f[0] for f in all_sketch])
+        elif face_pairs:
+            for bid, fi in face_pairs:
+                shape = self.workspace.current_shape(bid)
+                if shape is None:
+                    continue
+                all_f = list(shape.faces())
+                if fi < len(all_f):
+                    faces.append(all_f[fi])
 
-            if not faces:
-                self._revolve_preview_mesh = None
-                self._revolve_arrow_origin = None
-                self._revolve_arrow_dir    = None
-                self.update(); return
-
-            self._revolve_preview_mesh = [
-                _do_revolve_solid(f, axis_pt, axis_d, angle)
-                for f in faces
-            ]
-            self._update_revolve_arrow(faces, axis_pt, axis_d, angle)
-        except Exception as ex:
-            print(f"[Revolve Preview] {ex}")
+        if not faces:
             self._revolve_preview_mesh = None
             self._revolve_arrow_origin = None
             self._revolve_arrow_dir    = None
+            self.update(); return
+
+        try:
+            self._revolve_preview_mesh = [
+                _do_revolve_solid(f, axis_pt, axis_d, angle) for f in faces
+            ]
+        except Exception as ex:
+            print(f"[Revolve preview] {ex}")
+            self._revolve_preview_mesh = None
+
+        self._update_revolve_arrow(faces, axis_pt, axis_d, angle)
         self.update()
 
     def _update_revolve_arrow(self, faces, axis_pt, axis_d, angle_deg: float):
@@ -213,79 +205,72 @@ class RevolveMixin:
 
     def _draw_revolve_preview(self):
         solids = getattr(self, '_revolve_preview_mesh', None)
-        if not solids:
-            return
+        if solids:
+            from OCP.BRep import BRep_Tool
+            from OCP.BRepMesh import BRepMesh_IncrementalMesh
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
+            from OCP.TopoDS import TopoDS
+            from OCP.TopLoc import TopLoc_Location
+            from OCP.BRepAdaptor import BRepAdaptor_Curve
+            from OCP.GCPnts import GCPnts_UniformAbscissa
+            from OpenGL.GL import (glDisable, glEnable, glColor4f, glBegin, glEnd,
+                                   glVertex3f, glLineWidth, glBlendFunc,
+                                   GL_LIGHTING, GL_DEPTH_TEST, GL_CULL_FACE,
+                                   GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                                   GL_TRIANGLES, GL_LINE_STRIP)
+            from cad.prefs import prefs as _prefs
+            r, g, b = _prefs.op_preview_color
+            op = _prefs.op_preview_opacity
+            fill_color = (r, g, b, op)
+            edge_color = (min(r+0.23, 1.0), min(g+0.30, 1.0), min(b+0.15, 1.0), min(op+0.35, 1.0))
 
-        from OCP.BRep import BRep_Tool
-        from OCP.BRepMesh import BRepMesh_IncrementalMesh
-        from OCP.TopExp import TopExp_Explorer
-        from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
-        from OCP.TopoDS import TopoDS
-        from OCP.BRepAdaptor import BRepAdaptor_Curve
-        from OCP.GCPnts import GCPnts_UniformAbscissa
-        from OpenGL.GL import (glDisable, glEnable, glColor4f, glBegin, glEnd,
-                               glVertex3f, glLineWidth, glBlendFunc,
-                               GL_LIGHTING, GL_DEPTH_TEST, GL_CULL_FACE,
-                               GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-                               GL_TRIANGLES, GL_LINE_STRIP)
+            glDisable(GL_LIGHTING)
+            glEnable(GL_DEPTH_TEST)
+            glDisable(GL_CULL_FACE)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-        glDisable(GL_LIGHTING)
-        glEnable(GL_DEPTH_TEST)
-        glDisable(GL_CULL_FACE)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-
-        from cad.prefs import prefs as _prefs
-        r, g, b = _prefs.op_preview_color
-        fill_color = (r, g, b, 0.22)
-        edge_color = (min(r + 0.23, 1.0), min(g + 0.30, 1.0), min(b + 0.15, 1.0), 0.80)
-
-        for solid in solids:
-            try:
-                wrapped = solid.wrapped
-                BRepMesh_IncrementalMesh(wrapped, 0.15)
-
-                glColor4f(*fill_color)
-                exp = TopExp_Explorer(wrapped, TopAbs_FACE)
-                while exp.More():
-                    face = TopoDS.Face_s(exp.Current())
-                    loc  = face.Location()
-                    tri  = BRep_Tool.Triangulation_s(face, loc)
-                    if tri is not None:
-                        glBegin(GL_TRIANGLES)
-                        for i in range(1, tri.NbTriangles() + 1):
-                            n1, n2, n3 = tri.Triangle(i).Get()
-                            for ni in (n1, n2, n3):
-                                p = tri.Node(ni)
-                                glVertex3f(p.X(), p.Y(), p.Z())
-                        glEnd()
-                    exp.Next()
-
-                glColor4f(*edge_color)
-                glLineWidth(1.4)
-                exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
-                while exp2.More():
-                    edge = exp2.Current()
-                    try:
-                        adaptor = BRepAdaptor_Curve(edge)
-                        disc    = GCPnts_UniformAbscissa()
-                        disc.Initialize(adaptor, 32)
-                        if disc.IsDone() and disc.NbPoints() >= 2:
-                            glBegin(GL_LINE_STRIP)
-                            for pi in range(1, disc.NbPoints() + 1):
-                                p = adaptor.Value(disc.Parameter(pi))
-                                glVertex3f(p.X(), p.Y(), p.Z())
+            for solid in solids:
+                try:
+                    wrapped = solid.wrapped
+                    BRepMesh_IncrementalMesh(wrapped, 0.15)
+                    _identity = TopLoc_Location()
+                    glColor4f(*fill_color)
+                    exp = TopExp_Explorer(wrapped, TopAbs_FACE)
+                    while exp.More():
+                        face = TopoDS.Face_s(exp.Current())
+                        tri  = BRep_Tool.Triangulation_s(face, _identity)
+                        if tri is not None:
+                            glBegin(GL_TRIANGLES)
+                            for i in range(1, tri.NbTriangles() + 1):
+                                n1, n2, n3 = tri.Triangle(i).Get()
+                                for ni in (n1, n2, n3):
+                                    p = tri.Node(ni)
+                                    glVertex3f(p.X(), p.Y(), p.Z())
                             glEnd()
-                    except Exception:
-                        pass
-                    exp2.Next()
-                glLineWidth(1.0)
-            except Exception as ex:
-                print(f"[Revolve Preview] draw error: {ex}")
-
-        glDisable(GL_BLEND)
-        glEnable(GL_CULL_FACE)
-        glEnable(GL_LIGHTING)
+                        exp.Next()
+                    glColor4f(*edge_color)
+                    glLineWidth(1.4)
+                    exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
+                    while exp2.More():
+                        edge = exp2.Current()
+                        try:
+                            adp  = BRepAdaptor_Curve(edge)
+                            disc = GCPnts_UniformAbscissa()
+                            disc.Initialize(adp, 24)
+                            if disc.IsDone() and disc.NbPoints() >= 2:
+                                glBegin(GL_LINE_STRIP)
+                                for pi in range(1, disc.NbPoints() + 1):
+                                    p = adp.Value(disc.Parameter(pi))
+                                    glVertex3f(p.X(), p.Y(), p.Z())
+                                glEnd()
+                        except Exception:
+                            pass
+                        exp2.Next()
+                    glLineWidth(1.0)
+                except Exception as ex:
+                    print(f"[Revolve preview draw] {ex}")
 
         self._draw_revolve_arrow()
 
