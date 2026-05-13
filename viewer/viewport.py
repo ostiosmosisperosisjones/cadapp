@@ -1337,7 +1337,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     return
                 if idx is not None and self.route_body_pick_for_revolve(body_id):
                     return
-                if idx is not None:
+                if idx is not None and body_id in self.workspace.bodies:
                     self._selected_sketch_entry = None
                     self._selected_sketch_face  = None
                     self.selection.select_face(body_id, idx, additive=additive)

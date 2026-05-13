@@ -195,13 +195,18 @@ class HistoryMixin:
             self.workspace.remove_body(bid)
         self.history.delete(index)
 
+        # If the primary body now has no history entries at all, it has no
+        # source of geometry — remove it so it doesn't linger as a ghost.
+        if not any(e.body_id == body_id for e in self.history.entries):
+            self.workspace.remove_body(body_id)
+
         # Replay all surviving body chains in a single ordered pass so that
         # cross-body ops see up-to-date dependency shapes.
-        removed_body_ids = set(split_body_ids) | set(child_body_ids)
-        _, _, replay_mutated = self.history.replay_all_from(index)
-        mutated = ({body_id} | removed_body_ids) | replay_mutated
+        self.history.replay_all_from(index)
 
-        self._rebuild_bodies(mutated)
+        # Full rebuild — equivalent to clicking the last history entry — so any
+        # ghost meshes for removed bodies are guaranteed to be flushed.
+        self._rebuild_all_meshes()
         self.history_changed.emit()
 
     def _do_reorder(self, src: int, dst: int):
@@ -241,9 +246,20 @@ class HistoryMixin:
         # Snapshot bodies that will be removed.
         child_body_ids = list(entries[index].params.get("child_body_ids", []))
         split_body_ids = [entries[i].body_id for i in split_indices]
+        primary_body_id = entries[index].body_id
+        # If this is the only entry for the primary body, deleting it will also
+        # remove the body itself — snapshot it so undo can restore it.
+        primary_will_be_removed = not any(
+            e.body_id == primary_body_id
+            for i, e in enumerate(entries)
+            if i != index and i not in split_indices
+        )
+        bodies_to_snapshot = split_body_ids + child_body_ids
+        if primary_will_be_removed:
+            bodies_to_snapshot = [primary_body_id] + bodies_to_snapshot
         removed_bodies = [
             (bid, copy.deepcopy(self.workspace.bodies[bid]))
-            for bid in (split_body_ids + child_body_ids)
+            for bid in bodies_to_snapshot
             if bid in self.workspace.bodies
         ]
 
