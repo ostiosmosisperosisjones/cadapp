@@ -207,29 +207,32 @@ class BodyEdgeSource(EdgeSource):
 
 class SketchEdgeSource(EdgeSource):
     """
-    A LineEntity from a previously committed sketch entry.
+    A LineEntity (or ArcEntity) from a previously committed sketch entry.
 
-    On resolve(), converts the UV-space line back to world space using the
-    source SketchEntry's (possibly already-updated) plane cache, so it
+    Identified by the source sketch's stable entry_id UUID, so reorder/
+    delete/insert in the history list never breaks the reference.
+
+    On resolve(), converts the UV-space entity back to world space using
+    the source SketchEntry's (possibly already-updated) plane cache, so it
     automatically inherits upstream sketch plane changes.
     """
 
-    def __init__(self, history_idx: int, entity_idx: int):
-        self.history_idx = history_idx
-        self.entity_idx  = entity_idx
+    def __init__(self, source_entry_id: str, entity_idx: int):
+        self.source_entry_id = source_entry_id
+        self.entity_idx      = entity_idx
 
     def resolve(self, history, before_index: int) -> tuple[list, list | None]:
         from cad.sketch import LineEntity
 
-        entries = history.entries
-        if self.history_idx >= len(entries):
+        sketch_idx = history.id_to_index(self.source_entry_id)
+        if sketch_idx is None:
             raise RuntimeError(
-                f"SketchEdgeSource: history_idx {self.history_idx} out of range")
-        entry = entries[self.history_idx]
+                f"SketchEdgeSource: source entry '{self.source_entry_id}' not found")
+        entry = history.entries[sketch_idx]
         se = entry.params.get("sketch_entry")
         if se is None:
             raise RuntimeError(
-                f"SketchEdgeSource: entry {self.history_idx} has no sketch_entry")
+                f"SketchEdgeSource: entry '{self.source_entry_id}' has no sketch_entry")
         if self.entity_idx >= len(se.entities):
             raise RuntimeError(
                 f"SketchEdgeSource: entity_idx {self.entity_idx} out of range")
@@ -273,12 +276,12 @@ class SketchEdgeSource(EdgeSource):
             return [p0.tolist(), p1.tolist()], [occ_edge]
         else:
             raise RuntimeError(
-                f"SketchEdgeSource: entity {self.entity_idx} has unsupported type "
-                f"{type(ent).__name__}")
+                f"SketchEdgeSource: entity {self.entity_idx} in entry "
+                f"'{self.source_entry_id}' has unsupported type {type(ent).__name__}")
 
     def to_dict(self) -> dict:
         return {
-            "type":        "sketch_edge",
-            "history_idx": self.history_idx,
-            "entity_idx":  self.entity_idx,
+            "type":            "sketch_edge",
+            "source_entry_id": self.source_entry_id,
+            "entity_idx":      self.entity_idx,
         }

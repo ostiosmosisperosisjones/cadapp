@@ -182,7 +182,10 @@ class IncludeTool:
             else:
                 continue
 
-            source = SketchEdgeSource(se.history_idx, se.entity_idx)
+            src_entry_id = history.index_to_id(se.history_idx)
+            if src_entry_id is None:
+                continue
+            source = SketchEdgeSource(src_entry_id, se.entity_idx)
             sketch.entities.append(
                 ReferenceEntity(uv_pts, source_type='sketch_edge',
                                 occ_edges=[occ_edge] if occ_edge is not None else None,

@@ -132,10 +132,16 @@ def _edge_source_from_dict(d: dict | None):
         return BodyEdgeSource(body_id=d["body_id"], edge_ref=er)
     if t == "sketch_edge":
         from cad.edge_ref import SketchEdgeSource
-        return SketchEdgeSource(
-            history_idx = int(d["history_idx"]),
-            entity_idx  = int(d["entity_idx"]),
-        )
+        if "source_entry_id" in d:
+            return SketchEdgeSource(
+                source_entry_id = str(d["source_entry_id"]),
+                entity_idx      = int(d["entity_idx"]),
+            )
+        # Legacy v1: integer history_idx — resolved to a UUID in a post-load
+        # pass once history._entries is populated.
+        src = SketchEdgeSource(source_entry_id="", entity_idx=int(d["entity_idx"]))
+        src._legacy_history_idx = int(d["history_idx"])
+        return src
     return None
 
 
@@ -346,7 +352,7 @@ def save(workspace, history, camera=None) -> bytes:
         })
 
     doc: dict[str, Any] = {
-        "version":             1,
+        "version":             2,
         "bodies":              bodies,
         "active_body_id":      workspace._active_body_id,
         "world_plane_visible": workspace.world_plane_visible,
@@ -427,8 +433,42 @@ def load(data: bytes):
 
     history._cursor = int(doc.get("history_cursor", len(history._entries) - 1))
 
+    # v1 → v2 migration: SketchEdgeSource used to be keyed by an integer
+    # history_idx.  Convert any deferred-legacy sources to their entry_id
+    # now that all entries (with their UUIDs) are loaded.
+    _migrate_legacy_sketch_edge_sources(history)
+
     camera_dict = doc.get("camera")
     return workspace, history, camera_dict
+
+
+def _migrate_legacy_sketch_edge_sources(history) -> None:
+    """Resolve any SketchEdgeSource._legacy_history_idx → source_entry_id."""
+    from cad.edge_ref import SketchEdgeSource
+    from cad.sketch import ReferenceEntity
+
+    for e in history._entries:
+        se = e.params.get("sketch_entry")
+        if se is None:
+            continue
+        for ent in se.entities:
+            if not isinstance(ent, ReferenceEntity):
+                continue
+            src = ent.source
+            if not isinstance(src, SketchEdgeSource):
+                continue
+            legacy = getattr(src, '_legacy_history_idx', None)
+            if legacy is None:
+                continue
+            uuid = history.index_to_id(legacy)
+            if uuid is None:
+                # Out of range — leave the source pointing at an empty id so
+                # resolve() raises a clear error rather than silently picking
+                # the wrong entry.
+                src.source_entry_id = ""
+            else:
+                src.source_entry_id = uuid
+            del src._legacy_history_idx
 
 
 def replay_all(workspace, history) -> list[str]:

@@ -17,6 +17,18 @@ class Op:
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         raise NotImplementedError
 
+    def creates_body_from_nothing(self, history: "History", entry_index: int) -> bool:
+        """
+        True if this op is the first one on its body chain and produces a
+        shape with no prior input — e.g. a sketch extrude on a world plane.
+        Replay uses this to skip the "no input shape" guard.
+
+        Distinct from force_new_body: that flag means "spawn a child body
+        alongside the source body".  This predicate means "no source shape
+        is required at all".
+        """
+        return getattr(self, 'force_new_body', False)
+
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         """
         Run the operation for the first time (or after an edit), push history
@@ -101,6 +113,45 @@ class Op:
         if factory is None:
             return None
         return factory(operation, params)
+
+
+# Maximum UV-space distance between a stored sketch-face centroid and the
+# nearest current region centroid before we declare the original face gone.
+# 5mm is generous enough to absorb realistic sketch edits (moves, small
+# resizes, fillet/trim re-topology) but tight enough to catch deletions —
+# practical sketches live at 1–100mm scales so a 5mm centroid shift means
+# the face's identity is no longer recognisable.
+_FACE_CENTROID_MATCH_TOL = 5.0
+
+
+def _match_face_by_centroid(target, all_faces: list, all_regions: list,
+                            op_name: str, tol: float = _FACE_CENTROID_MATCH_TOL):
+    """
+    Find the face in *all_faces* whose region centroid is closest to *target*.
+    Raises RuntimeError when the closest match is further than *tol* mm —
+    i.e. the original face has been deleted or moved beyond recognition.
+
+    target      : (u, v) numpy array — the stored centroid from the original op
+    all_faces   : faces returned by SketchEntry.build_faces()[0]
+    all_regions : regions returned by SketchEntry.build_faces()[1]
+    op_name     : operation name to embed in the error message
+    """
+    import numpy as np
+    if not all_regions:
+        raise RuntimeError(f"{op_name}: sketch has no regions to match against")
+    best_i, best_d = -1, float('inf')
+    for i, region in enumerate(all_regions):
+        outer_uvs = region[0]
+        c = np.array(outer_uvs).mean(axis=0)
+        d = float(np.linalg.norm(c - target))
+        if d < best_d:
+            best_d, best_i = d, i
+    if best_d > tol:
+        raise RuntimeError(
+            f"{op_name}: stored sketch face no longer exists "
+            f"(nearest region centroid is {best_d:.3f}mm from stored "
+            f"target, threshold is {tol}mm)")
+    return all_faces[best_i]
 
 
 def _push_result(viewport, op_str: str, op_params: dict, body_id: str,

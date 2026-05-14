@@ -422,7 +422,10 @@ class CrossBodyCutOp(Op):
     source_face_idx  : face index on source_body (None if driven by sketch)
     source_sketch_id: entry_id of the driving sketch entry (None if face-driven)
     distance         : depth of the tool solid (always positive; direction encodes side)
-    direction        : unit vector the tool extends along, or None
+    direction        : unit vector the tool extends along (same convention
+                       as the preview: outward from the face the user picked,
+                       or whatever the user flipped to via the panel).  When
+                       None, the tool extrudes along the face's inward normal.
     target_vertex    : world-space point the tool depth is measured to, or None
     start_offset     : mm offset on near end
     end_offset       : mm offset on far end
@@ -444,19 +447,40 @@ class CrossBodyCutOp(Op):
         from OCP.TopTools import TopTools_ListOfShape
         from cad.operations.extrude import _do_extrude_solid
 
+        # stored direction IS the tool direction (matches preview convention).
+        # When None, the per-face fallback below extrudes along -face_normal
+        # (into the body the face is on) as a default for face-driven cuts.
         direction = (np.array(self.direction, dtype=float)
                      if self.direction is not None else None)
-        tool_dir = -direction if direction is not None else None
+        tool_dir = direction
 
         if self.source_sketch_id is not None:
             sketch_idx = history.id_to_index(self.source_sketch_id)
             if sketch_idx is None:
                 raise RuntimeError(
                     f"CrossBodyCutOp: sketch entry '{self.source_sketch_id}' not found")
-            sketch_entry = history._entries[sketch_idx].params.get("sketch_entry")
+            sketch_rec = history._entries[sketch_idx]
+            if sketch_rec.error:
+                raise RuntimeError(
+                    "CrossBodyCutOp: source sketch entry is in an error state")
+            sketch_entry = sketch_rec.params.get("sketch_entry")
             if sketch_entry is None:
                 raise RuntimeError(
                     f"CrossBodyCutOp: no sketch_entry at id '{self.source_sketch_id}'")
+            # Reproject the sketch's plane + reference entities against the
+            # shape state as of *this* op's history position — not the sketch's
+            # own position.  The sketch's plane_source is the abstract identity
+            # (e.g. "body A's top face"); its geometric realisation must follow
+            # any intervening operations that moved that face.  Otherwise the
+            # tool solid lands at the sketch's original plane, producing
+            # garbage cuts (or wholesale deletion of the target).
+            if sketch_entry.plane_source is not None:
+                from cad.history import _replay_sketch_entry
+                ok, err = _replay_sketch_entry(sketch_entry, history,
+                                               before_index=entry_index)
+                if not ok:
+                    raise RuntimeError(
+                        f"CrossBodyCutOp: sketch reprojection failed: {err}")
             all_faces, _ = sketch_entry.build_faces()
             if not all_faces:
                 raise RuntimeError("CrossBodyCutOp: sketch has no closed loops")
@@ -541,7 +565,8 @@ class CrossBodyCutOp(Op):
 
         direction = (np.array(self.direction, dtype=float)
                      if self.direction is not None else None)
-        tool_dir = -direction if direction is not None else None
+        # See note in execute(): stored direction is the tool direction.
+        tool_dir = direction
 
         source_face_ref = None
         if self.source_sketch_id is not None:
@@ -746,6 +771,23 @@ class SketchExtrudeOp(Op):
     force_new_body:  bool  = False
     merged_from:     str   | None = None
 
+    def creates_body_from_nothing(self, history: "History", entry_index: int) -> bool:
+        """
+        True when this sketch extrude is rooted on a world plane and has no
+        prior shape on its body — i.e. it's creating the body from scratch.
+        extrude_face_direct() handles shape=None for exactly this case.
+        """
+        if self.force_new_body or self.merge_body_id is not None:
+            return True
+        sketch_idx = history.id_to_index(self.from_sketch_id)
+        if sketch_idx is None:
+            return False
+        se = history._entries[sketch_idx].params.get("sketch_entry")
+        if se is None:
+            return False
+        from cad.plane_ref import WorldPlaneSource
+        return isinstance(se.plane_source, WorldPlaneSource)
+
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         from cad.operations.extrude import extrude_face_direct
         from build123d import Compound
@@ -769,7 +811,17 @@ class SketchExtrudeOp(Op):
 
         if se.plane_source is not None:
             from cad.history import _replay_sketch_entry
-            _replay_sketch_entry(se, history, before_index=sketch_idx)
+            # Reproject at *this* op's history position so the sketch's plane
+            # follows any intervening operations on its parent body.  Using
+            # sketch_idx would freeze the plane at the sketch's creation time
+            # and produce wrong geometry when something moved the parent face
+            # between the sketch and this extrude.
+            ok, err = _replay_sketch_entry(se, history, before_index=entry_index)
+            if not ok:
+                # Reprojection failed — the sketch's cached UV points and plane
+                # are stale.  Fail loudly instead of extruding against them.
+                raise RuntimeError(
+                    f"SketchExtrudeOp: sketch reprojection failed: {err}")
 
         all_faces, all_regions = se.build_faces()
         if not all_faces:
@@ -777,17 +829,11 @@ class SketchExtrudeOp(Op):
 
         if self.face_centroids:
             import numpy as np
+            from cad.op_base import _match_face_by_centroid
             centroids = np.array(self.face_centroids, dtype=float)
-            faces = []
-            for target in centroids:
-                best_i, best_d = 0, float('inf')
-                for i, region in enumerate(all_regions):
-                    outer_uvs = region[0]
-                    c = np.array(outer_uvs).mean(axis=0)
-                    d = float(np.linalg.norm(c - target))
-                    if d < best_d:
-                        best_d, best_i = d, i
-                faces.append(all_faces[best_i])
+            faces = [_match_face_by_centroid(t, all_faces, all_regions,
+                                             "SketchExtrudeOp")
+                     for t in centroids]
         elif self.face_indices is not None:
             faces = [all_faces[i] for i in self.face_indices if i < len(all_faces)]
             if not faces:

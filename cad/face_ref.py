@@ -101,26 +101,44 @@ class FaceRef:
 
     def find_in(self, shape,
                 normal_tol:  float = 0.001,
-                area_tol:    float = 0.5,
                 perp_tol:    float = 0.1,
+                area_frac:   float = 0.5,
                 ) -> tuple[int, object] | tuple[None, None]:
         """
         Find the best matching face in a build123d shape.
 
-        Matches on: normal direction, area, centroid_perp.
-        The centroid_along component is intentionally ignored —
-        it shifts predictably with extrude/cut distance.
+        Filters on: same normal direction (parallel) and perp-centroid within
+        perp_tol mm.  Area is *not* a hard filter — intervening cuts/fillets
+        can shrink a face's area substantially while it remains the same
+        physical face.  Instead area is used as a fallback tiebreaker only
+        when along_dist is identical.
+
+        Ranking among the surviving candidates:
+          1. same-direction normal beats opposite
+          2. closest centroid_along to ref (face didn't move far)
+          3. closest perp distance
+          4. closest area (final tiebreaker)
+
+        area_frac caps how much area drift is tolerated — a candidate whose
+        area differs from the ref by more than area_frac * ref.area is
+        rejected entirely.  Default 0.5 (50%) is generous enough to survive
+        normal cut/fillet operations but rejects matches to wholly different
+        faces.
 
         Returns (face_index, b3d_face) or (None, None) if no match.
         """
         ref_normal = np.array(self.normal)
         ref_perp   = np.array(self.centroid_perp)
+        # Absolute area cap so e.g. a 1mm² face can't accept a 100mm² match.
+        # Use 0.5mm² as a floor so tiny faces still admit small drift.
+        area_cap   = max(self.area * area_frac, 0.5)
 
         best_idx        = None
         best_face       = None
         best_perp_dist  = float("inf")
-        best_same_dir   = False      # prefer same-direction over opposite
+        best_same_dir   = False
         best_along_dist = float("inf")
+        best_area_dist  = float("inf")
 
         for idx, face in enumerate(shape.faces()):
             occ = face.wrapped
@@ -136,8 +154,8 @@ class FaceRef:
 
             centroid, area = _occ_face_props(occ)
 
-            # Area must match
-            if abs(area - self.area) > area_tol:
+            # Area drift cap — generous but not unbounded
+            if abs(area - self.area) > area_cap:
                 continue
 
             # Perpendicular centroid component must match
@@ -148,9 +166,8 @@ class FaceRef:
                 continue
 
             along_dist = abs(along - self.centroid_along)
+            area_dist  = abs(area - self.area)
 
-            # Rank: same-direction normal wins over opposite; then closest
-            # centroid_along (face didn't move far); then closest perp dist.
             better = False
             if best_idx is None:
                 better = True
@@ -159,8 +176,11 @@ class FaceRef:
             elif same_dir == best_same_dir:
                 if along_dist < best_along_dist - 1e-6:
                     better = True
-                elif abs(along_dist - best_along_dist) < 1e-6 and perp_dist < best_perp_dist:
-                    better = True
+                elif abs(along_dist - best_along_dist) < 1e-6:
+                    if perp_dist < best_perp_dist - 1e-6:
+                        better = True
+                    elif abs(perp_dist - best_perp_dist) < 1e-6 and area_dist < best_area_dist:
+                        better = True
 
             if better:
                 best_idx        = idx
@@ -168,6 +188,7 @@ class FaceRef:
                 best_perp_dist  = perp_dist
                 best_same_dir   = same_dir
                 best_along_dist = along_dist
+                best_area_dist  = area_dist
 
         return best_idx, best_face
 

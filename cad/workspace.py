@@ -87,12 +87,23 @@ class Workspace:
 
     def current_shape(self, body_id: str) -> Any | None:
         """
-        Return the current shape of a body — the shape_after of the last
-        history entry for this body at or before the cursor.
-        Falls back to source_shape if no operations have been applied.
+        Return the current shape of a body, honoring temporal/parametric
+        validity strictly:
 
-        Bodies with created_at_entry_id return None if the cursor is before
-        the entry that created them (they don't exist yet at that point).
+          - If the body's creation entry is at or after the cursor, the body
+            doesn't exist yet → return None.
+          - If the body's creation entry is errored, the body has no valid
+            origin → return None.
+          - Otherwise look up the last history entry for this body at or
+            before the cursor.  If it errored or has no shape_after, return
+            None (the body is logically invisible until the error is fixed).
+          - If the body has no entries of its own (e.g. STEP-imported bodies
+            with only an import entry that doesn't push a non-None
+            shape_after), fall back to source_shape.
+
+        Mesh rebuild + viewport rendering use this single function as the
+        source of truth, so an errored op anywhere in the relevant chain
+        causes the body to disappear from the viewport entirely.
         """
         if body_id not in self.bodies:
             return None
@@ -104,23 +115,30 @@ class Workspace:
         entries = self.history.entries
         cursor  = self.history.cursor
 
-        # If this body was created by a specific op, check the cursor is at
-        # or past that op before returning any shape.
+        # Creation entry must be visible (at-or-before cursor) AND not errored.
         if body.created_at_entry_id is not None:
             created_idx = self.history.id_to_index(body.created_at_entry_id)
             if created_idx is None or created_idx > cursor:
                 return None
+            if entries[created_idx].error:
+                return None
 
-        result = None
+        # Find the last entry for this body at-or-before the cursor.
+        last_entry = None
         for i, entry in enumerate(entries):
             if i > cursor:
                 break
             if entry.body_id != body_id:
                 continue
-            if not entry.error and entry.shape_after is not None:
-                result = entry.shape_after
+            last_entry = entry
 
-        return result or body.source_shape
+        if last_entry is not None:
+            if last_entry.error:
+                return None
+            return last_entry.shape_after   # may legitimately be a Compound
+
+        # No history entries for this body — fall back to source_shape.
+        return body.source_shape
 
     def all_current_shapes(self) -> list[tuple[str, Any]]:
         """Return [(body_id, current_shape)] for all visible bodies."""

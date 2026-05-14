@@ -430,29 +430,23 @@ class SketchRevolveOp(Op):
 
         if se.plane_source is not None:
             from cad.history import _replay_sketch_entry
-            _replay_sketch_entry(se, history, before_index=sketch_idx)
+            # Reproject at this op's position (not the sketch's) so the
+            # sketch follows intervening ops on its parent body.
+            ok, err = _replay_sketch_entry(se, history, before_index=entry_index)
+            if not ok:
+                raise RuntimeError(
+                    f"SketchRevolveOp: sketch reprojection failed: {err}")
 
         all_faces, all_regions = se.build_faces()
         if not all_faces:
             raise RuntimeError("SketchRevolveOp: sketch has no closed loops")
 
-        _MAX_CENTROID_DIST = 1e4
-
         if self.face_centroids:
+            from cad.op_base import _match_face_by_centroid
             centroids = np.array(self.face_centroids, dtype=float)
-            faces = []
-            for target in centroids:
-                best_i, best_d = 0, float('inf')
-                for i, region in enumerate(all_regions):
-                    outer_uvs = region[0]
-                    c = np.array(outer_uvs).mean(axis=0)
-                    d = float(np.linalg.norm(c - target))
-                    if d < best_d:
-                        best_d, best_i = d, i
-                if best_d > _MAX_CENTROID_DIST:
-                    raise RuntimeError(
-                        "SketchRevolveOp: profile face no longer exists in sketch")
-                faces.append(all_faces[best_i])
+            faces = [_match_face_by_centroid(t, all_faces, all_regions,
+                                             "SketchRevolveOp")
+                     for t in centroids]
         elif self.face_indices is not None:
             faces = [all_faces[i] for i in self.face_indices if i < len(all_faces)]
             if not faces:

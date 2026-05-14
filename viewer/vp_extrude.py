@@ -737,6 +737,13 @@ class ExtrudeMixin:
                                    sketch_idx, body_id, face_idx, extra)
             return
 
+        # No-target cut: cut through every body the tool intersects, one
+        # CrossBodyCutOp entry per affected body.
+        if is_cut and merge_body_id is None:
+            self._do_cut_all_intersecting(dist, direction, sketch_idx,
+                                          body_id, face_idx, extra)
+            return
+
         force_new_body = (merge_body_id == "__new_body__")
         real_merge_id  = None if force_new_body else merge_body_id
 
@@ -786,6 +793,135 @@ class ExtrudeMixin:
             end_offset       = float((extra or {}).get('end_offset', 0.0)),
         )
         op.commit_async(self, extra)
+
+    def _do_cut_all_intersecting(self, dist, direction, sketch_idx,
+                                 body_id, face_idx, extra):
+        """
+        No-target cut: build the tool solid once, then push a CrossBodyCutOp
+        entry for every workspace body the tool intersects.
+
+        Bodies whose bbox doesn't overlap the tool's are skipped cheaply.
+        Bodies where the boolean Cut produces no real volume change have
+        their just-pushed entry rolled back so the history panel stays clean.
+        """
+        import numpy as np
+        from cad.op_types import CrossBodyCutOp
+        from cad.operations.extrude import _do_extrude_solid
+        from cad.cut_all import bboxes_overlap
+        from build123d import Plane, Compound
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+        from OCP.TopTools import TopTools_ListOfShape
+
+        # ---- Resolve tool faces (depends on UI selection) ------------------
+        if sketch_idx is not None:
+            entries = self.history.entries
+            se = (entries[sketch_idx].params.get("sketch_entry")
+                  if sketch_idx < len(entries) else None)
+            if se is None:
+                print("[Cut] No-target cut: sketch entry missing."); return
+            src_body_id = se.body_id
+            all_sketch = self._sketch_faces.get(sketch_idx, [])
+            fidx_sel = self._selected_sketch_face
+            if fidx_sel is not None:
+                tool_faces = [all_sketch[i][0] for i in fidx_sel
+                              if 0 <= i < len(all_sketch)]
+            else:
+                tool_faces = [f[0] for f in all_sketch]
+        else:
+            src_body_id = body_id
+            src_shape = self.workspace.current_shape(body_id)
+            if src_shape is None or face_idx is None:
+                print("[Cut] No-target cut: source face missing."); return
+            all_faces = list(src_shape.faces())
+            if face_idx >= len(all_faces):
+                print("[Cut] No-target cut: face_idx out of range."); return
+            tool_faces = [all_faces[face_idx]]
+
+        if not tool_faces:
+            print("[Cut] No-target cut: no tool faces."); return
+
+        # ---- Build the tool solid once for the bbox prefilter --------------
+        tool_dist = abs(dist) + 0.01
+        if direction is None:
+            z = Plane(tool_faces[0]).z_dir
+            tool_dir = -np.array([z.X, z.Y, z.Z], dtype=float)
+        else:
+            tool_dir = np.asarray(direction, dtype=float)
+        start_off = float((extra or {}).get('start_offset', 0.0))
+        end_off   = float((extra or {}).get('end_offset',   0.0))
+
+        try:
+            tool_solid = None
+            for face in tool_faces:
+                s = _do_extrude_solid(face, tool_dist, tool_dir,
+                                      start_offset=start_off, end_offset=end_off)
+                if tool_solid is None:
+                    tool_solid = s
+                else:
+                    lst_a = TopTools_ListOfShape(); lst_a.Append(tool_solid.wrapped)
+                    lst_b = TopTools_ListOfShape(); lst_b.Append(s.wrapped)
+                    fu = BRepAlgoAPI_Fuse()
+                    fu.SetArguments(lst_a); fu.SetTools(lst_b)
+                    fu.SetRunParallel(True); fu.Build()
+                    if fu.IsDone():
+                        tool_solid = Compound(fu.Shape())
+        except Exception as ex:
+            print(f"[Cut] Tool construction failed: {ex}"); return
+
+        tool_bbox = tool_solid.bounding_box()
+        candidates: list[str] = []
+        for bid in self.workspace.bodies.keys():
+            bshape = self.workspace.current_shape(bid)
+            if bshape is None:
+                continue
+            try:
+                if bboxes_overlap(bshape.bounding_box(), tool_bbox):
+                    candidates.append(bid)
+            except Exception:
+                candidates.append(bid)   # bbox failed — let the cut decide
+
+        if not candidates:
+            print("[Cut] No-target cut: tool doesn't intersect any body."); return
+
+        sketch_id = (self.history.index_to_id(sketch_idx)
+                     if sketch_idx is not None else None)
+        dir_list = direction.tolist() if direction is not None else None
+
+        # ---- Fan out: one CrossBodyCutOp.commit per candidate body ---------
+        n_cut = 0
+        for bid in candidates:
+            shape_before = self.workspace.current_shape(bid)
+            vol_before   = (sum(s.volume for s in shape_before.solids())
+                            if shape_before is not None else 0.0)
+
+            op = CrossBodyCutOp(
+                cut_body_id      = bid,
+                source_body_id   = src_body_id,
+                source_face_idx  = face_idx,
+                source_sketch_id = sketch_id,
+                distance         = abs(dist),
+                direction        = dir_list,
+                target_vertex    = (extra or {}).get('target_vertex'),
+                start_offset     = start_off,
+                end_offset       = end_off,
+            )
+            op.commit(self, extra)
+
+            # Roll back if the bbox prefilter was a false positive.
+            shape_after = self.workspace.current_shape(bid)
+            vol_after   = (sum(s.volume for s in shape_after.solids())
+                           if shape_after is not None else 0.0)
+            if abs(vol_after - vol_before) < 1e-3 and self.history.entries:
+                last_idx = len(self.history.entries) - 1
+                if self.history.entries[last_idx].body_id == bid:
+                    self.history.delete(last_idx)
+            else:
+                n_cut += 1
+
+        if n_cut == 0:
+            print("[Cut] No-target cut: tool didn't actually intersect any body.")
+        else:
+            print(f"[Cut] No-target cut applied to {n_cut} body/bodies.")
 
     def do_extrude(self, face_pairs, distance: float,
                    direction=None, merge_body_id: str | None = None,

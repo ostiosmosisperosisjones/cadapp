@@ -10,8 +10,12 @@ fragile integer indices, so insert/delete/reorder never corrupts the graph.
 
 Parametric replay
 -----------------
-replay_from(index) re-executes all entries for the target body from *index*
-onward.  Two special cases beyond the REGISTRY executors:
+replay_from(index) re-executes every entry from *index* onward in list order,
+maintaining per-body shape state so that cross-body operations (e.g.
+CrossBodyCutOp) always see the up-to-date shape of dependency bodies that
+were already processed earlier in the same pass.
+
+Two special cases beyond the REGISTRY executors:
 
   "sketch" entries
       Re-resolve the sketch plane via SketchEntry.plane_source and
@@ -244,154 +248,6 @@ class History:
         return None
 
     # ------------------------------------------------------------------
-    # Parametric replay
-    # ------------------------------------------------------------------
-
-    def replay_from(self, index: int) -> tuple[bool, str, set[str]]:
-        """
-        Re-execute all entries from *index* onward for the body targeted by
-        entry[index].  Entries for other bodies are skipped.
-
-        On failure, the failing entry is marked with error=True/error_msg
-        instead of aborting immediately, so the rest of the chain can still
-        be attempted.
-
-        Returns (all_ok, first_error_message, mutated_body_ids) where
-        mutated_body_ids is the set of body IDs whose shape_after changed
-        — callers can use this to rebuild only the affected meshes.
-        """
-        if index < 0 or index >= len(self._entries):
-            return False, f"Index {index} out of range", set()
-
-        target_body_id = self._entries[index].body_id
-
-        # Build a shape cache from all entries before `index` so we can look up
-        # any body's current shape in O(1) instead of scanning the list each time.
-        # Stores (entry_index, shape) so before_index checks can be respected.
-        shape_cache: dict[str, tuple[int, Any]] = {}
-        for j, e in enumerate(self._entries[:index]):
-            if e.shape_after is not None:
-                shape_cache[e.body_id] = (j, e.shape_after)
-
-        current_shape = shape_cache[target_body_id][1] if target_body_id in shape_cache else None
-        mutated_bodies: set[str] = set()
-
-        # Expose cache on self so plane_ref/edge_ref resolve() calls are O(1)
-        self._replay_shape_cache = shape_cache
-        try:
-            return self._replay_from_inner(
-                index, target_body_id, current_shape,
-                shape_cache, mutated_bodies)
-        finally:
-            self._replay_shape_cache = None
-
-    def _replay_from_inner(self, index, target_body_id, current_shape,
-                           shape_cache, mutated_bodies):
-        from cad.op_types import ImportOp, SketchOp
-
-        first_error  = ""
-        chain_broken = False   # once True, all subsequent ops for this body cascade-error
-
-        for i in range(index, len(self._entries)):
-            entry = self._entries[i]
-
-            if entry.body_id != target_body_id:
-                continue
-
-            # Clear previous error state on re-play
-            entry.error     = False
-            entry.error_msg = ""
-
-            op = entry.op
-
-            # ---- import / force_new_body child: shape is authoritative ----
-            # ImportOp entries and force_new_body children (shape_before=None,
-            # source_entry_id set) carry their result in shape_after directly.
-            # Their shapes are updated by the parent op's split propagation.
-            if isinstance(op, ImportOp) or (
-                    entry.shape_before is None
-                    and entry.params.get("source_entry_id") is not None):
-                current_shape = entry.shape_after
-                shape_cache[entry.body_id] = (i, entry.shape_after)
-                continue
-
-            # If a prior op in this chain failed, cascade-error everything else
-            if chain_broken:
-                entry.error     = True
-                entry.error_msg = "Dependency error: a prior operation in this chain failed"
-                entry.shape_before = current_shape
-                entry.shape_after  = None
-                _null_split_dependents(self._entries, i)
-                continue
-
-            if op is None:
-                err = f"Entry {i} '{entry.label}': unknown operation '{entry.operation}'"
-                entry.error = True; entry.error_msg = err
-                entry.shape_before = current_shape; entry.shape_after = None
-                _null_split_dependents(self._entries, i)
-                chain_broken = True
-                if not first_error: first_error = err
-                mutated_bodies.add(entry.body_id)
-                continue
-
-            # ---- sketch: geometry no-op, re-projects references -----------
-            if isinstance(op, SketchOp):
-                try:
-                    op.execute(current_shape, self, i)
-                except Exception as ex:
-                    entry.error        = True
-                    entry.error_msg    = str(ex)
-                    entry.shape_before = current_shape
-                    entry.shape_after  = None
-                    chain_broken = True
-                    if not first_error:
-                        first_error = str(ex)
-                    mutated_bodies.add(entry.body_id)
-                    continue
-                entry.shape_before = current_shape
-                entry.shape_after  = current_shape
-                continue
-
-            # ---- all other ops: need a valid input shape ------------------
-            force_new = getattr(op, 'force_new_body', False)
-            if current_shape is None and not force_new:
-                err = f"Entry {i} '{entry.label}': no input shape (prior operation failed)"
-                entry.error = True; entry.error_msg = err
-                entry.shape_before = None; entry.shape_after = None
-                _null_split_dependents(self._entries, i)
-                chain_broken = True
-                if not first_error: first_error = err
-                mutated_bodies.add(entry.body_id)
-                continue
-
-            shape_before = current_shape
-            try:
-                new_shape = op.execute(current_shape, self, i)
-            except Exception as ex:
-                err = f"Entry {i} '{entry.label}' failed: {ex}"
-                entry.error = True; entry.error_msg = err
-                entry.shape_before = current_shape; entry.shape_after = None
-                _null_split_dependents(self._entries, i)
-                chain_broken = True
-                if not first_error: first_error = err
-                mutated_bodies.add(entry.body_id)
-                continue
-
-            entry.shape_before = shape_before
-            entry.shape_after  = new_shape
-            current_shape      = new_shape
-            shape_cache[entry.body_id] = (i, new_shape)
-            entry.label        = _make_label(entry.operation, entry.params)
-            mutated_bodies.add(entry.body_id)
-
-            # force_new_body child bodies are updated inside execute() directly.
-            child_body_ids = entry.params.get("child_body_ids", [])
-            for bid in child_body_ids:
-                mutated_bodies.add(bid)
-
-        return (not first_error), first_error, mutated_bodies
-
-    # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
 
@@ -400,17 +256,24 @@ class History:
         return [(i, e) for i, e in enumerate(self._entries)
                 if e.body_id == body_id]
 
-    def replay_all_from(self, index: int) -> tuple[bool, str, set[str]]:
+    # ------------------------------------------------------------------
+    # Parametric replay
+    # ------------------------------------------------------------------
+
+    def replay_from(self, index: int) -> tuple[bool, str, set[str]]:
         """
-        Re-execute ALL body chains from *index* onward in a single ordered pass.
+        Re-execute every entry from *index* onward in list order, maintaining
+        per-body shape state so cross-body ops (e.g. CrossBodyCutOp) see the
+        up-to-date shape of dependency bodies already processed earlier in
+        the same pass.
 
-        Unlike replay_from() which replays one body chain, this method processes
-        every entry from index onward in list order, maintaining a single shared
-        shape cache.  This ensures cross-body ops (e.g. CrossBodyCutOp) always
-        see the up-to-date shape of dependency bodies that were already processed
-        earlier in the same pass.
+        On failure, the failing entry is marked with error=True/error_msg and
+        downstream entries on the same body cascade-error.  Other bodies'
+        chains continue independently.
 
-        Returns (all_ok, first_error_message, mutated_body_ids).
+        Returns (all_ok, first_error_message, mutated_body_ids) where
+        mutated_body_ids is the set of body IDs whose shape_after changed —
+        callers can use this to rebuild only the affected meshes.
         """
         from cad.op_types import ImportOp, SketchOp
 
@@ -483,8 +346,7 @@ class History:
                     entry.shape_after  = current_shape
                     continue
 
-                force_new = getattr(op, 'force_new_body', False)
-                if current_shape is None and not force_new:
+                if current_shape is None and not op.creates_body_from_nothing(self, i):
                     err = f"Entry {i} '{entry.label}': no input shape (prior operation failed)"
                     entry.error = True; entry.error_msg = err
                     entry.shape_before = None; entry.shape_after = None
@@ -522,36 +384,34 @@ class History:
 
         return (not first_error), first_error, mutated_bodies
 
+    # Legacy name — kept so existing viewer/serializer call sites keep working.
+    # Both names invoke the same unified replay; pick replay_from() in new code.
+    replay_all_from = replay_from
+
     def replay_sketch_dependents(self, sketch_entry_id: str) -> tuple[bool, str, set[str]]:
         """
-        Replay all body chains that contain a SketchExtrudeOp referencing
-        sketch_entry_id.  Called after a sketch is re-edited so that extruded
-        bodies built from it are automatically recomputed.
+        Replay every body chain that contains a SketchExtrudeOp or
+        SketchRevolveOp referencing sketch_entry_id.  Called after a sketch is
+        re-edited so that ops built from it are automatically recomputed.
 
         Returns (all_ok, first_error, mutated_body_ids).
         """
         from cad.op_types import SketchExtrudeOp, SketchRevolveOp
-        all_ok   = True
-        first_err = ""
-        mutated: set[str] = set()
-        seen_bodies: set[str] = set()
 
+        earliest = None
         for i, entry in enumerate(self._entries):
             op = entry.op
             if not isinstance(op, (SketchExtrudeOp, SketchRevolveOp)):
                 continue
             if op.from_sketch_id != sketch_entry_id:
                 continue
-            body_id = entry.body_id
-            if body_id in seen_bodies:
-                continue
-            seen_bodies.add(body_id)
-            ok, err, mut = self.replay_from(i)
-            mutated |= mut
-            if not ok:
-                all_ok = False
-                if not first_err:
-                    first_err = err
+            if earliest is None or i < earliest:
+                earliest = i
+
+        if earliest is None:
+            return True, "", set()
+
+        all_ok, first_err, mutated = self.replay_from(earliest)
 
         return all_ok, first_err, mutated
 
@@ -609,15 +469,21 @@ def _replay_sketch_entry(se, history: History, before_index: int
     except Exception as ex:
         return False, f"Sketch plane resolve failed: {ex}"
 
-    # Resolve all reference entities before committing any mutations.
+    # Resolve all reference entities.  Failures here are non-fatal: a
+    # reference whose source has been deleted (e.g. an edge consumed by a
+    # later cut) keeps its previously-baked UV cache, which is at least
+    # stable.  Without this fallback the entire sketch — including all the
+    # user's drawn geometry — would fail to replay just because one Include
+    # reference can no longer be re-found.
     ref_updates = []
     for ent in se.entities:
         if not isinstance(ent, ReferenceEntity) or ent.source is None:
             continue
         try:
             world_pts, occ_edges = ent.source.resolve(history, before_index)
-        except Exception as ex:
-            return False, f"Reference entity re-projection failed: {ex}"
+        except Exception:
+            # Skip this reference — its cached UV remains in place.
+            continue
         ref_updates.append((ent, world_pts, occ_edges))
 
     # All resolved successfully — now commit.

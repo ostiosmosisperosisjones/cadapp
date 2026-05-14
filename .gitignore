@@ -4,3 +4,4 @@ dist/
 build/
 *.spec.bak
 AGENTS.md
+_tests/
